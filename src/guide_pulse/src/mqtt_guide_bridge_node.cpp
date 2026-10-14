@@ -98,8 +98,8 @@ void MqttGuideBridgeNode::declare_and_load_params()
   // 白禁过久；SDK 无播完事件（estimated_duration 恒 0 且无播完话题，
   // 见 接口说明.md PlayTts 节），只能估算收紧 + 参数化真机校准）
   declare_parameter<int>("tts_speech_ms_per_char", 220);
-  declare_parameter<int>("suppress_tail_lead_ms", 1500);
-  declare_parameter<double>("suppress_tail_scale", 1.0);
+  declare_parameter<int>("suppress_tail_lead_ms", 0);
+  declare_parameter<double>("suppress_tail_scale", 0.8);
   declare_parameter<int>("suppress_tail_max_ms", 0);
   // 停止续期时刷的收尾抑制 TTL：原 0=云端默认 3000ms（播完后还要白禁
   // 3s），2026-10-14 改 1ms 立即解除（真机反馈白禁 7~8s 过长）

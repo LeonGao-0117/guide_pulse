@@ -124,10 +124,10 @@
   《接口说明.md》PlayTts 节官方建议即字数预估），最后一条受理后按
   两段式估算持续续期 `tail_ms = suppress_tail_lead_ms + 字数估算秒×
   1000 × suppress_tail_scale`（`suppress_tail_max_ms>0` 封顶；默认
-  1500ms + 估算×scale（scale 默认 1.0，原为预估×2——120 字迎宾词宽限 52s，
-  实际 ~30s 播完，播完后唤醒被白禁 20s+；真机复测收紧后仍白禁 7~8s，
-  2026-10-14 再砍两刀：scale 1.3→1.0 + 收尾刷由云端默认 3s 改 1ms 立即
-  解除），到点停续期并刷 `suppress_tail_flush_ms` 立即解除；真机校准：
+  估算×scale（scale 默认 0.8，lead 默认 0 不加；原为预估×2——120 字迎宾词
+  宽限 52s，实际 ~30s 播完，播完后唤醒被白禁 20s+；真机复测收紧后仍白禁
+  7~8s，2026-10-14 再砍两刀：scale 1.3→1.0 + 收尾刷由云端默认 3s 改 1ms
+  立即解除），到点停续期并刷 `suppress_tail_flush_ms` 立即解除；真机校准：
   掐表 2~3 条典型文本拟合 lead 与 `tts_speech_ms_per_char`。
   `tts.stop` 掐断语音即停抑制。tts（type=tts）2026-10-14 起亦为单轮，
   播报期间同样抑制唤醒（原循环模式不抑制）；抑制失败仅告警不阻断播报。

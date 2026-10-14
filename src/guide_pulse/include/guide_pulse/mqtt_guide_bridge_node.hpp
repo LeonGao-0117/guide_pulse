@@ -139,8 +139,9 @@ private:
   // 真机播 2~3 条典型长度文本掐表（PlayTts 受理→听不到声音），
   // 两点拟合 lead 与每字时长（tts_speech_ms_per_char）
   int tts_speech_ms_per_char_{220};     // 每字时长（CJK/数字档，拉丁≈0.73 倍）
-  int suppress_tail_lead_ms_{1500};     // 固定合成启动延迟（与字数无关）
-  double suppress_tail_scale_{1.0};     // 估算放大系数（2026-10-14 前为硬编码 2.0）
+  int suppress_tail_lead_ms_{0};        // 固定合成启动延迟（默认 0 不加，
+                                        // 真机校准可填拟合截距）
+  double suppress_tail_scale_{0.8};     // 估算放大系数（2026-10-14 前为硬编码 2.0）
   int suppress_tail_max_ms_{0};         // 尾部宽限封顶（0=不封顶）
   int suppress_tail_flush_ms_{1};       // 停续期收尾刷的抑制 TTL（原 0=云端
                                         // 默认 3000ms，播完后白禁 3s；1=立即解除）
