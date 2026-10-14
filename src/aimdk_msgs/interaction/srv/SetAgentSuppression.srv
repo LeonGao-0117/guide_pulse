@@ -1,0 +1,25 @@
+# --------------------------------------------------------------------------------------------------------------
+# 临时抑制 Agent 行为
+#
+# 用于端侧业务临时抑制唤醒、打招呼或触摸。每种抑制均直接复用云端 AgentFlow
+# 对应的处理函数和 TTL 看门狗；新的同类请求会刷新该类型的 TTL。
+# --------------------------------------------------------------------------------------------------------------
+
+# 请求头
+CommonRequest header
+
+# 抑制类型
+uint32 suppression_type
+
+uint32 SUPPRESSION_TYPE_UNKNOWN  = 0
+uint32 SUPPRESSION_TYPE_WAKEUP   = 1 # 唤醒抑制
+uint32 SUPPRESSION_TYPE_GREETING = 2 # 打招呼抑制
+uint32 SUPPRESSION_TYPE_TOUCH    = 3 # 触摸抑制
+
+# 抑制时长，单位毫秒；0 表示使用对应云端链路的默认值 3000 ms。
+uint32 ttl_ms
+
+---
+
+# 响应头
+CommonResponse header

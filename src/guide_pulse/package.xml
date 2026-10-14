@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>guide_pulse</name>
+  <version>0.1.0</version>
+  <description>
+    机器人侧展厅讲解工程：通过 MQTT 接收后端（RobotCar 协议）下发的
+    scene（迎宾）/ navigate（导航+汽车讲解）/ tts（循环播报）指令，
+    调用启元机器人 SDK (sdk_t1-v0.9.4.4) 的 PlayTts 服务播报，
+    经 NavExecutor 挂载点执行本地导航。框架沿用 tts_demo 工程。
+  </description>
+  <maintainer email="dev@example.com">liang</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <!-- SDK 消息包（已拷贝内置 src/aimdk_msgs，来源 sdk_t1-v0.9.4.4） -->
+  <depend>aimdk_msgs</depend>
+  <!-- 航点导航服务定义（已拷贝内置 src/waypoint_nav_msgs，来源 t1_slam_nav_ws） -->
+  <depend>waypoint_nav_msgs</depend>
+  <depend>std_srvs</depend>
+  <!-- JSON 解析（MQTT 业务报文） -->
+  <depend>nlohmann_json</depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

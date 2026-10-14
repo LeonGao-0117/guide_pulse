@@ -1,0 +1,115 @@
+# ============================================================================
+# guide_bridge 节点参数
+# 协议基线：RobotCar 协议 v0.21.0（scene v0.17.0 迎宾 + navigate v0.16.0
+# 导航/汽车讲解 + v0.20.0 随动播报 texts + tts v0.5.0 播报 +
+# v0.6.0 tts.result 回执 + v0.9.0/v0.10.0 enroll 注册面）。
+# 2026-10-14 本地变更：tts 单轮播完自行结束（原协议语义为循环到替换/停止）。
+# 设计与本地策略见 docs/design.md，协议要点见 docs/protocol.md
+# ============================================================================
+guide_bridge:
+  ros__parameters:
+    # ---- MQTT 连接与 enroll 注册面 ----
+    broker_uri: "tcp://124.223.200.153:12883"
+    # Server HTTP 注册面。启动时 POST {enroll_origin}/v1/robots/enroll 换取
+    # 凭据：username 即 robot_id（Server 首次 enroll 分配，同 SN 稳定）；
+    # 密码每次轮换，只在内存使用、不落盘不打印；CONNECT 被拒(0x86/0x87)
+    # 时自动重新 enroll 再连。也可用环境变量 GUIDE_PULSE_ENROLL_ORIGIN 注入
+    enroll_origin: "http://124.223.200.153:8780"
+    # 本机序列号（6..64 位）。批量部署留空，按以下顺序自动获取：
+    #   1) 本参数（显式覆盖，仅联调用）
+    #   2) 环境变量 GUIDE_PULSE_SERIAL_NUMBER
+    #   3) serial_number_file 文件（默认 /robot/info/sn，板端标准位置）
+    # SN 必须由运维预先登记：RobotCar/Server 下
+    #   scripts/robot-admin.sh register <SN> guide_pulse
+    serial_number: ""
+    serial_number_file: "/robot/info/sn"
+    enroll_timeout_seconds: 5
+    # RobotCar Server 固定 TopicPrefix=robotCar（Server 代码常量，非部署配置）
+    topic_prefix: "robotCar/v1/robots"
+    keep_alive_seconds: 30
+    connect_timeout_seconds: 10
+    heartbeat_interval_seconds: 20       # 0 关闭心跳
+
+    # ---- 展厅讲解增量 ----
+    # 导航执行器：mock（联调/测试，模拟 mock_nav_seconds 秒后到达）
+    # 或 waypoint（真机：对接 t1_slam_nav_ws 航点巡航 /waypoint_follower
+    # 服务，point_name 直接映射航点名，航点表归 t1_slam_nav_ws 维护）
+    nav_executor: "mock"
+    mock_nav_seconds: 0                  # Mock 导航模拟行走秒数（0=立即到达）
+    tour_speak_interval_seconds: 2       # 迎宾词/讲解词每两条之间的间隔秒
+    welcome_default_texts:               # scene 未带 texts 时的本地默认迎宾词
+      - "欢迎光临！我是展厅讲解机器人，很高兴为您服务。"
+
+    # ---- SDK TTS 服务（sdk_t1-v0.9.4.4）----
+    tts_service_name: "/aimdk_5Fmsgs/srv/PlayTts"  # SDK 固定服务名，勿修改
+    tts_domain: "guide_pulse"            # 调用方来源标识（SDK 审计用）
+    stop_text: '<speak><break time="300ms"/></speak>'
+                                         # 停止抢占文本：SSML 静音段（tts_demo
+                                         # 实测：完全无声、任务正常完结）。
+                                         # 警告：勿改纯标点"。"——任务无法完结，
+                                         # 仲裁通道会被 1099 卡住 30-60 秒
+    # SDK 仲裁：新任务权重(level*100+weight) < 当前播报任务时直接丢弃。
+    # 迎宾/讲解播报用 SYSTEM_L7+0=700：高于 INTERACTION_L6=600（语音唤醒
+    # 响应/实时交互首句档位），播报期间唤醒/其他 L6 业务请求被仲裁丢弃，
+    # 迎宾词与讲解词完整播完不被抢话（若需允许唤醒打断改回 6）；
+    # WARNING_L8/SAFETY_L10（避障预警/安全警报）仍可打断（合理保留）。
+    # 停止由 tts_client 硬编码 SAFETY_L10+99=1099 抢占，保证能掐断一切播报
+    tts_priority_level: 7
+    tts_priority_weight: 0
+    tts_retry_seconds: 3                 # 被仲裁拒绝后隔几秒快速重试
+    tts_request_timeout_seconds: 5       # 单次 PlayTts 调用超时
+    tts_wait_timeout_seconds: 0          # 启动时等待 TTS 服务时长；0=不等待
+
+    # ---- 唤醒抑制（迎宾/讲解单轮播报防强打断 v0.23.0，看门狗续期模式）----
+    # 背景：agent 唤醒强打断(strong_interrupt)不走 TTS 优先级仲裁，
+    # SPEAKING 状态必掐断播报（真机日志证实，L7 也防不住）。官方出口：
+    # SetAgentSuppression(WAKEUP, ttl) 抑制唤醒。
+    # 模式：TTL 固定短，播报进行期间 worker 周期续期（间隔须小于 TTL），
+    # 会话结束转入尾部宽限后停止续期并刷 3s 快速恢复。
+    # 仅单轮会话（迎宾/讲解，2026-10-14 起 tts 亦单轮）抑制唤醒；
+    # PlaylistSession 的循环模式（当前无调用方）不抑制
+    #
+    # 尾部宽限两段式估算（2026-10-14 重做；SDK 无播完事件——流式合成下
+    # estimated_duration 恒 0 且无播完话题，接口说明.md PlayTts 节官方
+    # 建议即字数预估。原"预估×2"过保守：120 字迎宾词宽限 52s，实际
+    # ~30s 播完，播完后唤醒被白禁 20s+）：
+    #   tail_ms = suppress_tail_lead_ms + 估算秒数×1000×suppress_tail_scale
+    #             （suppress_tail_max_ms>0 时封顶）
+    # 校准方法：真机播 2~3 条典型长度文本掐表（下发受理→听不到声音），
+    # 两点拟合 lead（截距）与每字时长（斜率，填 tts_speech_ms_per_char）
+    suppress_service_name: "/aimdk_5Fmsgs/srv/SetAgentSuppression"  # 固定服务名
+    suppress_wakeup: true                # false 关闭（恢复默认可打断）
+    suppress_ttl_ms: 8000                # 每次抑制 TTL（> 续期间隔）
+    suppress_renew_interval_ms: 5000     # worker 续期间隔
+    tts_speech_ms_per_char: 220          # 每字时长 ms（CJK/数字档；拉丁≈160）
+    suppress_tail_lead_ms: 1500          # 尾部宽限固定项：合成启动延迟
+    suppress_tail_scale: 1.0             # 尾部宽限系数（2026-10-14 自 2.0 收紧；
+                                         # 若长词播到后段被唤醒打断可回调 1.2~1.3）
+    suppress_tail_max_ms: 0              # 尾部宽限封顶 ms（0=不封顶）
+    suppress_tail_flush_ms: 1            # 停续期收尾刷的抑制 TTL ms（原 0=云端
+                                         # 默认 3000ms 播完后白禁 3s；1=立即解除）
+
+    # ---- 屏幕二维码显示（迎宾场景 v0.22.0，SDK PlayEmotion）----
+    # 迎宾指令(scene=welcome)触发：App 可选下发二维码图 base64
+    # (qrcode_png_base64)，本机 ffmpeg 转 848x480 H.264 MP4 后 scp 推送
+    # 运控板，PlayEmotion(file, loop_count=0) 无限循环常驻；5 分钟超时
+    # 或任意新业务(tts/scene/navigate/tts.stop)到达即恢复默认表情。
+    # 多板架构：PlayEmotion 由运控板(10.1.1.100)执行，MP4 必须在其文件
+    # 系统上，故需 sshpass 推送；display_remote_pass 为空则显示禁用
+    #（迎宾 TTS 不受影响）。无 base64 时播放运控板预置 MP4
+    #（display_remote_dir/QRCode.mp4，运维预部署）
+    display_emotion_service_name: "/aimdk_5Fmsgs/srv/PlayEmotion"  # SDK 固定，勿改
+    display_remote_host: "10.1.1.100"    # 运控板（PlayEmotion 执行板）
+    display_remote_user: "run"
+    display_remote_pass: "1"             # scp 推送密码；空=禁用显示
+    display_remote_dir: "/home/run/screen_display"  # 运控板 MP4 存放目录
+    display_request_timeout_seconds: 5   # 单次 PlayEmotion 调用超时
+    display_show_timeout_seconds: 300    # 二维码常驻时长（5 分钟）
+    display_restore_emotion_id: 90       # 取消后恢复的 T1 默认表情
+
+    # ---- 协议限制 ----
+    # texts 1..20 条、每条 1..2048 字节（契约校验，无本地截断）；
+    # tts/迎宾/讲解均单轮播完自行结束（tts 2026-10-14 起单轮，
+    # 原协议语义为循环播到替换/tts.stop）；
+    # tts.result 回执同 operation_id 重发复用缓存（同 event_id）
+    dedupe_capacity: 1024                # operation_id 去重表/回执缓存容量

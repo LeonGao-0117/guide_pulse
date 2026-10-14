@@ -1,0 +1,53 @@
+# 查航点巡航节点此刻的状态。
+#
+# `~/status` 是 latched 话题，订阅上就能立刻拿到最后一帧，所以这个服务不是
+# 必需品；它存在是为了让「只想问一次」的调用方不必建订阅、不必处理
+# 「订上了但还没收到第一帧」这个瞬态。两条路读的是同一个快照。
+---
+# IDLE / RUNNING / PAUSED / SUCCEEDED / FAILED / CANCELLED
+string state
+
+# 任务已受理、但还在等一次新鲜位姿才敢下发第一个目标。
+# **这时 state 是 RUNNING 而机器人没动**，不看这个字段会误以为卡住了。
+bool awaiting_pose
+
+# 本次任务的种类：route（整条路线）/ goto（点名去几个）/ 空（还没接过任务）。
+string mission
+
+# 当前正在前往的航点名；没有则为空。
+string current
+
+# 本次任务的进度。**不是整条路线的进度**——`goto door` 的 total 就是 1，
+# 路线自身的规模看 route_total。
+uint32 step
+uint32 total
+
+# 本次任务要走的航点名序列。
+string[] plan
+
+# 路线里全部航点名。
+string[] available
+uint32 route_total
+
+# 距当前航点还剩多远。位姿未知时 has_remaining 为 false，此时 remaining_m
+# 无意义。**用一个显式的 bool 而不是拿 -1 或 NaN 当哨兵**：哨兵值迟早会被
+# 某个调用方当成真实距离参与运算。
+bool has_remaining
+float64 remaining_m
+
+# 当前航点还剩几次重试。
+uint32 retries_left
+
+# 进入当前状态的原因（失败原因、取消说明等）；正常运行时为空。
+string reason
+
+# 航点文件绑定的地图名。航点是 map 系下的绝对坐标，调用方可以拿它核对
+# 自己以为的地图和巡航节点加载的是不是同一张。
+string map_name
+
+# 与 `~/status` 话题完全一致的原始 JSON。
+#
+# 留这个字段是条**逃生通道**：以后状态里加字段时，调用方不必等接口包重编
+# 就能读到新字段。接口包是 ament_cmake + rosidl，改一次 .srv 必须重编、
+# 还要连带重编所有依赖它的包，在这台机器上这不是零成本的操作。
+string status_json

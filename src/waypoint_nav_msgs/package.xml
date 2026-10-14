@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>waypoint_nav_msgs</name>
+  <version>0.1.0</version>
+  <description>
+    航点巡航的服务接口。刻意与 waypoint_nav 分开成独立的包：接口包是
+    ament_cmake + rosidl，改一次就必须重编，而航点逻辑本身是纯 Python、
+    改了免重编。混在一起会让每次改航点逻辑都被迫走一遍编译。
+
+    另一个理由是依赖方向：调用方（别的节点）只该依赖接口，不该依赖巡航节点
+    的实现包。
+  </description>
+
+  <maintainer email="dev@liwei.local">liwei</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+
+  <exec_depend>rosidl_default_runtime</exec_depend>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
