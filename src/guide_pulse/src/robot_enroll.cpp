@@ -156,7 +156,6 @@ EnrollResult parse_enroll_error(long http_code, const std::string & body)
       }
     }
   } catch (const json::exception &) {
-    // 错误体不是 JSON：走 BAD_RESPONSE 分支
   }
 
   if (code == "invalid_request") {
@@ -216,13 +215,11 @@ EnrollResult RobotEnroller::enroll(const std::string & serial_number)
   curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, request_body.c_str());
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
   curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);  // 多线程进程必须关掉信号量定时器
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(timeout_seconds_));
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, static_cast<long>(timeout_seconds_));
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, append_body);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
-  // 注册面是受控内网的明文 HTTP（与 MQTT 1883 同一威胁模型，见协议
-  // 「安全边界与威胁模型」）；这里显式允许 http://，不跟随重定向。
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
 
   const CURLcode rc = curl_easy_perform(curl);

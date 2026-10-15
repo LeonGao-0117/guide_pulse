@@ -72,6 +72,7 @@ target_compile_options(guide_pulse_protocol PRIVATE -Wall -Wextra)
 #（nav_executor/playlist/welcome/tour 为纯头文件，随使用方编译）
 # ---------------------------------------------------------------------------
 add_library(guide_pulse_core STATIC
+  src/mc_transform.cpp
   src/screen_display.cpp
   src/tts_client.cpp
   src/mqtt_guide_bridge_node.cpp
@@ -101,7 +102,8 @@ install(TARGETS guide_bridge
   DESTINATION lib/${PROJECT_NAME}
 )
 # Mock TTS 服务脚本（ros2 run guide_pulse mock_tts_service.py）
-install(PROGRAMS scripts/mock_tts_service.py
+# Mock 运控服务脚本（迎宾变形联调：SetMcAction/GetMcAction 模拟）
+install(PROGRAMS scripts/mock_tts_service.py scripts/mock_mc_service.py
   DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY config launch
@@ -141,6 +143,15 @@ if(BUILD_TESTING)
 
   ament_add_gtest(welcome_test test/test_welcome.cpp)
   target_link_libraries(welcome_test guide_pulse_protocol)
+
+  # 3c. 迎宾变形纯函数单测：动作转移路径表/趴姿集合/reason 人话映射的
+  #     不变式（路径逐条抄自 SDK _ACTION_RULES，抄错一格 = 机器人做出
+  #     没预期的动作，靠测试锁住表结构）
+  ament_add_gtest(mc_transform_test test/test_mc_transform.cpp
+    src/mc_transform.cpp)
+  target_include_directories(mc_transform_test PRIVATE include)
+  ament_target_dependencies(mc_transform_test rclcpp aimdk_msgs)
+  target_link_libraries(mc_transform_test Threads::Threads)
 
   # 3b. 屏幕显示纯函数单测：base64 解码（含非法输入）与 ffmpeg 命令拼装。
   #     ScreenDisplay 的服务调用/推送链路属真机集成，由 scripts 现场验证

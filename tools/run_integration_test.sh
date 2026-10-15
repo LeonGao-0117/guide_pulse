@@ -5,6 +5,7 @@
 # 链路：enroll_mock_server(注册面) <- guide_bridge(enroll 换凭据)
 #       backend_simulator(scene/navigate/tts/tts.stop) -> mosquitto(1884)
 #       -> guide_bridge -> mock_tts_service(SDK PlayTts Mock) + MockNavExecutor
+#                     \-> mock_mc_service(运控 SetMcAction/GetMcAction Mock)
 # 契约：RobotCar 协议 v0.9.0/v0.10.0（enroll）+ v0.5.0/v0.6.0（tts 循环播报/
 #       回执）+ v0.17.0（scene 迎宾）+ v0.16.0/v0.20.0（navigate 导航+随动
 #       播报）。断言依据 Mock 服务日志、桥接日志与 simulator 收到的回执。
@@ -117,6 +118,17 @@ PYTHONUNBUFFERED=1 "${GUIDE_DIR}/install/guide_pulse/lib/guide_pulse/mock_tts_se
 MOCK_PID=$!
 PIDS+=("$MOCK_PID")
 
+# Mock 厂家运控服务（SetMcAction/GetMcAction，独立服务名防真机同名真服务
+# 抢先应答）：迎宾指令到达后桥接应直调它确保人形形态，用例 2a 断言完整
+# 转移序列（狗站立 -> 行走态 -> 变形 -> 自动落位 BIPED_LOCOMOTION_WBC）
+MOCK_MC_GET="/guide_pulse_integration/mock_mc_get"
+MOCK_MC_SET="/guide_pulse_integration/mock_mc_set"
+PYTHONUNBUFFERED=1 "${GUIDE_DIR}/install/guide_pulse/lib/guide_pulse/mock_mc_service.py" \
+  --get "${MOCK_MC_GET}" --set "${MOCK_MC_SET}" --transition-ms 1500 \
+  > "${WORK_DIR}/mock_mc.log" 2>&1 &
+MOCK_MC_PID=$!
+PIDS+=("$MOCK_MC_PID")
+
 # 桥接节点：enroll 换凭据（SN SIM-guide-it -> robot-001）后连本地 mosquitto；
 # mock_nav_seconds=2 模拟行走耗时（导航替换用例需要「在途」窗口）；
 # SN 经 serial_number_file 自动获取（模拟真机从板端文件读取）
@@ -126,9 +138,12 @@ echo -n "SIM-guide-it" > "${WORK_DIR}/sn"
   -p enroll_origin:="http://127.0.0.1:${ENROLL_PORT}" \
   -p serial_number_file:="${WORK_DIR}/sn" \
   -p tts_service_name:="${MOCK_SERVICE}" \
+  -p get_action_service:="${MOCK_MC_GET}" \
+  -p set_action_service:="${MOCK_MC_SET}" \
   -p tts_wait_timeout_seconds:=10 \
   -p heartbeat_interval_seconds:=5 \
   -p mock_nav_seconds:=6 \
+  -p transform_wait_timeout_seconds:=40 \
   > "${WORK_DIR}/bridge.log" 2>&1 &
 BRIDGE_PID=$!
 PIDS+=("$BRIDGE_PID")
@@ -154,6 +169,11 @@ wait_log "Mock PlayTts 服务已就绪" "${WORK_DIR}/mock_tts.log" 15 || {
 }
 log "Mock TTS 服务已就绪 (service=${MOCK_SERVICE})"
 
+wait_log "Mock 运控服务已就绪" "${WORK_DIR}/mock_mc.log" 15 || {
+  cat "${WORK_DIR}/mock_mc.log" || true
+  fail "Mock 运控服务未就绪"
+}
+log "Mock 运控服务已就绪 (get=${MOCK_MC_GET} set=${MOCK_MC_SET})"
 SIM="python3 ${GUIDE_DIR}/tools/backend_simulator.py --broker tcp://127.0.0.1:${PORT} --robot robot-001"
 DEFAULT_WELCOME="欢迎光临！我是展厅讲解机器人，很高兴为您服务。"
 
@@ -162,12 +182,15 @@ DEFAULT_WELCOME="欢迎光临！我是展厅讲解机器人，很高兴为您服
 # ---------------------------------------------------------------------------
 $SIM play "循环播报基线" > "${WORK_DIR}/sim1.log" 2>&1
 wait_log "text='循环播报基线'" "${WORK_DIR}/mock_tts.log" 10 || fail "Mock 未收到 tts 首播请求"
-grep -q "priority=INTERACTION_L6" "${WORK_DIR}/mock_tts.log" || fail "播报优先级不是 INTERACTION_L6"
+# v0.23.0（d245fab）播报提档 level 7（权重 700>600，播报期间唤醒/L6 业务被
+# 仲裁丢弃）。注意断言写 L7 而非 SYSTEM_L7：内置 aimdk_msgs（SDK v0.9.4.4）
+# 的 TtsPriorityLevel 枚举只有 1/2/4/6/8/10 常量，Mock 对 7 走兜底渲染 "L7"
+grep -q "priority=L7 weight=0" "${WORK_DIR}/mock_tts.log" || fail "播报优先级不是 L7（weight=0）"
 wait_log "outcome=accepted" "${WORK_DIR}/sim1.log" 5 || {
   cat "${WORK_DIR}/sim1.log" || true
   fail "未收到 tts.result accepted 回执"
 }
-log "用例 1 通过：tts 送达 Mock（INTERACTION_L6）且回执 accepted"
+log "用例 1 通过：tts 送达 Mock（L7）且回执 accepted"
 
 # ---------------------------------------------------------------------------
 # 4. 用例 2：迎宾（scene=welcome）
@@ -175,25 +198,70 @@ log "用例 1 通过：tts 送达 Mock（INTERACTION_L6）且回执 accepted"
 # ---------------------------------------------------------------------------
 $SIM welcome > /dev/null 2>&1
 wait_log "迎宾开始" "${WORK_DIR}/bridge.log" 5 || fail "未见迎宾开始日志"
-wait_log "text='${DEFAULT_WELCOME}'" "${WORK_DIR}/mock_tts.log" 10 || fail "Mock 未收到默认迎宾词"
+# 迎宾变形：scene=welcome 应直调运控确保人形，且**变形完成后才开播**
+#（2026-10-15 需求：先变形、后人声）。Mock 从狗站立起步，按转移表应
+# 依次发 行走态 -> 变形（ROTATE 后自动落位 BIPED_LOCOMOTION_WBC）
+wait_log "迎宾变形进行中，变形完成后开始播报" "${WORK_DIR}/bridge.log" 10 || fail "未见变形等待日志"
+wait_log "action='QUADRUPED_LOCOMOTION_DEFAULT'" "${WORK_DIR}/mock_mc.log" 10 || fail "迎宾变形未先进入四足行走态"
+wait_log "action='QUADRUPED_TO_BIPED_ROTATE'" "${WORK_DIR}/mock_mc.log" 20 || fail "迎宾变形未发变形动作"
+wait_log "迎宾变形完成: 已切到 BIPED_LOCOMOTION_WBC" "${WORK_DIR}/bridge.log" 30 || fail "未见迎宾变形完成日志"
+wait_log "迎宾变形流程结束，开始迎宾播报" "${WORK_DIR}/bridge.log" 5 || fail "未见变形后开播日志"
+wait_log "text='${DEFAULT_WELCOME}'" "${WORK_DIR}/mock_tts.log" 10 || fail "变形完成后未播默认迎宾词"
+# 顺序硬断言：bridge.log 中「变形结束」必须先于「迎宾播报会话开始」
+WAIT_LINE=$(grep -n "迎宾变形流程结束，开始迎宾播报" "${WORK_DIR}/bridge.log" | head -1 | cut -d: -f1)
+SPEAK_LINE=$(grep -n "播报会话开始: 迎宾:" "${WORK_DIR}/bridge.log" | head -1 | cut -d: -f1)
+[ -n "$WAIT_LINE" ] && [ -n "$SPEAK_LINE" ] && [ "$SPEAK_LINE" -gt "$WAIT_LINE" ] \
+  || fail "播报未等到变形完成之后（变形结束行=${WAIT_LINE} 播报开始行=${SPEAK_LINE}）"
 sleep 9  # 迎宾词 22 字 speech~5s + interval 2s：若误循环，~7s 处会出现第二次
 WELCOME_COUNT=$(grep -c "text='${DEFAULT_WELCOME}'" "${WORK_DIR}/mock_tts.log" || true)
 [ "$WELCOME_COUNT" -eq 1 ] || fail "迎宾词应单轮播完不循环（播了 ${WELCOME_COUNT} 次）"
 wait_log "单轮播完，会话结束" "${WORK_DIR}/bridge.log" 5 || fail "迎宾会话未按单轮结束"
-log "用例 2a 通过：迎宾播本地默认词一轮结束（不循环）"
+log "用例 2a 通过：变形完成（行走态->ROTATE->WBC）后才开播，默认词一轮结束"
 
-# 2b. 带 texts -> App 指定迎宾词优先
+# 2b. 带 texts -> App 指定迎宾词优先；再次迎宾应再次查形态——此时已是
+# 人形（Mock 状态 BIPED_LOCOMOTION_WBC），应零动作直接确认（幂等）
 $SIM welcome --text "指定迎宾词甲" --text "指定迎宾词乙" > /dev/null 2>&1
 wait_log "text='指定迎宾词甲'" "${WORK_DIR}/mock_tts.log" 10 || fail "Mock 未收到指定迎宾词甲"
 wait_log "text='指定迎宾词乙'" "${WORK_DIR}/mock_tts.log" 15 || fail "Mock 未收到指定迎宾词乙（按序播第二条）"
+wait_log "已是 BIPED_LOCOMOTION_WBC 且运行中，无需切换" "${WORK_DIR}/bridge.log" 10 || fail "第二次迎宾未做形态确认"
+SET_COUNT=$(grep -c "收到 SetMcAction" "${WORK_DIR}/mock_mc.log" || true)
+[ "$SET_COUNT" -eq 2 ] || fail "已是人形后再次迎宾不应再发动作（SetMcAction 共 ${SET_COUNT} 次，期望 2）"
 sleep 5
 COUNT_A=$(grep -c "text='指定迎宾词甲'" "${WORK_DIR}/mock_tts.log" || true)
 [ "$COUNT_A" -eq 1 ] || fail "指定迎宾词不应循环（甲 ${COUNT_A} 次）"
-log "用例 2b 通过：迎宾 texts 优先且按序单轮（甲→乙）"
+log "用例 2b 通过：迎宾 texts 优先且按序单轮（甲→乙）；已人形时零动作确认"
+
+# 2c. 动作切换中迎宾到达 -> 等稳定后再变形（复现真机 2026-10-15 故障：
+#     App 点坐下 417ms 后迎宾到达，发 STAND 被运控 2003 拒 state=-1008）
+# 注入：向 Mock 运控发「坐下」（受理后 1.5s 内报切换中 200），随即迎宾
+python3 - "${MOCK_MC_SET}" <<'PYEOF' > /dev/null 2>&1
+import sys
+import rclpy
+from aimdk_msgs.srv import SetMcAction
+rclpy.init()
+node = rclpy.create_node("it_mc_inject")
+cli = node.create_client(SetMcAction, sys.argv[1])
+cli.wait_for_service(timeout_sec=5)
+req = SetMcAction.Request()
+req.source = "integration_test"
+req.command.action_desc = "QUADRUPED_SIT_DOWN_DEFAULT"
+fut = cli.call_async(req)
+rclpy.spin_until_future_complete(node, fut, timeout_sec=5)
+node.destroy_node()
+rclpy.shutdown()
+PYEOF
+$SIM welcome > /dev/null 2>&1
+wait_log "尚未稳定，等它稳定" "${WORK_DIR}/bridge.log" 10 || fail "切换中状态未进入等待稳定分支"
+wait_count "收到 SetMcAction" "${WORK_DIR}/mock_mc.log" 5 30 || fail "等稳定后未走完坐下->人形变形（应再发 3 条动作）"
+wait_count "迎宾变形完成: 已切到 BIPED_LOCOMOTION_WBC" "${WORK_DIR}/bridge.log" 2 30 || fail "切换中起点的迎宾变形未完成"
+log "用例 2c 通过：动作切换中迎宾到达 -> 等稳定 -> 坐下->站立->变形成功"
 
 # ---------------------------------------------------------------------------
 # 5. 用例 3：汽车讲解（navigate：mock 导航 2s -> 到达 -> 讲解词按序一轮）
 # ---------------------------------------------------------------------------
+# 等 2c 迎宾互斥窗口过期（串行版里播报在变形 ~15s 后才开始，窗口随之后移；
+# 窗口内新 navigate 会被拒——这是迎宾流程互斥的既定本地策略，不是缺陷）
+sleep 10
 $SIM navigate 3号展台 --text "讲解第一句车型概述" --text "讲解第二句续航参数" > /dev/null 2>&1
 wait_log "导航开始: point=3号展台" "${WORK_DIR}/bridge.log" 5 || fail "未见导航开始日志"
 wait_log "导航到达: 3号展台，开始汽车讲解" "${WORK_DIR}/bridge.log" 10 || fail "Mock 导航未到达"

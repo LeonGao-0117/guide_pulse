@@ -1,25 +1,9 @@
 // ============================================================================
-// MQTT <-> 展厅讲解 桥接节点（机器人侧）
-//
-// 职责：
-//   0. 启动时凭预登记 serial_number 调 Server enroll 注册面换取当次运行的
-//      robot_id 与 MQTT 账号密码（RobotCar 协议 v0.9.0/v0.10.0）：
-//      username 即 robot_id，密码每次 enroll 轮换、只在内存不落盘；
-//      MQTT CONNECT 被拒（0x86/0x87）时重新 enroll 再连
-//   1. 订阅后端 MQTT 下行主题 {prefix}/{robot_id}/down/commands，
-//      接收 type=tts / tts.stop / scene / navigate 指令（其余 type 忽略，
-//      由其他组件处理）
-//   2. tts 为播报列表单轮播完且必须回执 tts.result；
-//      scene=welcome 迎宾（WelcomeModule：一轮迎宾词）；
-//      navigate 导航+汽车讲解（TourModule：NavExecutor 导航，到达后一轮
-//      讲解词）；scene/navigate/tts.stop 无回执（契约）
-//   3. 音频单会话：任一新播报替换当前会话；tts.stop 停一切播报并取消导航
-//   4. 维护 presence（遗嘱/在线）与 heartbeat 上行
-//
-// MQTT 实现沿用 tts_demo / robot_com 模式（vendored paho.mqtt.cpp）：
-//   - paho async_client + MQTT v5，发布附 JSON 内容类型属性
-//   - 下行消息先进队列再由工作线程处理，避免阻塞 paho 回调线程
-//   - 重连由专属连接线程统一驱动（凭据轮换语义需要应用层控制）
+// MQTT <-> 展厅讲解 桥接节点：enroll 换凭据 -> 订阅 down/commands
+//（tts/tts.stop/scene/navigate）-> 播报/导航/迎宾/动作执行 -> 回执与
+// presence/heartbeat 上行。详见 docs/design.md。
+// MQTT：vendored paho（async_client + MQTT v5），下行先进队列由 worker
+// 线程处理，重连由专属连接线程驱动（凭据轮换需应用层控制）。
 // ============================================================================
 #pragma once
 
@@ -41,8 +25,10 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <aimdk_msgs/srv/set_agent_suppression.hpp>
+#include <aimdk_msgs/srv/set_mc_preset_motion.hpp>
 
 #include "guide_pulse/guide_protocol.hpp"
+#include "guide_pulse/mc_transform.hpp"
 #include "guide_pulse/mqtt_guide_bridge_node.hpp"
 #include "guide_pulse/nav_executor.hpp"
 #include "guide_pulse/playlist.hpp"
@@ -87,6 +73,11 @@ private:
   void handle_command(const CommandEvent & event);  // tts / tts.stop / scene / navigate
   void handle_scene(const CommandEvent & event);        // 迎宾模块入口
   void handle_navigate(const CommandEvent & event);     // 讲解模块入口
+  // 迎宾变形（确保人形形态）由 McTransform 模块承担（先变形、后人声的
+  // 同步点在 handle_scene 内 transform_->wait_done()）
+  // 播报伴随动作：TTS 受理成功时触发预设动作（轮换池取下一个）。
+  // 同步短超时（正常毫秒级返回）；失败仅告警绝不影响语音播报
+  void trigger_speech_motion();
   // 开播一个音频会话（替换当前会话——音频单会话策略）
   void start_session(
     std::vector<std::string> texts, const std::string & mode, int interval_seconds,
@@ -124,41 +115,42 @@ private:
   int tts_request_timeout_seconds_{5};
   int tts_wait_timeout_seconds_{0};     // 启动等待服务时长，0=不等待
   int dedupe_capacity_{1024};
-  // ---- 唤醒抑制（迎宾/讲解单轮播报防强打断，v0.23.0）----
-  // 看门狗续期模式：TTL 固定短（suppress_ttl_ms），播报会话进行期间由
-  // worker 周期续期（suppress_renew_interval_ms < TTL），会话结束/取消即
-  // 停止续期并刷短 TTL 快速恢复——抑制窗口与实际播报时长自动贴合，
-  // 不依赖时长估算（实测 TTS 合成+排队延迟使实播≈字数估算 2 倍且波动
-  // 大，一次拍死 TTL 必然要么提前过期被打断、要么播完久不恢复）
+  // ---- 唤醒抑制：看门狗续期（TTL 短，worker 周期续期贴住实际播报
+  // 时长；SDK 无播完事件，尾部宽限 lead+估算×scale，参数校准见 yaml）----
   std::string suppress_service_name_;   // 默认 /aimdk_5Fmsgs/srv/SetAgentSuppression
   bool suppress_wakeup_{true};          // false 关闭（恢复默认可打断行为）
   int suppress_ttl_ms_{8000};           // 每次抑制的 TTL（须大于续期间隔）
   int suppress_renew_interval_ms_{5000};  // 续期间隔（worker 周期刷新）
-  // 尾部宽限两段式估算参数（SDK 无播完事件，字数估算 + 真机校准）：
-  // tail_ms = lead + 估算秒数×1000×scale（max>0 时封顶）。校准方法：
-  // 真机播 2~3 条典型长度文本掐表（PlayTts 受理→听不到声音），
-  // 两点拟合 lead 与每字时长（tts_speech_ms_per_char）
+  // 尾部宽限：tail_ms = lead + 估算秒×1000×scale（max>0 封顶）；
+  // flush=停续期收尾刷的 TTL（0=云端默认 3000ms，1=立即解除）
   int tts_speech_ms_per_char_{220};     // 每字时长（CJK/数字档，拉丁≈0.73 倍）
-  int suppress_tail_lead_ms_{0};        // 固定合成启动延迟（默认 0 不加，
-                                        // 真机校准可填拟合截距）
+  int suppress_tail_lead_ms_{0};        // 固定合成启动延迟（校准填拟合截距）
   double suppress_tail_scale_{0.8};     // 估算放大系数
   int suppress_tail_max_ms_{0};         // 尾部宽限封顶（0=不封顶）
-  int suppress_tail_flush_ms_{1};       // 停续期收尾刷的抑制 TTL（原 0=云端
-                                        // 默认 3000ms，播完后白禁 3s；1=立即解除）
+  int suppress_tail_flush_ms_{1};       // 停续期收尾刷的抑制 TTL
   bool suppress_renew_active_{false};   // 续期进行中（仅 worker 线程访问）
   std::chrono::steady_clock::time_point suppress_next_at_;  // 下次续期时刻
   std::optional<std::chrono::steady_clock::time_point> suppress_stop_at_;
     // 尾部宽限截止：最后一条已受理（语音仍在播），续期持续到该时刻再停
-  // 迎宾流程互斥窗口截止（仅 worker 线程访问）：迎宾词全部播完（估算）。
-  // 窗口内新 scene/navigate 直接拒绝（无回执面，丢弃记日志）；任一新
-  // 会话替换（start_session）或 tts.stop（cancel_session）即失效——
-  // 迎宾音频被打断/替换 = 流程终止
+  // 迎宾互斥窗口截止：窗口内新 scene/navigate 拒绝（无回执面，丢弃记
+  // 日志）；任一会话替换/tts.stop 即失效（迎宾音频被打断 = 流程终止）
   std::optional<std::chrono::steady_clock::time_point> welcome_busy_until_;
   // ---- 展厅讲解增量参数 ----
   std::vector<std::string> welcome_default_texts_;  // scene 未带 texts 时的迎宾词
   int tour_speak_interval_seconds_{2};  // 迎宾/讲解词每两条间隔（载荷无间隔字段）
   std::string nav_executor_name_;       // 当前仅 mock（真机实现后扩展）
   int mock_nav_seconds_{0};             // Mock 导航模拟耗时
+  // ---- 迎宾变形（scene=welcome 时确保人形形态）：由 McTransform 模块
+  // 承担，参数校验在 start() 内完成（welcome_transform 等）----
+
+  // ---- 播报伴随动作（TTS 受理成功时触发预设动作）----
+  std::string mc_source_name_;          // SetMc* 请求 source（变形模块共用）
+  bool motion_enabled_{true};            // false 关闭（只播语音不做动作）
+  std::vector<int32_t> motion_preset_ids_;   // 动作轮换池（参数注入；空=关闭）
+  std::size_t motion_next_index_{0};     // 轮换索引（仅 worker 线程访问）
+  int motion_request_timeout_seconds_{2};
+  rclcpp::Client<aimdk_msgs::srv::SetMcPresetMotion>::SharedPtr motion_client_;
+  rclcpp::CallbackGroup::SharedPtr motion_callback_group_;
   // ---- 迎宾二维码（v0.22.0 P-036：哈希快照 + 文件面按需下载）----
   std::string qr_cache_dir_;            // 本地二维码缓存目录（跨重启保留）
   int qr_download_timeout_seconds_{5};  // 单次下载（连接+传输）超时
@@ -187,6 +179,7 @@ private:
   std::unique_ptr<QrCodeCache> qr_cache_;  // 迎宾二维码缓存/下载（P-036）
   rclcpp::Client<aimdk_msgs::srv::SetAgentSuppression>::SharedPtr suppress_client_;
   rclcpp::CallbackGroup::SharedPtr suppress_callback_group_;
+  std::unique_ptr<McTransform> transform_;  // 迎宾变形（确保人形形态）
   std::unique_ptr<NavExecutor> nav_;    // MockNavExecutor（真机导航对接点）
   std::unique_ptr<TourRunner> tour_;    // 讲解模块状态机
   rclcpp::TimerBase::SharedPtr maintenance_timer_;

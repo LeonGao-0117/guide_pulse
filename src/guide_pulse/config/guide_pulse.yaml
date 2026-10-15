@@ -1,27 +1,18 @@
 # ============================================================================
 # guide_bridge 节点参数
-# 协议基线：RobotCar 协议 v0.22.0（scene v0.17.0 迎宾 + v0.16.0 navigate
-# 导航/汽车讲解 + v0.20.0 随动播报 texts + v0.22.0 迎宾二维码 qr_sha256
-# 哈希快照/文件面按需下载 + tts v0.5.0 播报 + v0.6.0 tts.result 回执 +
-# v0.9.0/v0.10.0 enroll 注册面）。
-# 本地变更：tts 单轮播完自行结束（协议原语义为循环到替换/停止）。
-# 设计与本地策略见 docs/design.md，协议要点见 docs/protocol.md
+# 协议基线：RobotCar v0.22.0（scene/navigate/texts/qr_sha256/tts/tts.result/
+# enroll）。本地变更：tts 单轮播完（协议原语义为循环到替换/停止）。
+# 设计见 docs/design.md，协议要点见 docs/protocol.md
 # ============================================================================
 guide_bridge:
   ros__parameters:
     # ---- MQTT 连接与 enroll 注册面 ----
     broker_uri: "tcp://124.223.200.153:12883"
-    # Server HTTP 注册面。启动时 POST {enroll_origin}/v1/robots/enroll 换取
-    # 凭据：username 即 robot_id（Server 首次 enroll 分配，同 SN 稳定）；
-    # 密码每次轮换，只在内存使用、不落盘不打印；CONNECT 被拒(0x86/0x87)
-    # 时自动重新 enroll 再连。也可用环境变量 GUIDE_PULSE_ENROLL_ORIGIN 注入
+    # POST {enroll_origin}/v1/robots/enroll 换凭据（username=robot_id 同 SN
+    # 稳定；密码每次轮换只存内存；CONNECT 被拒 0x86/0x87 自动重 enroll）
     enroll_origin: "http://124.223.200.153:8780"
-    # 本机序列号（6..64 位）。批量部署留空，按以下顺序自动获取：
-    #   1) 本参数（显式覆盖，仅联调用）
-    #   2) 环境变量 GUIDE_PULSE_SERIAL_NUMBER
-    #   3) serial_number_file 文件（默认 /robot/info/sn，板端标准位置）
-    # SN 必须由运维预先登记：RobotCar/Server 下
-    #   scripts/robot-admin.sh register <SN> guide_pulse
+    # 本机序列号：留空则按 环境变量 GUIDE_PULSE_SERIAL_NUMBER >
+    # serial_number_file 顺序自动获取。SN 须运维预登记（robot-admin.sh）
     serial_number: ""
     serial_number_file: "/robot/info/sn"
     enroll_timeout_seconds: 5
@@ -32,50 +23,59 @@ guide_bridge:
     heartbeat_interval_seconds: 20       # 0 关闭心跳
 
     # ---- 展厅讲解增量 ----
-    # 导航执行器：mock（联调/测试，模拟 mock_nav_seconds 秒后到达）
-    # 或 waypoint（真机：对接 t1_slam_nav_ws 航点巡航 /waypoint_follower
-    # 服务，point_name 直接映射航点名，航点表归 t1_slam_nav_ws 维护）
+    # 导航执行器：mock（联调）或 waypoint（真机：对接 t1_slam_nav_ws 的
+    # /waypoint_follower 航点服务，point_name 即航点名）
     nav_executor: "mock"
     mock_nav_seconds: 0                  # Mock 导航模拟行走秒数（0=立即到达）
     tour_speak_interval_seconds: 2       # 迎宾词/讲解词每两条之间的间隔秒
     welcome_default_texts:               # scene 未带 texts 时的本地默认迎宾词
       - "欢迎光临！我是展厅讲解机器人，很高兴为您服务。"
 
+    # ---- 迎宾变形（scene=welcome 时确保人形形态，直调厂家运控）----
+    # 对齐 t1_slam_nav_ws 的 stand_if_down.py（SetMcAction/GetMcAction，
+    # source 非空即可无需注册，与导航速度桥并存不冲突）。已是人形零
+    # 动作；四足态按 SDK 转移表逐步变形；趴姿默认扶起再变形。
+    # 时序（先变形、后人声）：变形与二维码处理并行，两者就绪后等变形
+    # 结束才开 TTS；变形失败/超时仍照常播报
+    welcome_transform: true              # false 关闭（保持当前姿态直接播报）
+    welcome_stand_from_down: true        # 趴姿是否一路扶起再变形
+    get_action_service: "/aimdk_5Fmsgs/srv/GetMcAction"  # SDK 固定服务名
+    set_action_service: "/aimdk_5Fmsgs/srv/SetMcAction"  # SDK 固定服务名
+    mc_source_name: "guide_pulse"        # SetMcAction 信源名（非空即可）
+    transform_wait_timeout_seconds: 60   # 变形全程时限（最长五步含起立）
+
+    # ---- 播报伴随动作（TTS 受理成功时触发预设动作）----
+    # 每条播报从轮换池取下一个动作触发，interrupt=true 打断上一个伴随
+    # 动作；失败仅告警不影响播报。枚举：1001 右手挥手 / 1011 左手挥手 /
+    # 2003~2009 说话动作族 / 1005 加油欢呼 / 2001 双手比心
+    motion_enabled: true                 # false 关闭（只播语音不做动作）
+    motion_preset_ids: [1001]            # 动作轮换池（当前：右手挥手打招呼）
+    motion_service_name: "/aimdk_5Fmsgs/srv/SetMcPresetMotion"
+    motion_request_timeout_seconds: 2    # 单次调用超时（正常毫秒级返回）
+
     # ---- SDK TTS 服务（sdk_t1-v0.9.4.4）----
     tts_service_name: "/aimdk_5Fmsgs/srv/PlayTts"  # SDK 固定服务名，勿修改
     tts_domain: "guide_pulse"            # 调用方来源标识（SDK 审计用）
     stop_text: '<speak><break time="300ms"/></speak>'
-                                         # 停止抢占文本：SSML 静音段（tts_demo
-                                         # 实测：完全无声、任务正常完结）。
-                                         # 警告：勿改纯标点"。"——任务无法完结，
-                                         # 仲裁通道会被 1099 卡住 30-60 秒
-    # SDK 仲裁：新任务权重(level*100+weight) < 当前播报任务时直接丢弃。
-    # 迎宾/讲解播报用 SYSTEM_L7+0=700：高于 INTERACTION_L6=600（语音唤醒
-    # 响应/实时交互首句档位），播报期间唤醒/其他 L6 业务请求被仲裁丢弃，
-    # 迎宾词与讲解词完整播完不被抢话（若需允许唤醒打断改回 6）；
-    # WARNING_L8/SAFETY_L10（避障预警/安全警报）仍可打断（合理保留）。
-    # 停止由 tts_client 硬编码 SAFETY_L10+99=1099 抢占，保证能掐断一切播报
+                                         # 停止抢占文本：SSML 静音段（完全
+                                         # 无声、任务正常完结）。勿改纯标点
+                                         # "。"——任务无法完结，通道被卡 30-60s
+    # SDK 仲裁：新任务权重(level*100+weight) < 当前播报时直接丢弃。
+    # L7=700 > 唤醒响应档 L6=600，播报期间唤醒/L6 请求被仲裁丢弃不被
+    # 抢话；L8/L10 安全预警仍可打断（合理）。停止由 tts_client 用
+    # 1099 最高权重抢占，保证掐断一切
     tts_priority_level: 7
     tts_priority_weight: 0
     tts_retry_seconds: 3                 # 被仲裁拒绝后隔几秒快速重试
     tts_request_timeout_seconds: 5       # 单次 PlayTts 调用超时
     tts_wait_timeout_seconds: 0          # 启动时等待 TTS 服务时长；0=不等待
 
-    # ---- 唤醒抑制（迎宾/讲解单轮播报防强打断 v0.23.0，看门狗续期模式）----
-    # 背景：agent 唤醒强打断(strong_interrupt)不走 TTS 优先级仲裁，
-    # SPEAKING 状态必掐断播报（真机日志证实，L7 也防不住）。官方出口：
-    # SetAgentSuppression(WAKEUP, ttl) 抑制唤醒。
-    # 模式：TTL 固定短，播报进行期间 worker 周期续期（间隔须小于 TTL），
-    # 会话结束转入尾部宽限后停止续期并立即解除。
-    # 仅单轮会话（tts/迎宾/讲解）抑制唤醒；PlaylistSession 的循环模式
-    #（当前无调用方）不抑制
-    #
-    # 尾部宽限估算（SDK 无播完事件——流式合成下 estimated_duration 恒 0
-    # 且无播完话题，官方建议即字数预估）：
-    #   tail_ms = suppress_tail_lead_ms + 估算秒数×1000×suppress_tail_scale
-    #             （suppress_tail_max_ms>0 时封顶）
-    # 校准方法：真机播 2~3 条典型长度文本掐表（下发受理→听不到声音），
-    # 两点拟合 lead（截距）与每字时长（斜率，填 tts_speech_ms_per_char）
+    # ---- 唤醒抑制（看门狗续期；防 agent strong_interrupt 强打断——
+    # 强打断不走 TTS 优先级仲裁，L7 也防不住，官方出口即本服务）----
+    # TTL 固定短，播报期间 worker 周期续期；尾部宽限（SDK 无播完事件，
+    # estimated_duration 恒 0，只能字数估算）：
+    #   tail_ms = lead + 估算秒×1000×scale（max>0 时封顶）
+    # 校准：掐表 2~3 条文本（受理→听不到声音）拟合 lead 与每字时长
     suppress_service_name: "/aimdk_5Fmsgs/srv/SetAgentSuppression"  # 固定服务名
     suppress_wakeup: true                # false 关闭（恢复默认可打断）
     suppress_ttl_ms: 8000                # 每次抑制 TTL（> 续期间隔）
@@ -89,25 +89,20 @@ guide_bridge:
     suppress_tail_flush_ms: 1            # 停续期收尾刷的抑制 TTL ms
                                          #（0=云端默认 3000ms；1=立即解除）
 
-    # ---- 屏幕二维码显示（迎宾场景 v0.22.0 P-036，SDK PlayEmotion）----
-    # 迎宾指令(scene=welcome)携带 qr_sha256（Server 端二维码内容哈希快照）：
-    # 与本地缓存(qr_cache_dir，文件名内嵌哈希)比对，命中直接显示免下载；
-    # 未命中以 MQTT 凭据(HTTP Basic)从 {enroll_origin}/v1/robots/{robot_id}
-    # /qr-code/content 下载图片（sha256+PNG/JPEG 魔数+≤512KiB 校验后原子
-    # 替换缓存），本机 ffmpeg 转 848x480 H.264 MP4 后 scp 推送运控板，
-    # PlayEmotion(file, loop_count=0) 无限循环常驻；5 分钟超时或任意新业务
-    # (tts/scene/navigate/tts.stop)到达即恢复默认表情。scene 未携带
-    # qr_sha256（App 未上传/已清除）则本次不显示二维码。
-    # 多板架构：PlayEmotion 由运控板(10.1.1.100)执行，MP4 必须在其文件
-    # 系统上，故需 sshpass 推送；display_remote_pass 为空则显示禁用
-    #（迎宾 TTS 不受影响）
+    # ---- 屏幕二维码显示（迎宾场景，SDK PlayEmotion）----
+    # qr_sha256 与本地缓存（qr_cache_dir，文件名内嵌哈希）比对，命中免
+    # 下载；未命中从 {enroll_origin}/v1/robots/{id}/qr-code/content 下载
+    #（sha256+魔数+≤512KiB 校验后原子替换），ffmpeg 转 848x480 MP4 后
+    # scp 推运控板 PlayEmotion(loop=0) 常驻；3 分钟超时或新业务恢复默认
+    # 表情。未携带 qr_sha256 则不显示。PlayEmotion 在运控板执行，MP4 须
+    # 推送过去；display_remote_pass 空=禁用显示（迎宾语音不受影响）
     display_emotion_service_name: "/aimdk_5Fmsgs/srv/PlayEmotion"  # SDK 固定，勿改
     display_remote_host: "10.1.1.100"    # 运控板（PlayEmotion 执行板）
     display_remote_user: "run"
     display_remote_pass: "1"             # scp 推送密码；空=禁用显示
     display_remote_dir: "/home/run/screen_display"  # 运控板 MP4 存放目录
     display_request_timeout_seconds: 5   # 单次 PlayEmotion 调用超时
-    display_show_timeout_seconds: 300    # 二维码常驻时长（5 分钟）
+    display_show_timeout_seconds: 180    # 二维码常驻时长（3 分钟）
     display_restore_emotion_id: 90       # 取消后恢复的 T1 默认表情
     qr_cache_dir: "/tmp/guide_pulse/qr_cache"  # 二维码本地缓存目录
                                          #（文件名内嵌哈希；跨重启保留可免
@@ -115,8 +110,6 @@ guide_bridge:
     qr_download_timeout_seconds: 5       # 二维码单次下载（连接+传输）超时
 
     # ---- 协议限制 ----
-    # texts 1..20 条、每条 1..2048 字节（契约校验，无本地截断）；
-    # tts/迎宾/讲解均单轮播完自行结束（tts 与协议原语义
-    # "循环播到替换/tts.stop"有偏差）；
-    # tts.result 回执同 operation_id 重发复用缓存（同 event_id）
+    # texts 1..20 条、每条 1..2048 字节；tts/迎宾/讲解均单轮播完；
+    # tts.result 同 operation_id 重发复用缓存
     dedupe_capacity: 1024                # operation_id 去重表/回执缓存容量

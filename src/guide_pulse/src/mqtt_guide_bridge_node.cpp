@@ -6,9 +6,13 @@
 #include "guide_pulse/mqtt_guide_bridge_node.hpp"
 
 #include <algorithm>
+#include <map>
+#include <set>
 #include <utility>
 
 #include <nlohmann/json.hpp>
+
+#include "guide_pulse/service_call.hpp"
 
 namespace guide_pulse
 {
@@ -112,7 +116,7 @@ void MqttGuideBridgeNode::declare_and_load_params()
     "display_remote_pass", "");  // 空禁用显示；亦可环境变量注入后写入参数
   declare_parameter<std::string>("display_remote_dir", "/home/run/screen_display");
   declare_parameter<int>("display_request_timeout_seconds", 5);
-  declare_parameter<int>("display_show_timeout_seconds", 300);  // 5 分钟
+  declare_parameter<int>("display_show_timeout_seconds", 180);  // 3 分钟
   declare_parameter<int>("display_restore_emotion_id", 90);     // T1 默认表情
 
   // ---- 迎宾二维码缓存/下载（v0.22.0 P-036：scene 带 qr_sha256 哈希快照，
@@ -128,6 +132,34 @@ void MqttGuideBridgeNode::declare_and_load_params()
   declare_parameter<std::vector<std::string>>(
     "welcome_default_texts",
     std::vector<std::string>{"欢迎光临！我是展厅讲解机器人，很高兴为您服务。"});
+
+  // ---- 迎宾变形（scene=welcome 时确保人形形态，直调厂家运控）----
+  // 参数由 McTransform 模块消费（构造见 start()），此处仅声明默认值
+  declare_parameter<bool>("welcome_transform", true);
+  // 趴姿（被动/趴下/坐下/阻尼/躺下）是否一路扶起再变形。迎宾由后端在
+  // 有人到场时触发，与「远程下发航点」场景不同，默认扶起；false 则趴着
+  // 只播报不变形（与导航栈 ensure_biped 的保守策略一致）
+  declare_parameter<bool>("welcome_stand_from_down", true);
+  declare_parameter<std::string>(
+    "get_action_service", "/aimdk_5Fmsgs/srv/GetMcAction");  // SDK 固定服务名
+  declare_parameter<std::string>(
+    "set_action_service", "/aimdk_5Fmsgs/srv/SetMcAction");  // SDK 固定服务名
+  // SetMcAction.request.source：非空即可（无需 SetMcInputSource 注册）。
+  // 用独立名字便于在运控日志里分辨「这条变形是谁发的」
+  declare_parameter<std::string>("mc_source_name", "guide_pulse");
+  // 变形全程时限：最长路径五步（阻尼/躺下 -> 被动 -> 狗站立 -> 行走态 ->
+  // 变形），狗站立三步实测十余秒，60s 留足余量
+  declare_parameter<int>("transform_wait_timeout_seconds", 60);
+
+  // ---- 播报伴随动作（TTS 受理成功时触发预设动作）----
+  declare_parameter<bool>("motion_enabled", true);
+  // 预设动作轮换池（McPresetMotion 枚举值：1001=右手挥手，2003~2009
+  // 为说话动作族；多条时每次播报轮换一个）
+  declare_parameter<std::vector<int64_t>>(
+    "motion_preset_ids", std::vector<int64_t>{1001});
+  declare_parameter<std::string>(
+    "motion_service_name", "/aimdk_5Fmsgs/srv/SetMcPresetMotion");
+  declare_parameter<int>("motion_request_timeout_seconds", 2);
 
   broker_uri_ = get_parameter("broker_uri").as_string();
   enroll_origin_ = get_parameter("enroll_origin").as_string();
@@ -379,6 +411,67 @@ bool MqttGuideBridgeNode::start()
       suppress_service_name_, rmw_qos_profile_services_default, suppress_callback_group_);
   }
 
+  // ---- 迎宾变形（scene=welcome 时确保人形形态）----
+  // 直调厂家运控服务（本体固件提供），与 t1_slam_nav_ws 是否在跑无关；
+  // 服务不在也允许启动——联调环境没有运控时迎宾只多一条 WARN，播报不受影响
+  McTransform::Config transform_cfg;
+  transform_cfg.enabled = get_parameter("welcome_transform").as_bool();
+  transform_cfg.stand_from_down = get_parameter("welcome_stand_from_down").as_bool();
+  transform_cfg.get_action_service = get_parameter("get_action_service").as_string();
+  transform_cfg.set_action_service = get_parameter("set_action_service").as_string();
+  mc_source_name_ = get_parameter("mc_source_name").as_string();
+  transform_cfg.source_name = mc_source_name_;
+  transform_cfg.wait_timeout_seconds = std::max(5, static_cast<int>(
+    get_parameter("transform_wait_timeout_seconds").as_int()));
+  if (mc_source_name_.empty()) {
+    // 空 source 会被运控以 Invalid source 当场拒掉（state=-10002），而表象
+    // 只是「等不到位超时」——这儿响亮拦住，不带注定被拒的请求跑下去
+    RCLCPP_WARN(
+      get_logger(), "mc_source_name 为空：迎宾变形禁用（运控会拒空 source 请求）");
+    transform_cfg.enabled = false;
+  }
+  transform_ = std::make_unique<McTransform>(shared_from_this(), transform_cfg);
+  if (transform_cfg.enabled) {
+    RCLCPP_INFO(
+      get_logger(),
+      "迎宾变形已启用: 直调运控 %s / %s（已是人形则不动；趴姿%s扶起）",
+      transform_cfg.set_action_service.c_str(),
+      transform_cfg.get_action_service.c_str(),
+      transform_cfg.stand_from_down ? "默认" : "不");
+  } else {
+    RCLCPP_INFO(get_logger(), "迎宾变形已关闭（welcome_transform=false）");
+  }
+
+  // ---- 播报伴随动作 ----
+  // 独立于迎宾变形开关（动作在当前形态下直接执行；变形流程本身也会
+  // 保证人形）。服务不在也允许启动——动作失败仅 WARN，播报不受影响
+  motion_enabled_ = get_parameter("motion_enabled").as_bool();
+  {
+    // 先拷贝再迭代：as_integer_array() 返回 Parameter 内部引用，
+    // 直接 range-for 临时 Parameter 会悬空（真机踩坑：读到垃圾值）
+    const auto motion_ids = get_parameter("motion_preset_ids").as_integer_array();
+    for (const auto id : motion_ids) {
+      if (id > 0) {
+        motion_preset_ids_.push_back(static_cast<int32_t>(id));
+      }
+    }
+  }
+  motion_request_timeout_seconds_ = std::max(1, static_cast<int>(
+    get_parameter("motion_request_timeout_seconds").as_int()));
+  if (motion_enabled_ && !motion_preset_ids_.empty()) {
+    motion_callback_group_ = create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive);
+    motion_client_ = create_client<aimdk_msgs::srv::SetMcPresetMotion>(
+      get_parameter("motion_service_name").as_string(),
+      rmw_qos_profile_services_default, motion_callback_group_);
+    RCLCPP_INFO(
+      get_logger(), "播报伴随动作已启用: %zu 个动作轮换（首个=%d）",
+      motion_preset_ids_.size(), motion_preset_ids_.front());
+  } else {
+    RCLCPP_INFO(
+      get_logger(), "播报伴随动作已关闭（motion_enabled=false 或动作池为空）");
+  }
+
   // 导航执行器：mock（联调/测试）或 waypoint（真机，对接 t1_slam_nav_ws
   // 的 waypoint_follower 航点巡航服务，docs/design.md §4）
   if (nav_executor_name_ == "waypoint") {
@@ -574,6 +667,12 @@ void MqttGuideBridgeNode::shutdown() noexcept
   queue_cv_.notify_all();
   if (worker_thread_.joinable()) {
     worker_thread_.join();
+  }
+  // 变形线程在 worker 之后回收：worker（handle_scene 发起变形）已收尾，
+  // 变形线程的等待循环每 500ms 检查关停（rclcpp::ok()，Ctrl-C 已触发），
+  // 约半秒内退出
+  if (transform_) {
+    transform_->shutdown();
   }
   // 连接线程可能阻塞在 enroll HTTP / connect 等待（均有超时上限），可安全 join
   if (connect_thread_.joinable()) {
@@ -796,7 +895,7 @@ void MqttGuideBridgeNode::worker_loop()
         }
       } else if (screen_ && screen_->active() && now >= screen_->deadline()) {
         // 二维码常驻超时：恢复默认表情（PlayEmotion 单通道，新请求即打断）
-        screen_->cancel("超时5min");
+        screen_->cancel("超时3min");
       } else if (tour_) {
         // 到达槽消费（导航中 250ms 轮询；空闲时到达事件也会在唤醒后被拾取）
         if (const auto arrival = tour_->poll_arrival()) {
@@ -911,11 +1010,13 @@ void MqttGuideBridgeNode::handle_command(const CommandEvent & event)
 void MqttGuideBridgeNode::handle_scene(const CommandEvent & event)
 {
   // 协议层已保证 scene=welcome（可扩展枚举唯一值），未知值在解析层丢弃
+
+  // ---- 迎宾变形：异步发起，二维码就绪后等变形完成再开播（先变形、
+  // 后人声）；已是人形零动作立即通过 ----
+  transform_->ensure_biped("迎宾:" + event.operation_id);
+
   auto texts = make_welcome_texts(event.texts, welcome_default_texts_);
-  // ---- 二维码（v0.22.0 P-036）：qr_sha256 哈希快照驱动 ----
-  // 省略 -> 本次不显示（并取消常驻中的旧二维码）；携带 -> 缓存命中免下载，
-  // 未命中经文件面拉取一次（校验哈希后原子替换缓存）。二维码缺失只影响
-  // 显示：不阻塞迎宾动作、不产生上行事件
+  // ---- 二维码：qr_sha256 与缓存比对，命中免下载；缺失只影响显示 ----
   if (event.qr_sha256.empty()) {
     RCLCPP_INFO(
       get_logger(), "迎宾开始: operation_id=%s 迎宾词=%zu 条 二维码=无（未携带 qr_sha256）",
@@ -951,12 +1052,27 @@ void MqttGuideBridgeNode::handle_scene(const CommandEvent & event)
       }
     }
   }
-  // 迎宾流程互斥窗口：至迎宾词全部播完。SDK 无播完事件，只能字数估算——
-  // 公式与唤醒抑制尾部宽限保持一致（每条 = suppress_tail_lead_ms +
-  // 估算秒×1000×suppress_tail_scale，共用同一组参数、同步生效），
-  // 另加条间间隔总和。窗口内新 scene/navigate 被拒（handle_command
-  // 入口检查）；任一 start_session 替换 / cancel_session（tts.stop 等）
-  // 即失效。注意：赋值须在 start_session 之后（其内部会 reset 旧窗口）
+  // ---- 等待变形完成后再开播（2026-10-15 需求：先变形、后人声）----
+  // wait_done 必然在有限时间返回：变形线程内部每层等待都有上限（单次服务
+  // 调用 3s / 动作到位总时限 / 等稳定 10s），运控不可达时更是立即放弃并
+  // 照常播报。等待期间新指令在下行队列排队（worker 串行，处理完迎宾才
+  // 轮到它们）；二维码的下载/转码/推送（实测 ~3.5s）与变形并行重叠，总
+  // 时长 = max(变形, 二维码) 而非两者之和。worker 与本函数同线程调用
+  // transform_，无并发；shutdown 先 join worker 再回收变形线程
+  if (transform_->in_flight()) {
+    RCLCPP_INFO(
+      get_logger(), "迎宾变形进行中，变形完成后开始播报: 迎宾:%s",
+      event.operation_id.c_str());
+  }
+  if (transform_->wait_done()) {
+    // 变形结束（成败均已在变形线程记日志），开始迎宾播报
+    RCLCPP_INFO(
+      get_logger(), "迎宾变形流程结束，开始迎宾播报: 迎宾:%s",
+      event.operation_id.c_str());
+  }
+
+  // 迎宾互斥窗口：公式同唤醒抑制尾部宽限（lead+估算×scale，共用参数）
+  // + 条间间隔；赋值须在 start_session 之后（其内部 reset 旧窗口）
   int64_t welcome_busy_ms = 0;
   for (const auto & t : texts) {
     welcome_busy_ms += suppress_tail_lead_ms_ +
@@ -971,6 +1087,48 @@ void MqttGuideBridgeNode::handle_scene(const CommandEvent & event)
     /*loop_forever=*/false, "迎宾:" + event.operation_id);
   welcome_busy_until_ = std::chrono::steady_clock::now() +
     std::chrono::milliseconds(welcome_busy_ms);
+}
+
+// ---------------------------------------------------------------------------
+// 播报伴随动作：TTS 受理成功时从轮换池取下一个预设动作触发。
+// worker 线程同步调用（正常毫秒级返回；异常最多阻塞 motion_request_
+// timeout_seconds，不影响 5s 周期的抑制续期）。失败仅告警不重试不阻断。
+// ---------------------------------------------------------------------------
+void MqttGuideBridgeNode::trigger_speech_motion()
+{
+  if (!motion_enabled_ || !motion_client_ || motion_preset_ids_.empty()) {
+    return;  // 功能关闭：只播语音不做动作
+  }
+  const auto motion_id = motion_preset_ids_[
+    motion_next_index_ % motion_preset_ids_.size()];
+  ++motion_next_index_;
+
+  auto request = std::make_shared<aimdk_msgs::srv::SetMcPresetMotion::Request>();
+  request->header.stamp = now();
+  request->source = mc_source_name_.empty() ? "guide_pulse" : mc_source_name_;
+  request->area.value = 0;  // NONE：预设动作按整体编排执行
+  request->motion.value = motion_id;
+  request->interrupt = true;  // 打断上一个伴随动作（语音才是主时间轴）
+
+  const auto response = call_with_timeout(
+    *motion_client_, request, motion_request_timeout_seconds_);
+  if (!response) {
+    RCLCPP_WARN(
+      get_logger(), "播报动作 %d 无应答（跳过，播报不受影响）", motion_id);
+    return;
+  }
+  const auto & result = response->response;
+  if (result.header.code == 0) {
+    RCLCPP_INFO(
+      get_logger(), "播报动作已触发: id=%d task_id=%lu state=%d",
+      motion_id, static_cast<unsigned long>(result.task_id),
+      result.state.value);
+  } else {
+    RCLCPP_WARN(
+      get_logger(), "播报动作 %d 被拒: code=%ld state=%d reason=%d（播报不受影响）",
+      motion_id, static_cast<long>(result.header.code), result.state.value,
+      result.state.reason);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,6 +1246,8 @@ TtsClient::Result MqttGuideBridgeNode::play_current()
 
   const auto result = tts_->play(command);
   if (result.ok) {
+    // 语音受理成功即触发伴随动作（动作与语音并行；失败只记日志）
+    trigger_speech_motion();
     const bool more = session_->advance();
     if (!more) {
       // 单轮模式一轮播完（受理完最后一条，语音仍在播）：会话结束，续期

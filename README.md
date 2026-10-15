@@ -21,7 +21,7 @@ APP 经 Server（RobotCar 协议 v0.21.0）下发参数到 Robot，Robot 本地�
 
 | 展厅功能 | 协议指令 | 回执 | Robot 本地行为 |
 | --- | --- | --- | --- |
-| 迎宾 | `scene`（`scene="welcome"` + 可选 `texts`） | 无 | 播迎宾词一轮（texts 缺省用 `welcome_default_texts`） |
+| 迎宾 | `scene`（`scene="welcome"` + 可选 `texts`） | 无 | 先确保人形形态（直调运控 SetMcAction/GetMcAction，已是人形零动作；不依赖 t1_slam_nav_ws），**变形完成后才播**迎宾词一轮（texts 缺省用 `welcome_default_texts`；二维码处理与变形并行） |
 | 导航 + 汽车讲解 | `navigate`（`point_name` + 可选 `texts`） | 无 | 导航到点位，到达后按序播讲解词一轮 |
 | 播报 | `tts`（`texts`+`mode`+`interval_seconds`） | `tts.result` | 列表单轮播完自行结束（2026-10-14 变更，原为循环播到替换/停止） |
 | 停止 | `tts.stop` | 无 | 停一切播报并取消导航 |
@@ -121,6 +121,14 @@ bash tools/run_integration_test.sh                                        # 7 �
   `waypoint`（真机，对接 t1_slam_nav_ws `/waypoint_follower` 航点服务，
   `point_name` 直接映射航点名，详见 `docs/design.md` §4）。真机启用
   前置条件：t1_slam_nav_ws 航点巡航在该机上可用。
+- 迎宾变形（2026-10-15）：迎宾时直调厂家运控（`SetMcAction`/
+  `GetMcAction`，本体固件提供）确保人形——狗站立/行走态按 SDK 转移表
+  逐步变形，已是人形零动作，趴姿默认一路扶起（`welcome_stand_from_down`
+  可关）。**不依赖 t1_slam_nav_ws**（与导航栈速度桥并存安全，发动作
+  无需信源注册）。变形与播报/二维码并行，失败不阻断语音。无真机联调
+  用 `scripts/mock_mc_service.py`（集成测试已覆盖完整转移序列）。
+  已知取舍：变形音与头顶摄像头伸出跟随的是导航栈（速度桥）的行为，
+  迎宾直调路径不附带这两项。
 - 迎宾动作（招手）预留参数 `welcome_motion_id`（默认 0 禁用）：动作 ID 因
   机型而异，真机校准后启用。
 - `relocate` / `ota.start` 等指令静默忽略（由其他组件处理）。

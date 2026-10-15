@@ -83,16 +83,42 @@
 输入 `scene` 指令；只认 `scene="welcome"`（可扩展枚举的当前唯一值，
 未知值记日志忽略）。行为：
 
-1. 确定迎宾词：指令 `texts` 优先，缺省用参数 `welcome_default_texts`；
-2. 迎宾二维码（v0.22.0 P-036，`qr_sha256` 哈希快照驱动）：
+1. **迎宾变形**（2026-10-15）：**直调厂家运控服务**（本体固件提供的
+   `/aimdk_5Fmsgs/srv/GetMcAction` + `SetMcAction`）确保人形形态——
+   做法、转移表与回执判定口径对齐 t1_slam_nav_ws 的 `stand_if_down.py` /
+   `mc_velocity_bridge.py`（那边真机实测校准过），但**不依赖
+   t1_slam_nav_ws 是否在跑**；发动作不需要信源注册（`source` 非空即可，
+   与导航栈速度桥并存不冲突，`stand_if_down.py` 即此先例）。
+   行为：已是人形（`BIPED_LOCOMOTION_WBC` + RUNNING）则零动作直接确认；
+   狗站立/四足行走态按 SDK 转移表逐步变形（变形动作发完等运控自动落位，
+   SDK 明确勿手动再发 WBC）；趴姿由 `welcome_stand_from_down`（默认
+   true）决定是否一路扶起再变形——迎宾由后端在有人到场时触发，与远程
+   下发航点的场景不同；表外动作（空翻/跳舞等）拒绝不猜。
+   **时序（2026-10-15 需求：先变形、后人声）**：变形异步发起，二维码
+   处理（下载/转码/推送 ~3.5s）与变形并行重叠，两者就绪后**等变形结束
+   才开 TTS 会话**——总时长 = max(变形, 二维码)。变形失败/超时仍照常
+   播报（姿态链路失败不阻断语音）。等待期间新指令在下行队列排队，
+   迎宾互斥窗口自开播时起算。防抖三件套（均为真机实测教训）：
+   规划前等上一个动作稳定（2003 拒绝，state=-1008）、中间动作 dwell
+   3s 连续保持（1008 限频，state=-10001）、回执 SUCCESS=1/已目标态
+   reason=16 非失败。消息类型注意：SDK v0.9.4.4 的 `McActionInfo.msg`
+   缺 `source` 字段，与运控固件（v0.9.4.8+）DDS 类型不匹配，内置
+   `src/aimdk_msgs` 已按固件版补齐该字段；
+1b. **播报伴随动作**（2026-10-15）：每条语音（迎宾/讲解/tts）PlayTts
+   受理成功时从 `motion_preset_ids` 轮换池取一个 `SetMcPresetMotion`
+   预设动作触发（默认 1001 右手挥手打招呼），动作与语音并行、
+   `interrupt=true` 打断上一个伴随动作；worker 同步短超时调用（正常
+   毫秒级），失败仅 WARN 不重试不阻断播报。独立于迎宾变形开关；
+2. 确定迎宾词：指令 `texts` 优先，缺省用参数 `welcome_default_texts`；
+3. 迎宾二维码（v0.22.0 P-036，`qr_sha256` 哈希快照驱动）：
    `QrCodeCache` 与本地单文件缓存比对——命中直接取缓存图片（免下载），
    未命中经 Server 文件面（HTTP Basic = 自身 MQTT 凭据）下载一次，
    sha256 + PNG/JPEG 魔数 + ≤512KiB 校验后原子替换缓存（文件名内嵌
    哈希 `qr_{sha256}.{png|jpg}`，旧哈希文件淘汰）；`ScreenDisplay` 将
    图片 ffmpeg 转 848x480 MP4 推运控板常驻显示。`qr_sha256` 省略/
    下载失败/校验失败：本次不显示二维码，不影响迎宾播报，不上报；
-3. 开一轮 PlaylistSession（替换当前任何播报——音频单会话，见 3.4）；
-4. 迎宾动作（SDK `SetMcPresetMotion` 招手）预留参数 `welcome_motion_id`
+4. 开一轮 PlaylistSession（替换当前任何播报——音频单会话，见 3.4）；
+5. 迎宾动作（SDK `SetMcPresetMotion` 招手）预留参数 `welcome_motion_id`
    （默认 0=禁用）。动作 ID 因机型而异（文档 examples：T1=1002 招手，
    另一机型=3001），真机校准后再启用。// ponytail: 默认只播报，动作待真机校准 ID 后开启
 
@@ -156,7 +182,7 @@
   协议无回执面）。二维码显示独立于播报会话：播完后**继续常驻**，
   直至 ①任意新业务（tts/scene/navigate/tts.stop）到达立即取消
   （新 scene 重入则重新显示并重置超时）或 ②`display_show_timeout_seconds`
-  （默认 300s）超时自动恢复默认表情——二者取先到者。
+  （默认 180s）超时自动恢复默认表情——二者取先到者。
 - 幂等：按 `event_id` 去传输重复、按 `operation_id` 防重复副作用
   （同一 operation_id 的 scene/navigate 不重复触发；tts 重发重发同一回执）。
 
@@ -225,7 +251,7 @@ class NavExecutor {
 | 播报状态机（纯 C++） | `test_playlist.cpp` | sequence/shuffle、单轮结束、无界循环、失败重试推进 |
 | 迎宾模块（纯 C++） | `test_welcome.cpp` | texts 优先/默认词回退、未知 scene 值忽略 |
 | 讲解模块（纯 C++，FakeNav） | `test_tour.cpp` | start/到达开播/失败不开播/替换/取消 |
-| 端到端集成 | `tools/run_integration_test.sh` | enroll Mock + mosquitto + 桥接 + Mock TTS + 后端模拟器发 scene/navigate/tts/tts.stop，断言日志与回执 |
+| 端到端集成 | `tools/run_integration_test.sh` | enroll Mock + mosquitto + 桥接 + Mock TTS + Mock 运控（SetMcAction/GetMcAction 状态机，迎宾变形走完整转移序列断言）+ 后端模拟器发 scene/navigate/tts/tts.stop，断言日志与回执 |
 
 ## 7. 明确后置
 

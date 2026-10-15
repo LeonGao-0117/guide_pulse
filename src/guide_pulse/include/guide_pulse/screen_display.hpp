@@ -3,7 +3,7 @@
 //   迎宾指令触发 -> QrCodeCache 提供本地二维码图片（缓存/下载见
 //   qr_code_cache.hpp）-> 本地 ffmpeg 转 848x480 H.264 MP4 -> sshpass scp
 //   推送到运控板 -> PlayEmotion(file, loop_count=0) 无限循环常驻 ->
-//   5 分钟超时或新业务到达时 cancel() 恢复默认表情打断视频。
+//   3 分钟超时或新业务到达时 cancel() 恢复默认表情打断视频。
 //
 // 多板架构（实测结论，见 docs/design.md §屏幕显示）：
 //   PlayEmotion 服务由运控板 (默认 10.1.1.100) 实际执行，file_paths 必须
@@ -50,7 +50,7 @@ public:
     std::string local_tmp_dir{"/tmp/guide_pulse"};  // MP4 本地暂存
     // ---- 行为参数 ----
     int request_timeout_seconds{5};           // 单次 PlayEmotion 调用超时
-    int show_timeout_seconds{300};            // 二维码常驻时长（默认 5 分钟）
+    int show_timeout_seconds{180};            // 二维码常驻时长（默认 3 分钟）
     int restore_emotion_id{90};               // 取消显示后恢复的默认表情
   };
 
