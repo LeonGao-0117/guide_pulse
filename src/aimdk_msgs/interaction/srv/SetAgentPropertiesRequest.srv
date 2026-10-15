@@ -1,0 +1,7 @@
+# 设置 Agent 属性（拷自运控板 aimrt_pulsecore 完整消息包）。
+# 唤醒抑制云端失效期间的本地替代：RUN_MODE=only_voice 关闭语音助手
+#（唤醒引擎不工作，唤醒词物理无效），恢复 normal 重新启用
+CommonRequest header
+AgentProperties contents
+---
+CommonResponse header

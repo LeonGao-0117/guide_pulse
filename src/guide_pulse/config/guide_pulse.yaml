@@ -1,9 +1,10 @@
 # ============================================================================
 # guide_bridge 节点参数
-# 协议基线：RobotCar 协议 v0.21.0（scene v0.17.0 迎宾 + navigate v0.16.0
-# 导航/汽车讲解 + v0.20.0 随动播报 texts + tts v0.5.0 播报 +
-# v0.6.0 tts.result 回执 + v0.9.0/v0.10.0 enroll 注册面）。
-# 2026-10-14 本地变更：tts 单轮播完自行结束（原协议语义为循环到替换/停止）。
+# 协议基线：RobotCar 协议 v0.22.0（scene v0.17.0 迎宾 + v0.16.0 navigate
+# 导航/汽车讲解 + v0.20.0 随动播报 texts + v0.22.0 迎宾二维码 qr_sha256
+# 哈希快照/文件面按需下载 + tts v0.5.0 播报 + v0.6.0 tts.result 回执 +
+# v0.9.0/v0.10.0 enroll 注册面）。
+# 本地变更：tts 单轮播完自行结束（协议原语义为循环到替换/停止）。
 # 设计与本地策略见 docs/design.md，协议要点见 docs/protocol.md
 # ============================================================================
 guide_bridge:
@@ -65,14 +66,12 @@ guide_bridge:
     # SPEAKING 状态必掐断播报（真机日志证实，L7 也防不住）。官方出口：
     # SetAgentSuppression(WAKEUP, ttl) 抑制唤醒。
     # 模式：TTL 固定短，播报进行期间 worker 周期续期（间隔须小于 TTL），
-    # 会话结束转入尾部宽限后停止续期并刷 3s 快速恢复。
-    # 仅单轮会话（迎宾/讲解，2026-10-14 起 tts 亦单轮）抑制唤醒；
-    # PlaylistSession 的循环模式（当前无调用方）不抑制
+    # 会话结束转入尾部宽限后停止续期并立即解除。
+    # 仅单轮会话（tts/迎宾/讲解）抑制唤醒；PlaylistSession 的循环模式
+    #（当前无调用方）不抑制
     #
-    # 尾部宽限两段式估算（2026-10-14 重做；SDK 无播完事件——流式合成下
-    # estimated_duration 恒 0 且无播完话题，接口说明.md PlayTts 节官方
-    # 建议即字数预估。原"预估×2"过保守：120 字迎宾词宽限 52s，实际
-    # ~30s 播完，播完后唤醒被白禁 20s+）：
+    # 尾部宽限估算（SDK 无播完事件——流式合成下 estimated_duration 恒 0
+    # 且无播完话题，官方建议即字数预估）：
     #   tail_ms = suppress_tail_lead_ms + 估算秒数×1000×suppress_tail_scale
     #             （suppress_tail_max_ms>0 时封顶）
     # 校准方法：真机播 2~3 条典型长度文本掐表（下发受理→听不到声音），
@@ -82,24 +81,26 @@ guide_bridge:
     suppress_ttl_ms: 8000                # 每次抑制 TTL（> 续期间隔）
     suppress_renew_interval_ms: 5000     # worker 续期间隔
     tts_speech_ms_per_char: 220          # 每字时长 ms（CJK/数字档；拉丁≈160）
-    suppress_tail_lead_ms: 0            # 尾部宽限固定项（默认 0 不加；真机
-                                         # 校准可填拟合截距）
-    suppress_tail_scale: 0.8             # 尾部宽限系数（2026-10-14 自 2.0
-                                         # 逐次收紧 1.3→1.0→0.9→0.8；若长词
-                                         # 后段被唤醒打断再回调）
+    suppress_tail_lead_ms: 0             # 尾部宽限固定项（校准可填拟合截距）
+    suppress_tail_scale: 0.8             # 尾部宽限系数（长词后段会被唤醒
+                                         # 打断属已知权衡；播完后白禁过久
+                                         # 则再降）
     suppress_tail_max_ms: 0              # 尾部宽限封顶 ms（0=不封顶）
-    suppress_tail_flush_ms: 1            # 停续期收尾刷的抑制 TTL ms（原 0=云端
-                                         # 默认 3000ms 播完后白禁 3s；1=立即解除）
+    suppress_tail_flush_ms: 1            # 停续期收尾刷的抑制 TTL ms
+                                         #（0=云端默认 3000ms；1=立即解除）
 
-    # ---- 屏幕二维码显示（迎宾场景 v0.22.0，SDK PlayEmotion）----
-    # 迎宾指令(scene=welcome)触发：App 可选下发二维码图 base64
-    # (qrcode_png_base64)，本机 ffmpeg 转 848x480 H.264 MP4 后 scp 推送
-    # 运控板，PlayEmotion(file, loop_count=0) 无限循环常驻；5 分钟超时
-    # 或任意新业务(tts/scene/navigate/tts.stop)到达即恢复默认表情。
+    # ---- 屏幕二维码显示（迎宾场景 v0.22.0 P-036，SDK PlayEmotion）----
+    # 迎宾指令(scene=welcome)携带 qr_sha256（Server 端二维码内容哈希快照）：
+    # 与本地缓存(qr_cache_dir，文件名内嵌哈希)比对，命中直接显示免下载；
+    # 未命中以 MQTT 凭据(HTTP Basic)从 {enroll_origin}/v1/robots/{robot_id}
+    # /qr-code/content 下载图片（sha256+PNG/JPEG 魔数+≤512KiB 校验后原子
+    # 替换缓存），本机 ffmpeg 转 848x480 H.264 MP4 后 scp 推送运控板，
+    # PlayEmotion(file, loop_count=0) 无限循环常驻；5 分钟超时或任意新业务
+    # (tts/scene/navigate/tts.stop)到达即恢复默认表情。scene 未携带
+    # qr_sha256（App 未上传/已清除）则本次不显示二维码。
     # 多板架构：PlayEmotion 由运控板(10.1.1.100)执行，MP4 必须在其文件
     # 系统上，故需 sshpass 推送；display_remote_pass 为空则显示禁用
-    #（迎宾 TTS 不受影响）。无 base64 时播放运控板预置 MP4
-    #（display_remote_dir/QRCode.mp4，运维预部署）
+    #（迎宾 TTS 不受影响）
     display_emotion_service_name: "/aimdk_5Fmsgs/srv/PlayEmotion"  # SDK 固定，勿改
     display_remote_host: "10.1.1.100"    # 运控板（PlayEmotion 执行板）
     display_remote_user: "run"
@@ -108,10 +109,14 @@ guide_bridge:
     display_request_timeout_seconds: 5   # 单次 PlayEmotion 调用超时
     display_show_timeout_seconds: 300    # 二维码常驻时长（5 分钟）
     display_restore_emotion_id: 90       # 取消后恢复的 T1 默认表情
+    qr_cache_dir: "/tmp/guide_pulse/qr_cache"  # 二维码本地缓存目录
+                                         #（文件名内嵌哈希；跨重启保留可免
+                                         # 二次下载，/tmp 被清则下次重新拉取）
+    qr_download_timeout_seconds: 5       # 二维码单次下载（连接+传输）超时
 
     # ---- 协议限制 ----
     # texts 1..20 条、每条 1..2048 字节（契约校验，无本地截断）；
-    # tts/迎宾/讲解均单轮播完自行结束（tts 2026-10-14 起单轮，
-    # 原协议语义为循环播到替换/tts.stop）；
+    # tts/迎宾/讲解均单轮播完自行结束（tts 与协议原语义
+    # "循环播到替换/tts.stop"有偏差）；
     # tts.result 回执同 operation_id 重发复用缓存（同 event_id）
     dedupe_capacity: 1024                # operation_id 去重表/回执缓存容量

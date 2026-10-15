@@ -84,8 +84,15 @@
 未知值记日志忽略）。行为：
 
 1. 确定迎宾词：指令 `texts` 优先，缺省用参数 `welcome_default_texts`；
-2. 开一轮 PlaylistSession（替换当前任何播报——音频单会话，见 3.4）；
-3. 迎宾动作（SDK `SetMcPresetMotion` 招手）预留参数 `welcome_motion_id`
+2. 迎宾二维码（v0.22.0 P-036，`qr_sha256` 哈希快照驱动）：
+   `QrCodeCache` 与本地单文件缓存比对——命中直接取缓存图片（免下载），
+   未命中经 Server 文件面（HTTP Basic = 自身 MQTT 凭据）下载一次，
+   sha256 + PNG/JPEG 魔数 + ≤512KiB 校验后原子替换缓存（文件名内嵌
+   哈希 `qr_{sha256}.{png|jpg}`，旧哈希文件淘汰）；`ScreenDisplay` 将
+   图片 ffmpeg 转 848x480 MP4 推运控板常驻显示。`qr_sha256` 省略/
+   下载失败/校验失败：本次不显示二维码，不影响迎宾播报，不上报；
+3. 开一轮 PlaylistSession（替换当前任何播报——音频单会话，见 3.4）；
+4. 迎宾动作（SDK `SetMcPresetMotion` 招手）预留参数 `welcome_motion_id`
    （默认 0=禁用）。动作 ID 因机型而异（文档 examples：T1=1002 招手，
    另一机型=3001），真机校准后再启用。// ponytail: 默认只播报，动作待真机校准 ID 后开启
 
@@ -134,6 +141,13 @@
   真机验证：抑制生效期间喊唤醒词，播报完整播完（无 strong_interrupt/
   request_stop，正常 tts_status.done）。
 - **导航单任务**：新 `navigate` 替换进行中的导航。
+- **迎宾流程互斥（2026-10-15）**：迎宾词 TTS 播完前（SDK 无播完事件，
+  按字数估算设窗口，**公式与唤醒抑制尾部宽限一致**：每条 =
+  `suppress_tail_lead_ms + 估算×suppress_tail_scale`，共用同一组参数、
+  调参同步生效；另加条间间隔），新的 `scene`/`navigate`
+  直接拒绝——两者协议均无回执面，本地丢弃记 WARN 日志（App 无感知，
+  需重发）。`tts`/`tts.stop` 不受限：tts 替换会话或 tts.stop 终止会话
+  均使互斥窗口立即失效（迎宾音频被打断 = 流程终止）。
 - `tts.stop`：掐断当前语音（SDK 最高权重 1099 抢占）+ 终止播报会话 +
   **取消进行中的导航**（展厅语义：stop = 放弃本次讲解流程；一行可改）。
 - `scene` 不打断导航：讲解途中来迎宾，导航继续，到达后讲解词按替换
@@ -195,14 +209,18 @@ class NavExecutor {
 | `welcome_motion_id` | `0`（禁用） | 迎宾预设动作 ID，机型相关，真机校准后启用 |
 | `nav_executor` | `mock` | 导航执行器：`mock`（联调/测试）或 `waypoint`（真机，对接 t1_slam_nav_ws 航点服务） |
 | `mock_nav_seconds` | `0` | Mock 导航模拟耗时（0=立即到达） |
+| `display_*`（服务名/运控板/超时/恢复表情） | 见 yaml | 迎宾二维码显示：PlayEmotion 调用与 MP4 推送运控板 |
+| `qr_cache_dir` | `/tmp/guide_pulse/qr_cache` | 迎宾二维码本地缓存目录（文件名内嵌哈希；被清则下次迎宾重新拉取） |
+| `qr_download_timeout_seconds` | `5` | 二维码单次下载（连接+传输）超时 |
 | `tts_*`（服务名/优先级/停止文本/重试/超时） | 同 tts_demo | SDK PlayTts 调用参数 |
 
 ## 6. 测试计划
 
 | 层 | 用例文件 | 覆盖 |
 | --- | --- | --- |
-| 协议层（纯 C++） | `test_guide_protocol.cpp` | tts/tts.stop/scene/navigate 载荷正反例、信封校验、过期、幂等键提取、回执构造 |
+| 协议层（纯 C++） | `test_guide_protocol.cpp` | tts/tts.stop/scene/navigate 载荷正反例、scene.qr_sha256 格式正反例、信封校验、过期、幂等键提取、回执构造 |
 | enroll（纯 C++） | `test_robot_enroll.cpp` | 沿用 tts_demo（响应解析/错误码/SN 校验） |
+| 二维码缓存（纯 C++） | `test_qr_code_cache.cpp` | sha256 已知向量、PNG/JPEG 魔数、qr_sha256 格式、缓存写入/哈希拒绝/旧文件淘汰 |
 | TtsClient（进程内 Mock 服务） | `test_tts_client.cpp` | 沿用 tts_demo（字段映射/回执判定/超时） |
 | 播报状态机（纯 C++） | `test_playlist.cpp` | sequence/shuffle、单轮结束、无界循环、失败重试推进 |
 | 迎宾模块（纯 C++） | `test_welcome.cpp` | texts 优先/默认词回退、未知 scene 值忽略 |

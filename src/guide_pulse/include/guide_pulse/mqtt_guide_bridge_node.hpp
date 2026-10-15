@@ -9,8 +9,7 @@
 //   1. 订阅后端 MQTT 下行主题 {prefix}/{robot_id}/down/commands，
 //      接收 type=tts / tts.stop / scene / navigate 指令（其余 type 忽略，
 //      由其他组件处理）
-//   2. tts 为播报列表单轮播完（2026-10-14 需求变更，原为沿用 tts_demo 的
-//      无限循环语义）且必须回执 tts.result；
+//   2. tts 为播报列表单轮播完且必须回执 tts.result；
 //      scene=welcome 迎宾（WelcomeModule：一轮迎宾词）；
 //      navigate 导航+汽车讲解（TourModule：NavExecutor 导航，到达后一轮
 //      讲解词）；scene/navigate/tts.stop 无回执（契约）
@@ -47,6 +46,7 @@
 #include "guide_pulse/mqtt_guide_bridge_node.hpp"
 #include "guide_pulse/nav_executor.hpp"
 #include "guide_pulse/playlist.hpp"
+#include "guide_pulse/qr_code_cache.hpp"
 #include "guide_pulse/robot_enroll.hpp"
 #include "guide_pulse/screen_display.hpp"
 #include "guide_pulse/tour.hpp"
@@ -141,7 +141,7 @@ private:
   int tts_speech_ms_per_char_{220};     // 每字时长（CJK/数字档，拉丁≈0.73 倍）
   int suppress_tail_lead_ms_{0};        // 固定合成启动延迟（默认 0 不加，
                                         // 真机校准可填拟合截距）
-  double suppress_tail_scale_{0.8};     // 估算放大系数（2026-10-14 前为硬编码 2.0）
+  double suppress_tail_scale_{0.8};     // 估算放大系数
   int suppress_tail_max_ms_{0};         // 尾部宽限封顶（0=不封顶）
   int suppress_tail_flush_ms_{1};       // 停续期收尾刷的抑制 TTL（原 0=云端
                                         // 默认 3000ms，播完后白禁 3s；1=立即解除）
@@ -149,11 +149,19 @@ private:
   std::chrono::steady_clock::time_point suppress_next_at_;  // 下次续期时刻
   std::optional<std::chrono::steady_clock::time_point> suppress_stop_at_;
     // 尾部宽限截止：最后一条已受理（语音仍在播），续期持续到该时刻再停
+  // 迎宾流程互斥窗口截止（仅 worker 线程访问）：迎宾词全部播完（估算）。
+  // 窗口内新 scene/navigate 直接拒绝（无回执面，丢弃记日志）；任一新
+  // 会话替换（start_session）或 tts.stop（cancel_session）即失效——
+  // 迎宾音频被打断/替换 = 流程终止
+  std::optional<std::chrono::steady_clock::time_point> welcome_busy_until_;
   // ---- 展厅讲解增量参数 ----
   std::vector<std::string> welcome_default_texts_;  // scene 未带 texts 时的迎宾词
   int tour_speak_interval_seconds_{2};  // 迎宾/讲解词每两条间隔（载荷无间隔字段）
   std::string nav_executor_name_;       // 当前仅 mock（真机实现后扩展）
   int mock_nav_seconds_{0};             // Mock 导航模拟耗时
+  // ---- 迎宾二维码（v0.22.0 P-036：哈希快照 + 文件面按需下载）----
+  std::string qr_cache_dir_;            // 本地二维码缓存目录（跨重启保留）
+  int qr_download_timeout_seconds_{5};  // 单次下载（连接+传输）超时
 
   // ---- 运行时状态 ----
   std::string robot_id_;               // enroll 响应分配（同 SN 稳定），空=尚未取得
@@ -176,6 +184,7 @@ private:
   std::unique_ptr<mqtt::async_client> client_;
   std::unique_ptr<TtsClient> tts_;
   std::unique_ptr<ScreenDisplay> screen_;  // 迎宾二维码显示（脸屏）
+  std::unique_ptr<QrCodeCache> qr_cache_;  // 迎宾二维码缓存/下载（P-036）
   rclcpp::Client<aimdk_msgs::srv::SetAgentSuppression>::SharedPtr suppress_client_;
   rclcpp::CallbackGroup::SharedPtr suppress_callback_group_;
   std::unique_ptr<NavExecutor> nav_;    // MockNavExecutor（真机导航对接点）

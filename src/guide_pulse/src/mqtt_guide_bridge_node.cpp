@@ -94,15 +94,13 @@ void MqttGuideBridgeNode::declare_and_load_params()
   declare_parameter<bool>("suppress_wakeup", true);
   declare_parameter<int>("suppress_ttl_ms", 8000);
   declare_parameter<int>("suppress_renew_interval_ms", 5000);
-  // 尾部宽限两段式模型（2026-10-14：原 预估×2 过保守，播完后唤醒被
-  // 白禁过久；SDK 无播完事件（estimated_duration 恒 0 且无播完话题，
-  // 见 接口说明.md PlayTts 节），只能估算收紧 + 参数化真机校准）
+  // 尾部宽限估算模型：SDK 无播完事件（estimated_duration 恒 0 且无播完
+  // 话题，见 接口说明.md PlayTts 节），只能字数估算 + 参数化真机校准
   declare_parameter<int>("tts_speech_ms_per_char", 220);
   declare_parameter<int>("suppress_tail_lead_ms", 0);
   declare_parameter<double>("suppress_tail_scale", 0.8);
   declare_parameter<int>("suppress_tail_max_ms", 0);
-  // 停止续期时刷的收尾抑制 TTL：原 0=云端默认 3000ms（播完后还要白禁
-  // 3s），2026-10-14 改 1ms 立即解除（真机反馈白禁 7~8s 过长）
+  // 停止续期时刷的收尾抑制 TTL（注意 0=云端默认 3000ms；1=立即解除）
   declare_parameter<int>("suppress_tail_flush_ms", 1);
 
   // ---- 屏幕二维码显示（迎宾场景，v0.22.0）----
@@ -116,6 +114,11 @@ void MqttGuideBridgeNode::declare_and_load_params()
   declare_parameter<int>("display_request_timeout_seconds", 5);
   declare_parameter<int>("display_show_timeout_seconds", 300);  // 5 分钟
   declare_parameter<int>("display_restore_emotion_id", 90);     // T1 默认表情
+
+  // ---- 迎宾二维码缓存/下载（v0.22.0 P-036：scene 带 qr_sha256 哈希快照，
+  // 未命中本地缓存时以 MQTT 凭据从 Server 文件面拉取图片）----
+  declare_parameter<std::string>("qr_cache_dir", "/tmp/guide_pulse/qr_cache");
+  declare_parameter<int>("qr_download_timeout_seconds", 5);
 
   // ---- 展厅讲解增量参数（docs/design.md §5）----
   declare_parameter<std::string>("nav_executor", "mock");
@@ -339,6 +342,16 @@ bool MqttGuideBridgeNode::start()
       "display_remote_pass 为空：迎宾二维码显示禁用（TTS 播报不受影响）");
   }
   screen_ = std::make_unique<ScreenDisplay>(shared_from_this(), screen_cfg);
+
+  // ---- 迎宾二维码缓存/下载（v0.22.0 P-036）----
+  // 文件面与 enroll 注册面同源（RobotCar Server 单服务多路由）；
+  // 下载凭据复用当次 enroll 的 MQTT 密码（HTTP Basic，username=robot_id）
+  QrCodeCache::Config qr_cfg;
+  qr_cfg.origin = enroll_origin_;
+  qr_cfg.cache_dir = get_parameter("qr_cache_dir").as_string();
+  qr_cfg.timeout_seconds =
+    static_cast<int>(get_parameter("qr_download_timeout_seconds").as_int());
+  qr_cache_ = std::make_unique<QrCodeCache>(qr_cfg);
 
   // 唤醒抑制客户端（独立回调组，worker 线程 wait_for 等回执）
   suppress_service_name_ = get_parameter("suppress_service_name").as_string();
@@ -814,11 +827,29 @@ void MqttGuideBridgeNode::worker_loop()
 
 void MqttGuideBridgeNode::handle_command(const CommandEvent & event)
 {
+  // 迎宾流程互斥：迎宾词 TTS 播完前（SDK 无播完事件，
+  // 按字数估算设窗口，见 handle_scene），新的 scene/navigate 直接拒绝
+  //（两者协议均无回执面，本地丢弃记日志，App 无感知）。tts/tts.stop
+  // 不受限：tts 替换会话=迎宾流程终止（窗口随 start_session 失效），
+  // tts.stop 停止一切
+  if ((event.type == "scene" || event.type == "navigate") &&
+    welcome_busy_until_.has_value() &&
+    std::chrono::steady_clock::now() < *welcome_busy_until_)
+  {
+    const auto remain_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      *welcome_busy_until_ - std::chrono::steady_clock::now()).count();
+    RCLCPP_WARN(
+      get_logger(),
+      "迎宾流程进行中(迎宾词播报未完)，拒绝 type=%s operation_id=%s（约%lldms 后结束）",
+      event.type.c_str(), event.operation_id.c_str(),
+      static_cast<long long>(remain_ms));
+    return;
+  }
+
   if (event.type == "tts") {
     // 新播报列表替换旧会话（App 通过重发 tts 更换播报内容），从头开始播；
+    // 单轮播报：列表播完一轮自行结束
     // 新业务到达 -> 迎宾二维码让位（恢复默认表情）
-    // 单轮播报：列表播完一轮自行结束，不再循环（2026-10-14 需求变更，
-    // 原为沿用 tts_demo 的无限循环直到替换/停止）
     screen_->cancel("tts");
     start_session(
       event.texts, event.mode, event.interval_seconds, /*loop_forever=*/false,
@@ -881,22 +912,65 @@ void MqttGuideBridgeNode::handle_scene(const CommandEvent & event)
 {
   // 协议层已保证 scene=welcome（可扩展枚举唯一值），未知值在解析层丢弃
   auto texts = make_welcome_texts(event.texts, welcome_default_texts_);
-  RCLCPP_INFO(
-    get_logger(), "迎宾开始: operation_id=%s 迎宾词=%zu 条 二维码=%s",
-    event.operation_id.c_str(), texts.size(),
-    event.qrcode_png_base64.empty() ? "预置" : "下发");
-  // 二维码常驻显示（5 分钟超时/新业务取消由 ScreenDisplay 与 worker 驱动）；
-  // 显示失败不阻断迎宾语音（屏幕与音频相互独立）
-  const auto show_result = screen_->show(
-    event.qrcode_png_base64, "迎宾:" + event.operation_id);
-  if (!show_result.ok) {
-    RCLCPP_WARN(
-      get_logger(), "迎宾二维码显示失败(不影响播报): %s",
-      show_result.detail.c_str());
+  // ---- 二维码（v0.22.0 P-036）：qr_sha256 哈希快照驱动 ----
+  // 省略 -> 本次不显示（并取消常驻中的旧二维码）；携带 -> 缓存命中免下载，
+  // 未命中经文件面拉取一次（校验哈希后原子替换缓存）。二维码缺失只影响
+  // 显示：不阻塞迎宾动作、不产生上行事件
+  if (event.qr_sha256.empty()) {
+    RCLCPP_INFO(
+      get_logger(), "迎宾开始: operation_id=%s 迎宾词=%zu 条 二维码=无（未携带 qr_sha256）",
+      event.operation_id.c_str(), texts.size());
+    screen_->cancel("scene未携带二维码");
+  } else {
+    auto image_path = qr_cache_->cached_path(event.qr_sha256);
+    const bool cache_hit = image_path.has_value();
+    if (!cache_hit) {
+      const auto fetch = qr_cache_->fetch(robot_id_, password_, event.qr_sha256);
+      if (fetch.ok) {
+        image_path = fetch.image_path;
+      } else {
+        RCLCPP_WARN(
+          get_logger(),
+          "迎宾二维码下载失败(本次不显示,不影响播报): hash=%.12s… %s",
+          event.qr_sha256.c_str(), fetch.detail.c_str());
+      }
+    }
+    if (image_path.has_value()) {
+      RCLCPP_INFO(
+        get_logger(), "迎宾开始: operation_id=%s 迎宾词=%zu 条 二维码=%s(hash=%.12s…)",
+        event.operation_id.c_str(), texts.size(),
+        cache_hit ? "缓存命中" : "已下载", event.qr_sha256.c_str());
+      // 二维码常驻显示（5 分钟超时/新业务取消由 ScreenDisplay 与 worker 驱动）；
+      // 显示失败不阻断迎宾语音（屏幕与音频相互独立）
+      const auto show_result = screen_->show(
+        *image_path, "迎宾:" + event.operation_id, event.qr_sha256);
+      if (!show_result.ok) {
+        RCLCPP_WARN(
+          get_logger(), "迎宾二维码显示失败(不影响播报): %s",
+          show_result.detail.c_str());
+      }
+    }
   }
+  // 迎宾流程互斥窗口：至迎宾词全部播完。SDK 无播完事件，只能字数估算——
+  // 公式与唤醒抑制尾部宽限保持一致（每条 = suppress_tail_lead_ms +
+  // 估算秒×1000×suppress_tail_scale，共用同一组参数、同步生效），
+  // 另加条间间隔总和。窗口内新 scene/navigate 被拒（handle_command
+  // 入口检查）；任一 start_session 替换 / cancel_session（tts.stop 等）
+  // 即失效。注意：赋值须在 start_session 之后（其内部会 reset 旧窗口）
+  int64_t welcome_busy_ms = 0;
+  for (const auto & t : texts) {
+    welcome_busy_ms += suppress_tail_lead_ms_ +
+      static_cast<int64_t>(
+        estimate_speech_seconds(t, tts_speech_ms_per_char_) * 1000.0 *
+        suppress_tail_scale_);
+  }
+  welcome_busy_ms += static_cast<int64_t>(tour_speak_interval_seconds_) *
+    static_cast<int64_t>(texts.size() - 1) * 1000;
   start_session(
     std::move(texts), TTS_MODE_SEQUENCE, tour_speak_interval_seconds_,
     /*loop_forever=*/false, "迎宾:" + event.operation_id);
+  welcome_busy_until_ = std::chrono::steady_clock::now() +
+    std::chrono::milliseconds(welcome_busy_ms);
 }
 
 // ---------------------------------------------------------------------------
@@ -926,7 +1000,10 @@ void MqttGuideBridgeNode::start_session(
       get_logger(), "替换播报会话: old=%s new=%s",
       session_source_.c_str(), source.c_str());
   }
-  // 单轮播报（tts/迎宾/讲解，2026-10-14 起 tts 亦单轮）期间抑制唤醒
+  // 新会话 = 迎宾音频被打断/替换，迎宾流程互斥窗口随之失效
+  //（迎宾自身重入由 handle_scene 在本函数之后重新设窗口）
+  welcome_busy_until_.reset();
+  // 单轮播报（tts/迎宾/讲解）期间抑制唤醒
   //（看门狗续期，见头文件说明）；循环播报（PlaylistSession 仍保留该能力，
   // 当前无调用方）不抑制——被唤醒进入对话属可接受业务行为。
   // 替换会话时：旧单轮会话的续期由新会话类型接管（循环=停止并快速恢复）
@@ -978,7 +1055,9 @@ void MqttGuideBridgeNode::suppress_wakeup(std::uint32_t ttl_ms)
   }
   const auto response = future.get();
   if (response->header.header.code == 0) {
-    RCLCPP_DEBUG(
+    // INFO 级（原 DEBUG）：抑制是否真的在发需可观测——真机排查
+    // "播报被唤醒打断"时确认抑制调用链（2026-10-15 排查启用）
+    RCLCPP_INFO(
       get_logger(), "唤醒抑制: ttl=%ums（续期=%s）",
       ttl_ms, suppress_renew_active_ ? "进行中" : "停止");
   } else {
@@ -1012,11 +1091,8 @@ TtsClient::Result MqttGuideBridgeNode::play_current()
     const bool more = session_->advance();
     if (!more) {
       // 单轮模式一轮播完（受理完最后一条，语音仍在播）：会话结束，续期
-      // 转入尾部宽限——两段式估算（SDK 无播完事件，流式合成下
-      // estimated_duration 恒 0，只能字数估算）：固定合成启动延迟 +
-      // 字数估算×系数（均可 yaml 校准），到点停续期并快速恢复唤醒。
-      // 2026-10-14：原"估算×2"过保守（120 字迎宾词宽限 52s，实际语音
-      // ~30s 播完，播完后唤醒被白禁 20s+）
+      // 转入尾部宽限——lead + 字数估算×scale（参数可 yaml 校准），
+      // 到点停续期并立即解除唤醒抑制
       RCLCPP_INFO(
         get_logger(), "播报[轮%zu %zu/%zu] ok（单轮播完，会话结束: %s）",
         session_->round_no(), index + 1, session_->size(),
@@ -1064,6 +1140,8 @@ void MqttGuideBridgeNode::cancel_session()
   }
   session_.reset();
   session_source_.clear();
+  // 会话终止（tts.stop/新 navigate）= 迎宾流程不再继续，互斥窗口失效
+  welcome_busy_until_.reset();
 }
 
 // ---------------------------------------------------------------------------

@@ -4,7 +4,8 @@
 // 本层只依赖 nlohmann/json，不依赖 ROS，便于独立单元测试。
 // 协议定义详见 docs/protocol.md 与 RobotCar Protocol 契约
 // (contracts/server-robot/mqtt/v1，协议 v0.5.0 列表播报 + v0.6.0 tts.result
-// + v0.16.0 navigate + v0.17.0 scene + v0.20.0 随动播报 texts)。
+// + v0.16.0 navigate + v0.17.0 scene + v0.20.0 随动播报 texts + v0.22.0
+// scene 可选 qr_sha256 迎宾二维码哈希快照)。
 // ============================================================================
 #pragma once
 
@@ -19,8 +20,8 @@ namespace guide_pulse
 // ---------------------------------------------------------------------------
 // 协议常量
 // ---------------------------------------------------------------------------
-// tts.mode 播报模式：sequence 按列表顺序 / shuffle 每轮重洗（2026-10-14 起
-// 机器人侧单轮播完，不再无限循环）
+// tts.mode 播报模式：sequence 按列表顺序 / shuffle 每轮重洗
+//（机器人侧均单轮播完）
 inline constexpr const char * TTS_MODE_SEQUENCE = "sequence";  // 按列表顺序播报
 inline constexpr const char * TTS_MODE_SHUFFLE = "shuffle";    // 随机顺序播报（每轮重洗）
 
@@ -35,13 +36,14 @@ inline constexpr const char * TTS_REASON_PLAYBACK_UNAVAILABLE = "playback_unavai
 // scene 场景值（可扩展枚举，当前唯一值 welcome；扩枚举须先改契约再改这里）
 inline constexpr const char * SCENE_WELCOME = "welcome";
 
+// scene.qr_sha256 格式校验（v0.22.0 P-036）：64 位小写十六进制
+//（command-event.schema.json pattern ^[0-9a-f]{64}$）
+bool valid_qr_sha256(const std::string & sha256);
+
 // 契约限制（command-event.schema.json）
 inline constexpr std::size_t TTS_TEXTS_MAX = 20;         // texts 最多 20 条
 inline constexpr std::size_t TTS_TEXT_MAX_BYTES = 2048;  // 每条 1..2048 UTF-8 字节
 inline constexpr std::size_t POINT_NAME_MAX_SCALARS = 64;  // point_name 1..64 Unicode 标量
-// scene.qrcode_png_base64 长度上限（≈2MB PNG 的 base64 展开长度；严格
-// 解码与图片大小校验由 ScreenDisplay 组件负责，此处仅防巨型载荷）
-inline constexpr std::size_t QRCODE_BASE64_MAX_BYTES = 2796210;
 
 // ---------------------------------------------------------------------------
 // 下行设备指令（契约：后端发布到 {prefix}/{robot_id}/down/commands，
@@ -58,10 +60,13 @@ struct CommandEvent
   std::string mode;               // sequence 按序循环 | shuffle 随机循环
   int interval_seconds{0};        // 每两条内容之间的播报间隔，恒必填（1..86400）
   // type=scene 载荷字段（v0.17.0：可扩展枚举，当前仅 welcome；
-  // v0.22.0 可选 qrcode_png_base64：迎宾二维码图 PNG 的 base64，
-  // 机器人转 MP4 后在脸屏常驻显示至超时/新业务）
+  // v0.22.0 P-036 可选 qr_sha256：Server 下发时该机器人当前迎宾二维码
+  // 图片的内容哈希快照（64 位小写十六进制）。Robot 与本地缓存比对：
+  // 一致直接显示缓存图片不下载；不一致经二维码文件面（HTTP Basic =
+  // 自身 MQTT 凭据）拉取一次并校验后替换缓存再显示（QrCodeCache 组件）；
+  // 字段省略本次不显示二维码）
   std::string scene;
-  std::string qrcode_png_base64;  // scene: 可选（PNG base64，1..2730668 字节≈2MB 图）
+  std::string qr_sha256;         // scene: 可选（64 位小写十六进制内容哈希）
   // type=navigate 载荷字段（v0.16.0：点位名 + 可选随动播报）
   std::string point_name;         // 位置不透明名（1..64 Unicode 标量，Server 原样转发）
   bool expired{false};            // expires_at 早于当前时间

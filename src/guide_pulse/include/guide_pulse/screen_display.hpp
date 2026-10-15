@@ -1,9 +1,9 @@
 // ============================================================================
 // 屏幕二维码显示组件（迎宾场景）：
-//   迎宾指令触发 -> (可选)App 下发二维码图 base64 -> 本地 ffmpeg 转
-//   848x480 H.264 MP4 -> sshpass scp 推送到运控板 -> PlayEmotion(file,
-//   loop_count=0) 无限循环常驻 -> 5 分钟超时或新业务到达时 cancel() 恢复
-//   默认表情打断视频。
+//   迎宾指令触发 -> QrCodeCache 提供本地二维码图片（缓存/下载见
+//   qr_code_cache.hpp）-> 本地 ffmpeg 转 848x480 H.264 MP4 -> sshpass scp
+//   推送到运控板 -> PlayEmotion(file, loop_count=0) 无限循环常驻 ->
+//   5 分钟超时或新业务到达时 cancel() 恢复默认表情打断视频。
 //
 // 多板架构（实测结论，见 docs/design.md §屏幕显示）：
 //   PlayEmotion 服务由运控板 (默认 10.1.1.100) 实际执行，file_paths 必须
@@ -27,13 +27,11 @@
 namespace guide_pulse
 {
 
-// 标准 base64 解码（含填充校验）。输入非法返回 false。纯函数，独立单测。
-bool decode_base64(const std::string & in, std::string & out);
-
-// 拼接 ffmpeg 转码命令行（qrcode -> 848x480 H.264 MP4，静态图 1s@10fps，
-// 短视频+播放端无限循环，实测转码约 0.8s）。纯函数，独立单测。
+// 拼接 ffmpeg 转码命令行（二维码图片(PNG/JPEG，ffmpeg 自动识别) ->
+// 848x480 H.264 MP4，静态图 1s@10fps，短视频+播放端无限循环，实测转码
+// 约 0.8s）。纯函数，独立单测。
 std::string build_ffmpeg_command(
-  const std::string & ffmpeg_bin, const std::string & png_path,
+  const std::string & ffmpeg_bin, const std::string & image_path,
   const std::string & mp4_path);
 
 class ScreenDisplay
@@ -49,12 +47,11 @@ public:
     std::string remote_dir{"/home/run/screen_display"};
     std::string sshpass_bin{"sshpass"};
     std::string ffmpeg_bin{"ffmpeg"};
-    std::string local_tmp_dir{"/tmp/guide_pulse"};  // PNG/MP4 本地暂存
+    std::string local_tmp_dir{"/tmp/guide_pulse"};  // MP4 本地暂存
     // ---- 行为参数 ----
     int request_timeout_seconds{5};           // 单次 PlayEmotion 调用超时
     int show_timeout_seconds{300};            // 二维码常驻时长（默认 5 分钟）
     int restore_emotion_id{90};               // 取消显示后恢复的默认表情
-    int max_png_bytes{2 * 1024 * 1024};       // base64 解码后图片上限（防御）
   };
 
   struct Result
@@ -67,11 +64,15 @@ public:
   // node: 所属节点（桥接节点）；config: 见上
   ScreenDisplay(rclcpp::Node::SharedPtr node, Config config);
 
-  // 显示二维码。qrcode_png_base64 空 -> 直接播放运控板预置 MP4
-  // （{remote_dir}/QRCode.mp4，由运维预部署）；非空 -> 解码落盘 ->
-  // ffmpeg 转码 -> scp 推送 -> PlayEmotion 无限循环。成功后 active()=true
-  // 且 deadline() 生效。失败不改变当前显示状态。
-  Result show(const std::string & qrcode_png_base64, const std::string & source);
+  // 显示二维码。image_path：本地二维码图片文件（PNG/JPEG，QrCodeCache
+  // 提供的缓存路径）-> ffmpeg 转码 -> scp 推送 -> PlayEmotion 无限循环。
+  // content_id：内容标识（二维码 sha256），非空时远程 MP4 以它命名——
+  // 固定同名覆盖 + 同路径重播时运控板播放器不重新加载（真机：换图后
+  // 屏幕仍是上一张），换内容必换文件名才能强制重载。
+  // 成功后 active()=true 且 deadline() 生效。失败不改变当前显示状态。
+  Result show(
+    const std::string & image_path, const std::string & source,
+    const std::string & content_id = "");
 
   // 取消显示（超时/新业务到达）：恢复默认表情打断循环视频。
   // 未显示时为空操作（幂等）。
@@ -86,10 +87,14 @@ private:
   Result call_play_emotion(
     const std::string & type, const std::string & file_path,
     const std::vector<int32_t> & emotion_ids, int32_t loop_count);
-  // scp 推送 mp4 到运控板 remote_dir（system 子进程 sshpass）
-  bool push_to_remote(const std::string & mp4_path, std::string & error);
-  // 运控板上 MP4 的绝对路径（PlayEmotion file_paths 用）
-  std::string remote_mp4_path() const;
+  // scp 推送 mp4 到运控板 remote_dir（system 子进程 sshpass）。
+  // content_id 非空时推 QRCode_{id}.mp4 并清掉旧 QRCode*.mp4（防堆积；
+  // rm 正在播放的旧文件无碍：播放器持有 fd，且新路径播放即打断）
+  bool push_to_remote(const std::string & mp4_path, const std::string & content_id,
+    std::string & error);
+  // 运控板上 MP4 的绝对路径（PlayEmotion file_paths 用）：
+  // content_id 非空 -> QRCode_{id}.mp4；空 -> QRCode.mp4（兼容旧行为）
+  std::string remote_mp4_path(const std::string & content_id) const;
 
   rclcpp::Node::SharedPtr node_;
   Config config_;

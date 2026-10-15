@@ -1,4 +1,4 @@
-# guide_pulse MQTT 协议说明（RobotCar 协议 v0.21.0 子集）
+# guide_pulse MQTT 协议说明（RobotCar 协议 v0.22.0 子集）
 
 guide_pulse 消费 RobotCar Protocol 正式契约的指令子集，本文只记录
 本工程视角的要点与本地策略；完整契约见
@@ -46,19 +46,29 @@ payload 仅 `operation_id`。本工程行为：最高权重抢占掐断语音 + 
 ```json
 {"payload": {"operation_id": "<uuidv7>", "scene": "welcome",
              "texts": ["欢迎光临"],
-             "qrcode_png_base64": "iVBORw0KGgo..."}}
+             "qr_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}}
 ```
 
 - `scene` 必填，当前唯一合法值 `welcome`（可扩展枚举）；未知值记日志忽略。
 - `texts` 可选（1..20 条，每条 1..2048）；缺省用 `welcome_default_texts`。
-- `qrcode_png_base64` 可选（v0.22.0，1..2796210 字节标准 base64，解码后
-  ≤2MB PNG）：迎宾二维码图，App 连同迎宾 enable 一起下发。机器人侧转
-  848x480 H.264 MP4 推送运控板后 `PlayEmotion(loop_count=0)` 常驻显示，
-  5 分钟超时（`display_show_timeout_seconds`）或任意新业务
-  （tts/scene/navigate/tts.stop）到达即恢复默认表情。缺省播放运控板
-  预置 MP4（`display_remote_dir/QRCode.mp4`，运维预部署）。
+- `qr_sha256` 可选（v0.22.0 P-036，64 位小写十六进制）：Server 下发时该
+  机器人当前迎宾二维码图片的**内容哈希快照**（App 经 HTTP 按需上传/替换/
+  清除，不随迎宾触发重传）。机器人侧与本地单文件缓存比对（QrCodeCache，
+  缓存文件名内嵌哈希）：**一致直接显示缓存图片、不重新下载**；不一致经
+  `GET {enroll_origin}/v1/robots/{robot_id}/qr-code/content`（HTTP Basic =
+  自身 MQTT 凭据，username=robot_id）拉取一次，校验字节 sha256 与快照
+  一致 + PNG/JPEG 魔数 + ≤512KiB 后原子替换缓存再显示（旧哈希文件淘汰）。
+  校验失败/下载失败（含 401/404）本次不显示二维码——**不阻塞迎宾动作、
+  不产生上行事件、单次迎宾内不重试**。**字段省略（App 未上传或已清除）
+  本次不显示二维码**。命中缓存的图片经 ffmpeg 转 848x480 H.264 MP4 推送
+  运控板后 `PlayEmotion(loop_count=0)` 常驻显示，5 分钟超时
+  （`display_show_timeout_seconds`）或任意新业务（tts/scene/navigate/
+  tts.stop）到达即恢复默认表情。
 - 行为：开一轮迎宾播报（单轮结束，不循环）+ 二维码常驻显示；不打断导航。
   屏幕显示失败不影响语音播报（仅告警日志）。
+- **迎宾互斥（2026-10-15）**：迎宾词播报未完（字数估算窗口）期间，新的
+  `scene`/`navigate` 直接拒绝——协议无回执面，本地丢弃记日志，App 需重发；
+  `tts`/`tts.stop` 不受限（会终止迎宾流程并解除互斥）。
 - 过期直接丢弃（无回执通道，协议规定）。
 
 ### 2.4 `navigate`（无回执）——导航 + 汽车讲解

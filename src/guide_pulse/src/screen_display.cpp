@@ -3,99 +3,29 @@
 // ============================================================================
 #include "guide_pulse/screen_display.hpp"
 
-#include <array>
 #include <cstdlib>
-#include <fstream>
 
 namespace guide_pulse
 {
 
-namespace
-{
-// base64 字符表与逆表（RFC 4648 标准 alphabet）
-constexpr char kAlphabet[] =
-  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-int decode_char(char c)
-{
-  if (c >= 'A' && c <= 'Z') {
-    return c - 'A';
-  }
-  if (c >= 'a' && c <= 'z') {
-    return c - 'a' + 26;
-  }
-  if (c >= '0' && c <= '9') {
-    return c - '0' + 52;
-  }
-  if (c == '+') {
-    return 62;
-  }
-  if (c == '/') {
-    return 63;
-  }
-  return -1;
-}
-}  // namespace
-
-bool decode_base64(const std::string & in, std::string & out)
-{
-  out.clear();
-  // 允许尾部 0-2 个 '=' 填充，总长须为 4 的倍数且非空
-  if (in.empty() || in.size() % 4U != 0U) {
-    return false;
-  }
-  out.reserve(in.size() / 4U * 3U);
-  std::uint32_t buffer = 0;
-  int bits = 0;
-  std::size_t payload = 0;   // 非 '=' 字符数
-  std::size_t padding = 0;   // '=' 数量（只能连续出现在尾部）
-  for (const char c : in) {
-    if (c == '=') {
-      padding++;
-      continue;
-    }
-    if (padding > 0U) {
-      out.clear();  // '=' 后再出现数据字符：非法
-      return false;
-    }
-    const int value = decode_char(c);
-    if (value < 0) {
-      out.clear();
-      return false;
-    }
-    buffer = (buffer << 6) | static_cast<std::uint32_t>(value);
-    bits += 6;
-    payload++;
-    if (bits >= 8) {
-      bits -= 8;
-      out.push_back(static_cast<char>((buffer >> bits) & 0xFFU));
-    }
-  }
-  // 填充合法性：0 填充 payload%4==0；1 填充 ==3；2 填充 ==2；其余非法
-  const std::size_t tail = payload % 4U;
-  const bool padding_ok =
-    payload != 0U &&
-    ((padding == 0U && tail == 0U) || (padding == 1U && tail == 3U) ||
-    (padding == 2U && tail == 2U));
-  if (!padding_ok) {
-    out.clear();
-    return false;
-  }
-  return true;
-}
-
 std::string build_ffmpeg_command(
-  const std::string & ffmpeg_bin, const std::string & png_path,
+  const std::string & ffmpeg_bin, const std::string & image_path,
   const std::string & mp4_path)
 {
   // 848x480 为 T1 脸屏原生画幅（display_ui 内置表情同款，其他画幅会被拉伸）；
   // 图标最大边 441（短边 92%）居中防圆屏裁角；1s@10fps 静态图视觉无差，
   // 转码约 0.8s；yuv420p+faststart 为嵌入式播放端最兼容组合。
-  return ffmpeg_bin + " -y -loglevel error -loop 1 -framerate 10 -i '" +
-         png_path + "' -t 1 -vf \"scale='min(iw,441)':'min(ih,441)':"
+  // 输入支持 PNG/JPEG 及其变体（ffmpeg 按内容自动探测）。
+  // 首帧复制用 loop「滤镜」（libavfilter 标准能力）而非 -loop 1 输入选项：
+  // 后者是 image2 demuxer 私有选项，部分图片字节（如 App 上传的某些
+  // JPEG/PNG 变体）会让 ffmpeg 内容探测选中 *_pipe demuxer 而不支持它，
+  // 真机部分图片会报 "Option loop not found"；帧率同理用输出侧 -r。
+  return ffmpeg_bin + " -y -loglevel error -i '" + image_path +
+         "' -t 1 -vf \"scale='min(iw,441)':'min(ih,441)':"
          "force_original_aspect_ratio=decrease,"
-         "pad=848:480:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p\" "
-         "-c:v libx264 -preset veryfast -crf 23 -movflags +faststart -an '" +
+         "pad=848:480:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p,"
+         "loop=loop=-1:size=1:start=0\" "
+         "-r 10 -c:v libx264 -preset veryfast -crf 23 -movflags +faststart -an '" +
          mp4_path + "'";
 }
 
@@ -119,14 +49,19 @@ std::chrono::steady_clock::time_point ScreenDisplay::deadline() const
   return deadline_;
 }
 
-std::string ScreenDisplay::remote_mp4_path() const
+std::string ScreenDisplay::remote_mp4_path(const std::string & content_id) const
 {
-  // remote_dir 末尾去重斜杠后拼文件名
+  // remote_dir 末尾去重斜杠后拼文件名；content_id 带内容寻址（见头文件）
   const std::string & dir = config_.remote_dir;
-  return (dir.back() == '/' ? dir.substr(0, dir.size() - 1U) : dir) + "/QRCode.mp4";
+  const std::string base = (dir.back() == '/' ? dir.substr(0, dir.size() - 1U) : dir);
+  if (content_id.empty()) {
+    return base + "/QRCode.mp4";
+  }
+  return base + "/QRCode_" + content_id + ".mp4";
 }
 
-bool ScreenDisplay::push_to_remote(const std::string & mp4_path, std::string & error)
+bool ScreenDisplay::push_to_remote(
+  const std::string & mp4_path, const std::string & content_id, std::string & error)
 {
   // 空密码防御：sshpass -p '' 行为不可控，直接拒绝
   if (config_.remote_pass.empty()) {
@@ -134,15 +69,20 @@ bool ScreenDisplay::push_to_remote(const std::string & mp4_path, std::string & e
     return false;
   }
   const std::string ssh_opts = "-o StrictHostKeyChecking=no -o ConnectTimeout=5";
-  // 1) 建目录（幂等）2) 推送
+  const std::string target =
+    config_.remote_user + "@" + config_.remote_host;
+  const std::string remote_file = remote_mp4_path(content_id);
+  // 1) 建目录（幂等）+ 清旧 QRCode*.mp4（内容寻址换名后防堆积）
+  //    rm 正在循环播放的旧文件无碍：播放器已持有 fd 继续播完当前内容，
+  //    且随后新路径的 PlayEmotion 会立即打断它
+  // 2) 推送
   const std::string mkdir_cmd = config_.sshpass_bin + " -p '" + config_.remote_pass +
-    "' ssh " + ssh_opts + " " + config_.remote_user + "@" + config_.remote_host +
-    " mkdir -p '" + config_.remote_dir + "'";
+    "' ssh " + ssh_opts + " " + target + " mkdir -p '" + config_.remote_dir +
+    "' && rm -f '" + config_.remote_dir + "/QRCode'*.mp4";
   const std::string scp_cmd = config_.sshpass_bin + " -p '" + config_.remote_pass +
-    "' scp " + ssh_opts + " '" + mp4_path + "' " + config_.remote_user + "@" +
-    config_.remote_host + ":'" + config_.remote_dir + "/QRCode.mp4'";
+    "' scp " + ssh_opts + " '" + mp4_path + "' " + target + ":'" + remote_file + "'";
   if (std::system(mkdir_cmd.c_str()) != 0) {
-    error = "ssh mkdir failed on " + config_.remote_host;
+    error = "ssh mkdir/rm failed on " + config_.remote_host;
     return false;
   }
   if (std::system(scp_cmd.c_str()) != 0) {
@@ -193,50 +133,35 @@ ScreenDisplay::Result ScreenDisplay::call_play_emotion(
 }
 
 ScreenDisplay::Result ScreenDisplay::show(
-  const std::string & qrcode_png_base64, const std::string & source)
+  const std::string & image_path, const std::string & source,
+  const std::string & content_id)
 {
   Result result;
-  // ---- 1. 确定运控板可播放的 MP4：下发 base64 则转换推送，否则用预置 ----
-  if (!qrcode_png_base64.empty()) {
-    std::string png;
-    if (!decode_base64(qrcode_png_base64, png)) {
-      result.detail = "qrcode_png_base64 is not valid base64";
-      return result;
-    }
-    if (png.empty() ||
-      static_cast<int>(png.size()) > config_.max_png_bytes)
-    {
-      result.detail = "qrcode png size out of range (max " +
-                      std::to_string(config_.max_png_bytes) + " bytes)";
-      return result;
-    }
-    const std::string png_path = config_.local_tmp_dir + "/qrcode.png";
-    const std::string mp4_path = config_.local_tmp_dir + "/QRCode.mp4";
-    // 简化目录创建：依赖 shell（下一条 system 命令天然可用）
-    const std::string mkdir_local = "mkdir -p '" + config_.local_tmp_dir + "'";
-    if (std::system(mkdir_local.c_str()) != 0) {
-      result.detail = "cannot create local tmp dir " + config_.local_tmp_dir;
-      return result;
-    }
-    std::ofstream file(png_path, std::ios::binary | std::ios::trunc);
-    if (!file) {
-      result.detail = "cannot write " + png_path;
-      return result;
-    }
-    file.write(png.data(), static_cast<std::streamsize>(png.size()));
-    file.close();
-    const std::string ffmpeg_cmd = build_ffmpeg_command(
-      config_.ffmpeg_bin, png_path, mp4_path);
-    if (std::system(ffmpeg_cmd.c_str()) != 0) {
-      result.detail = "ffmpeg convert failed (see command log)";
-      return result;
-    }
-    if (!push_to_remote(mp4_path, result.detail)) {
-      return result;
-    }
+  // ---- 1. 二维码图片转 848x480 MP4 并推送运控板 ----
+  if (image_path.empty()) {
+    result.detail = "image_path is empty (no qr image to show)";
+    return result;
+  }
+  const std::string mp4_path = config_.local_tmp_dir + "/QRCode.mp4";
+  // 简化目录创建：依赖 shell（下一条 system 命令天然可用）
+  const std::string mkdir_local = "mkdir -p '" + config_.local_tmp_dir + "'";
+  if (std::system(mkdir_local.c_str()) != 0) {
+    result.detail = "cannot create local tmp dir " + config_.local_tmp_dir;
+    return result;
+  }
+  const std::string ffmpeg_cmd = build_ffmpeg_command(
+    config_.ffmpeg_bin, image_path, mp4_path);
+  if (std::system(ffmpeg_cmd.c_str()) != 0) {
+    result.detail = "ffmpeg convert failed (see command log)";
+    return result;
+  }
+  if (!push_to_remote(mp4_path, content_id, result.detail)) {
+    return result;
   }
   // ---- 2. 无限循环播放（loop_count=0 常驻，直至超时/新业务打断）----
-  const auto play = call_play_emotion("file", remote_mp4_path(), {}, 0);
+  // 内容寻址文件名：换图必是新路径，运控板播放器被迫重新加载
+  //（固定路径覆盖重播时播放器不重读文件——真机踩坑）
+  const auto play = call_play_emotion("file", remote_mp4_path(content_id), {}, 0);
   if (!play.ok) {
     return play;
   }

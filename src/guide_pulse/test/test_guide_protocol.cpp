@@ -284,6 +284,63 @@ TEST(SceneEventTest, RejectsUnknownSceneValue)
   EXPECT_TRUE(invalid_op.empty());  // 无回执面
 }
 
+// ---------------------------------------------------------------------------
+// scene.qr_sha256（v0.22.0 P-036 迎宾二维码哈希快照：64 位小写十六进制）
+// ---------------------------------------------------------------------------
+TEST(SceneQrSha256Test, ParsesValidSha)
+{
+  const std::string sha =
+    "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+  const auto payload = build_command_json(
+    "scene", R"({"operation_id":")" + std::string(kOperationId) +
+    R"(","scene":"welcome","texts":["欢迎光临"],"qr_sha256":")" + sha +
+    R"("})");
+  std::string error;
+  const auto event = guide_pulse::parse_command_event(payload, "robot-001", error);
+  ASSERT_TRUE(event.has_value()) << error;
+  EXPECT_EQ(event->qr_sha256, sha);
+}
+
+TEST(SceneQrSha256Test, AbsentMeansNoQrcode)
+{
+  // 省略 qr_sha256（App 未上传/已清除）：合法，机器人本次不显示二维码
+  const auto payload = build_command_json(
+    "scene", R"({"operation_id":")" + std::string(kOperationId) + R"(","scene":"welcome"})");
+  std::string error;
+  const auto event = guide_pulse::parse_command_event(payload, "robot-001", error);
+  ASSERT_TRUE(event.has_value()) << error;
+  EXPECT_TRUE(event->qr_sha256.empty());
+}
+
+TEST(SceneQrSha256Test, RejectsInvalidSha)
+{
+  const std::string good64(64, 'a');
+  const std::vector<std::string> bad_shas = {
+    std::string(63, 'a'),                  // 长度 63
+    std::string(65, 'a'),                  // 长度 65
+    std::string(64, 'A'),                  // 大写十六进制
+    std::string(64, 'g'),                  // 非 hex 字符
+    "",                                    // 空串（携带即非法，省略须整体缺字段）
+  };
+  for (const auto & sha : bad_shas) {
+    const auto payload = build_command_json(
+      "scene", R"({"operation_id":")" + std::string(kOperationId) +
+      R"(","scene":"welcome","qr_sha256":")" + sha + R"("})");
+    std::string error;
+    const auto event = guide_pulse::parse_command_event(payload, "robot-001", error);
+    EXPECT_FALSE(event.has_value()) << "sha='" << sha << "'";
+    if (!event.has_value()) {
+      EXPECT_NE(error.find("qr_sha256"), std::string::npos) << error;
+    }
+  }
+  // 非字符串类型
+  const auto payload = build_command_json(
+    "scene", R"({"operation_id":")" + std::string(kOperationId) +
+    R"(","scene":"welcome","qr_sha256":123})");
+  std::string error;
+  EXPECT_FALSE(guide_pulse::parse_command_event(payload, "robot-001", error));
+}
+
 TEST(SceneEventTest, RejectsInvalidScenePayloads)
 {
   const std::vector<std::string> bad_payloads = {

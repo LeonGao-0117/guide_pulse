@@ -27,7 +27,8 @@ APP 经 Server（RobotCar 协议 v0.21.0）下发参数到 Robot，Robot 本地�
 | 停止 | `tts.stop` | 无 | 停一切播报并取消导航 |
 
 本地策略：音频单会话（新播报替换旧会话）；导航单任务（新 navigate 替换旧导航）；
-tts/迎宾/讲解均单轮播完自行结束（2026-10-14 起 tts 不再循环）。SDK 无点位导航服务——`NavExecutor` 为真机对接点
+tts/迎宾/讲解均单轮播完自行结束（2026-10-14 起 tts 不再循环）；迎宾词播报未完
+期间新 scene/navigate 直接拒绝（2026-10-15，无回执面本地丢弃）。SDK 无点位导航服务——`NavExecutor` 为真机对接点
 （默认 Mock；真机实现对接 `/opt/liwei/t1_slam_nav_ws` 的 `GoToWaypoints`
 航点服务，见 docs/design.md §4）。
 

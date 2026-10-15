@@ -143,6 +143,16 @@ bool parse_optional_texts(
 
 }  // namespace
 
+bool valid_qr_sha256(const std::string & sha256)
+{
+  if (sha256.size() != 64U) {
+    return false;
+  }
+  return std::all_of(sha256.begin(), sha256.end(), [](unsigned char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+  });
+}
+
 std::optional<CommandEvent> parse_command_event(
   const std::string & payload, const std::string & robot_id, std::string & error,
   std::string * invalid_operation_id, std::string * invalid_command_type)
@@ -293,8 +303,8 @@ std::optional<CommandEvent> parse_command_event(
     }
   } else if (event.type == "scene") {
     // v0.17.0 场景载荷：operation_id + scene 必填、texts 可选（v0.20.0）、
-    // qrcode_png_base64 可选（v0.22.0 迎宾二维码）。合法字段白名单
-    // {operation_id, scene, texts, qrcode_png_base64}，其余（含 extra 等
+    // qr_sha256 可选（v0.22.0 P-036 迎宾二维码哈希快照）。合法字段白名单
+    // {operation_id, scene, texts, qr_sha256}，其余（含 extra 等
     // 未知字段）一律拒绝。scene 为可扩展枚举，当前契约唯一值 welcome：
     // 未知值属于「未来版本的指令」，本机丢弃记日志（无回执面），不按错误处理
     if (!body.contains("scene") || !body["scene"].is_string()) {
@@ -304,7 +314,7 @@ std::optional<CommandEvent> parse_command_event(
     for (const auto & [key, value] : body.items()) {
       (void)value;
       if (key != "operation_id" && key != "scene" && key != "texts" &&
-        key != "qrcode_png_base64")
+        key != "qr_sha256")
       {
         error = "scene payload has unknown fields";
         return std::nullopt;
@@ -315,16 +325,15 @@ std::optional<CommandEvent> parse_command_event(
       error = "unsupported scene value (only welcome in this version)";
       return std::nullopt;
     }
-    if (body.contains("qrcode_png_base64")) {
-      if (!body["qrcode_png_base64"].is_string()) {
-        error = "qrcode_png_base64 must be string";
+    if (body.contains("qr_sha256")) {
+      if (!body["qr_sha256"].is_string()) {
+        error = "qr_sha256 must be string";
         return std::nullopt;
       }
-      event.qrcode_png_base64 = body["qrcode_png_base64"].get<std::string>();
-      if (event.qrcode_png_base64.empty() ||
-        event.qrcode_png_base64.size() > QRCODE_BASE64_MAX_BYTES)
-      {
-        error = "qrcode_png_base64 length must be within 1..2796210 bytes";
+      event.qr_sha256 = body["qr_sha256"].get<std::string>();
+      // 契约：64 位小写十六进制（command-event.schema.json pattern）
+      if (!valid_qr_sha256(event.qr_sha256)) {
+        error = "qr_sha256 must be 64 lowercase hex chars";
         return std::nullopt;
       }
     }

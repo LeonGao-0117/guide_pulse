@@ -2,10 +2,9 @@
 // PlaylistSession：共享的播报列表会话状态机（纯逻辑，无 ROS/MQTT 依赖）。
 //
 // tts_demo 的 cycle 状态机抽象（sequence/shuffle 轮次 + 语音时长估算间隔），
-// 增加单轮模式：loop_forever=false 时一轮播完会话自行结束——迎宾词与讲解词
-//（scene/navigate 的 texts）按本地策略只播一轮；tts 指令 2026-10-14 起同样
-// 单轮播完（需求变更，原契约语义为无限循环到替换/tts.stop）。
-// 驱动方（桥接节点 worker 线程）负责调用 SDK。
+// 单轮模式：loop_forever=false 时一轮播完会话自行结束——tts/迎宾词/
+// 讲解词（scene/navigate 的 texts）均单轮播完。驱动方（桥接节点
+// worker 线程）负责调用 SDK。
 // ============================================================================
 #pragma once
 

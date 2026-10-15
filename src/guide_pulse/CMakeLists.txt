@@ -14,8 +14,10 @@ find_package(aimdk_msgs REQUIRED)
 find_package(waypoint_nav_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(nlohmann_json REQUIRED)
-# enroll 注册面 HTTP 客户端（RobotCar 协议 v0.9.0+，系统 libcurl）
+# enroll 注册面 HTTP 客户端（RobotCar 协议 v0.9.0+，系统 libcurl）；
+# 迎宾二维码下载校验用系统 OpenSSL（sha256，v0.22.0 P-036）
 find_package(CURL REQUIRED)
+find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------------------
@@ -45,12 +47,14 @@ set(PAHO_WITH_SSL ON CACHE BOOL "" FORCE)
 add_subdirectory("${PAHO_MQTT_CPP_DIR}" "${CMAKE_BINARY_DIR}/_deps/paho_mqtt_cpp" EXCLUDE_FROM_ALL)
 
 # ---------------------------------------------------------------------------
-# 协议层：MQTT 业务报文 (JSON) 的解析与序列化 + enroll 注册面客户端，
-# 不依赖 ROS，可独立单测
+# 协议层：MQTT 业务报文 (JSON) 的解析与序列化 + enroll 注册面客户端 +
+# 迎宾二维码缓存/下载（qr_code_cache，v0.22.0 P-036），不依赖 ROS，
+# 可独立单测
 # ---------------------------------------------------------------------------
 add_library(guide_pulse_protocol STATIC
   src/guide_protocol.cpp
   src/robot_enroll.cpp
+  src/qr_code_cache.cpp
 )
 target_include_directories(guide_pulse_protocol PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -59,6 +63,7 @@ target_include_directories(guide_pulse_protocol PUBLIC
 target_link_libraries(guide_pulse_protocol
   nlohmann_json::nlohmann_json
   CURL::libcurl
+  OpenSSL::Crypto
 )
 target_compile_options(guide_pulse_protocol PRIVATE -Wall -Wextra)
 
@@ -117,6 +122,11 @@ if(BUILD_TESTING)
   #     HTTP 传输层由集成测试经 enroll_mock_server 覆盖）
   ament_add_gtest(robot_enroll_test test/test_robot_enroll.cpp)
   target_link_libraries(robot_enroll_test guide_pulse_protocol)
+
+  # 1c. 迎宾二维码缓存/下载纯函数单测（sha256 摘要/图片魔数/qr_sha256
+  #     格式/缓存写入与淘汰；HTTP 传输层与模拟器联调覆盖）
+  ament_add_gtest(qr_code_cache_test test/test_qr_code_cache.cpp)
+  target_link_libraries(qr_code_cache_test guide_pulse_protocol)
 
   # 2. TTS 客户端单测：进程内拉起 Mock PlayTts 服务端，
   #    校验请求字段映射与回执判定逻辑
