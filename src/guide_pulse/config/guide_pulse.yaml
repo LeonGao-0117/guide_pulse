@@ -1,115 +1,126 @@
 # ============================================================================
-# guide_bridge 节点参数
-# 协议基线：RobotCar v0.22.0（scene/navigate/texts/qr_sha256/tts/tts.result/
-# enroll）。本地变更：tts 单轮播完（协议原语义为循环到替换/停止）。
-# 设计见 docs/design.md，协议要点见 docs/protocol.md
+# guide_bridge 节点部署配置
+# 参数默认值的唯一源 = mqtt_guide_bridge_node.cpp 的 declare_parameter，
+# 本文件只写两类内容：
+#   1) 部署环境配置（地址/凭据/路径，按环境必须覆盖）
+#   2) 现场常调项（内容类/校准类，改完重启生效）
+# 未列出的参数一律用代码默认值；需要覆盖时在此追加同名条目即可
 # ============================================================================
 guide_bridge:
   ros__parameters:
-    # ---- MQTT 连接与 enroll 注册面 ----
+    # ---- 部署环境 ----
     broker_uri: "tcp://124.223.200.153:12883"
-    # POST {enroll_origin}/v1/robots/enroll 换凭据（username=robot_id 同 SN
-    # 稳定；密码每次轮换只存内存；CONNECT 被拒 0x86/0x87 自动重 enroll）
     enroll_origin: "http://124.223.200.153:8780"
-    # 本机序列号：留空则按 环境变量 GUIDE_PULSE_SERIAL_NUMBER >
-    # serial_number_file 顺序自动获取。SN 须运维预登记（robot-admin.sh）
-    serial_number: ""
+    serial_number: ""                    # 留空自动获取（环境变量 > 本地文件）
     serial_number_file: "/robot/info/sn"
-    enroll_timeout_seconds: 5
-    # RobotCar Server 固定 TopicPrefix=robotCar（Server 代码常量，非部署配置）
-    topic_prefix: "robotCar/v1/robots"
-    keep_alive_seconds: 30
-    connect_timeout_seconds: 10
-    heartbeat_interval_seconds: 20       # 0 关闭心跳
-
-    # ---- 展厅讲解增量 ----
-    # 导航执行器：mock（联调）或 waypoint（真机：对接 t1_slam_nav_ws 的
-    # /waypoint_follower 航点服务，point_name 即航点名）
-    nav_executor: "mock"
-    mock_nav_seconds: 0                  # Mock 导航模拟行走秒数（0=立即到达）
-    tour_speak_interval_seconds: 2       # 迎宾词/讲解词每两条之间的间隔秒
-    welcome_default_texts:               # scene 未带 texts 时的本地默认迎宾词
-      - "欢迎光临！我是展厅讲解机器人，很高兴为您服务。"
-
-    # ---- 迎宾变形（scene=welcome 时确保人形形态，直调厂家运控）----
-    # 对齐 t1_slam_nav_ws 的 stand_if_down.py（SetMcAction/GetMcAction，
-    # source 非空即可无需注册，与导航速度桥并存不冲突）。已是人形零
-    # 动作；四足态按 SDK 转移表逐步变形；趴姿默认扶起再变形。
-    # 时序（先变形、后人声）：变形与二维码处理并行，两者就绪后等变形
-    # 结束才开 TTS；变形失败/超时仍照常播报
-    welcome_transform: true              # false 关闭（保持当前姿态直接播报）
-    welcome_stand_from_down: true        # 趴姿是否一路扶起再变形
-    get_action_service: "/aimdk_5Fmsgs/srv/GetMcAction"  # SDK 固定服务名
-    set_action_service: "/aimdk_5Fmsgs/srv/SetMcAction"  # SDK 固定服务名
-    mc_source_name: "guide_pulse"        # SetMcAction 信源名（非空即可）
-    transform_wait_timeout_seconds: 60   # 变形全程时限（最长五步含起立）
-
-    # ---- 播报伴随动作（TTS 受理成功时触发预设动作）----
-    # 每条播报从轮换池取下一个动作触发，interrupt=true 打断上一个伴随
-    # 动作；失败仅告警不影响播报。枚举：1001 右手挥手 / 1011 左手挥手 /
-    # 2003~2009 说话动作族 / 1005 加油欢呼 / 2001 双手比心
-    motion_enabled: true                 # false 关闭（只播语音不做动作）
-    motion_preset_ids: [1001]            # 动作轮换池（当前：右手挥手打招呼）
-    motion_service_name: "/aimdk_5Fmsgs/srv/SetMcPresetMotion"
-    motion_request_timeout_seconds: 2    # 单次调用超时（正常毫秒级返回）
-
-    # ---- SDK TTS 服务（sdk_t1-v0.9.4.4）----
-    tts_service_name: "/aimdk_5Fmsgs/srv/PlayTts"  # SDK 固定服务名，勿修改
-    tts_domain: "guide_pulse"            # 调用方来源标识（SDK 审计用）
-    stop_text: '<speak><break time="300ms"/></speak>'
-                                         # 停止抢占文本：SSML 静音段（完全
-                                         # 无声、任务正常完结）。勿改纯标点
-                                         # "。"——任务无法完结，通道被卡 30-60s
-    # SDK 仲裁：新任务权重(level*100+weight) < 当前播报时直接丢弃。
-    # L7=700 > 唤醒响应档 L6=600，播报期间唤醒/L6 请求被仲裁丢弃不被
-    # 抢话；L8/L10 安全预警仍可打断（合理）。停止由 tts_client 用
-    # 1099 最高权重抢占，保证掐断一切
-    tts_priority_level: 7
-    tts_priority_weight: 0
-    tts_retry_seconds: 3                 # 被仲裁拒绝后隔几秒快速重试
-    tts_request_timeout_seconds: 5       # 单次 PlayTts 调用超时
-    tts_wait_timeout_seconds: 0          # 启动时等待 TTS 服务时长；0=不等待
-
-    # ---- 唤醒抑制（看门狗续期；防 agent strong_interrupt 强打断——
-    # 强打断不走 TTS 优先级仲裁，L7 也防不住，官方出口即本服务）----
-    # TTL 固定短，播报期间 worker 周期续期；尾部宽限（SDK 无播完事件，
-    # estimated_duration 恒 0，只能字数估算）：
-    #   tail_ms = lead + 估算秒×1000×scale（max>0 时封顶）
-    # 校准：掐表 2~3 条文本（受理→听不到声音）拟合 lead 与每字时长
-    suppress_service_name: "/aimdk_5Fmsgs/srv/SetAgentSuppression"  # 固定服务名
-    suppress_wakeup: true                # false 关闭（恢复默认可打断）
-    suppress_ttl_ms: 8000                # 每次抑制 TTL（> 续期间隔）
-    suppress_renew_interval_ms: 5000     # worker 续期间隔
-    tts_speech_ms_per_char: 220          # 每字时长 ms（CJK/数字档；拉丁≈160）
-    suppress_tail_lead_ms: 0             # 尾部宽限固定项（校准可填拟合截距）
-    suppress_tail_scale: 0.8             # 尾部宽限系数（长词后段会被唤醒
-                                         # 打断属已知权衡；播完后白禁过久
-                                         # 则再降）
-    suppress_tail_max_ms: 0              # 尾部宽限封顶 ms（0=不封顶）
-    suppress_tail_flush_ms: 1            # 停续期收尾刷的抑制 TTL ms
-                                         #（0=云端默认 3000ms；1=立即解除）
-
-    # ---- 屏幕二维码显示（迎宾场景，SDK PlayEmotion）----
-    # qr_sha256 与本地缓存（qr_cache_dir，文件名内嵌哈希）比对，命中免
-    # 下载；未命中从 {enroll_origin}/v1/robots/{id}/qr-code/content 下载
-    #（sha256+魔数+≤512KiB 校验后原子替换），ffmpeg 转 848x480 MP4 后
-    # scp 推运控板 PlayEmotion(loop=0) 常驻；3 分钟超时或新业务恢复默认
-    # 表情。未携带 qr_sha256 则不显示。PlayEmotion 在运控板执行，MP4 须
-    # 推送过去；display_remote_pass 空=禁用显示（迎宾语音不受影响）
-    display_emotion_service_name: "/aimdk_5Fmsgs/srv/PlayEmotion"  # SDK 固定，勿改
-    display_remote_host: "10.1.1.100"    # 运控板（PlayEmotion 执行板）
+    display_remote_host: "10.1.1.100"    # 运控板（屏幕显示/SSH 回查共用）
     display_remote_user: "run"
-    display_remote_pass: "1"             # scp 推送密码；空=禁用显示
-    display_remote_dir: "/home/run/screen_display"  # 运控板 MP4 存放目录
-    display_request_timeout_seconds: 5   # 单次 PlayEmotion 调用超时
-    display_show_timeout_seconds: 180    # 二维码常驻时长（3 分钟）
-    display_restore_emotion_id: 90       # 取消后恢复的 T1 默认表情
-    qr_cache_dir: "/tmp/guide_pulse/qr_cache"  # 二维码本地缓存目录
-                                         #（文件名内嵌哈希；跨重启保留可免
-                                         # 二次下载，/tmp 被清则下次重新拉取）
-    qr_download_timeout_seconds: 5       # 二维码单次下载（连接+传输）超时
+    display_remote_pass: "1"             # scp/SSH 密码；空=禁用屏幕显示
 
-    # ---- 协议限制 ----
-    # texts 1..20 条、每条 1..2048 字节；tts/迎宾/讲解均单轮播完；
-    # tts.result 同 operation_id 重发复用缓存
-    dedupe_capacity: 1024                # operation_id 去重表/回执缓存容量
+    # ---- 现场常调项 ----
+    # 二维码业务互斥窗口秒数（2026-10-17 现场需求：显示与取消二维码显示
+    # 是两个业务，与其他业务互斥，超时 20s；只管互斥占用，二维码常驻
+    # 时长仍由 display_show_timeout_seconds 独立计时默认 180s）
+    qr_business_timeout_seconds: 20
+    # 真机航点导航：对接 t1_slam_nav_ws waypoint_follower 服务
+    #（navigate=go / relocate=set_pose，验收轮询 set_pose.verified）
+    nav_executor: "waypoint"
+    mock_nav_seconds: 0                  # mock 导航模拟耗时秒
+    # 导航在途兜底超时秒（默认 600）：go_to_waypoints 受理后 ~/status 终态
+    # 推送断流/导航栈卡死时，到期按 failed:navigation_failed 收尾并释放
+    # 导览业务——等待期所有新业务被拒（failed/busy），超时过长现场感受
+    # 就是「一直拒绝」。按场地最大行程时长配置（展厅通常几十秒）
+    nav_timeout_seconds: 600
+    # 重定位（relocate）等待导航模块验收的超时秒（2026-10-17：终态 =
+    # waypoint_follower 的 set_pose.verified 验收结果，正常 ~1.5s 出结果，
+    # 此值为 status 丢失/服务卡死的兜底；超时按 failed/localization_failed 收尾）
+    relocate_timeout_seconds: 30
+    # 业务互斥拒绝时的语音提示（重定位/导航在途播——机器人没在说话；
+    # 迎宾/播报/讲解中正在出声不播；空串 = 禁用）
+    busy_hint_relocate_text: "我正在重定位，请稍后"
+    busy_hint_navigate_text: "我正在导航，请稍后"
+    # 导航/重定位失败时的语音提示（2026-10-17 现场需求：导航栈异常
+    #（服务不可用/超时/验收失败）现场要能听到，提示排查 navigation
+    # service）；回执照发，播报属本地增强；空串 = 禁用
+    navigate_failed_text: "导航失败，请检查navigation service是否正常"
+    relocate_failed_text: "重定位失败，请检查navigation service是否正常"
+    # 导览受理成功后的引导语（2026-10-17 现场需求：确认 [导航] 收到
+    # 应答 accepted=true 后播报；{point} 替换点位显示名=映射表 name，
+    # 如「比亚迪 M9 DM-i」；空串 = 禁用）
+    navigate_lead_text: "请跟我来，让我带您去看看{point}这款车"
+    # 迎宾引导语（2026-10-17 现场需求：迎宾先播引导语，播完（TtsStatus
+    # 终态回流/字数估算兜底）再变形，变形完成播迎宾词；空串 = 禁用
+    #（直接变形，回退原时序））
+    welcome_lead_text: "元气满满，小T来迎接我的顾客了。"
+    # 点位映射表落盘文件（v0.25.0 P-039 point_map 全量替换）：App 每次推表
+    # 整表覆盖此文件，重启自动加载（App 无需重推）。默认放平台持久化
+    # 数据目录 /robot/persist/var/guide_pulse/（与其他模块 var 数据同级，
+    # 代码默认值一致，此处显式写出便于现场排查）
+    point_map_file: "/robot/persist/var/guide_pulse/point_map.json"
+    # navigate 到达而映射表为空时的提示话术（播报给现场 + 回执
+    # navigate.result/failed:point_not_found，不启动导航）
+    point_map_missing_text: "无法执行导览工作，请配置点位映射表哦"
+    # 表空或点位名未命中时的拒绝话术，navigate/relocate 共用
+    #（{point} 替换原始点位名；回执同 failed:point_not_found。
+    # 2026-10-17 现场需求：映射表是唯一权威，未命中直接拒绝，
+    # 不再原样透传航点名；空串 = 禁用播报）
+    point_map_unmatched_text: "未找到点位{point}，请重新配置映射表"
+    # 导览到达默认车型讲解词（2026-10-17 现场需求）：后端下发导览
+    # 指令不带讲解词、或 agent 语料触发导航时，到达后按点位播对应
+    # 车型的默认讲解词。格式「点位名|讲解词」；点位名按归一化
+    #（去空格+小写）与映射表 name/code 匹配（「比亚迪M9 DM-i」与
+    # 「比亚迪 M9 DM-i」均命中 B）；未配置的点位到达不播报
+    navigate_default_texts:
+      - "比亚迪ATTO 1|ATTO 1是一款五座纯电小型两厢轿车，别看它小巧，日常配置也挺丰富！全景影像方便观察周围环境，手机无线充电也很顺手。后排座椅放倒后还能扩展储物空间，日常通勤、接送孩子都可以看看它！"
+      - "比亚迪ATTO 2|ATTO 2是一款五座纯电SUV，车身比较紧凑，适合喜欢SUV、又想兼顾城市出行的朋友！它配有前排座椅通风、12.8英寸旋转中控屏和全景影像，既照顾乘坐体验，也方便日常使用。您可以坐进车里，感受一下空间哦！"
+      - "比亚迪ATTO 3|ATTO 3是一款五座纯电SUV，日常代步和家庭出游都能派上用场！全景天窗让车内更有开阔感，15.6英寸旋转中控屏也是一大亮点。后排配有儿童安全座椅固定接口，座椅还能按比例放倒，带孩子和行李出门更方便安排！"
+      - "比亚迪M6|M6是一款纯电MPV，有六座和七座版本，是多人家庭出行的好伙伴！六座版第二排采用独立座椅，七座版则多一个座位，您可以按家庭人数来选。它还配有旋转中控屏、全景影像和儿童安全座椅固定接口，全家一起出门可以重点看看！"
+      - "比亚迪M9 DM-i|M9 DM-i是一款七座插电式混合动力MPV，可油可电，让出行多一种选择！双侧电动滑门方便上下车，第三排折叠后还能扩展行李空间。如果更看重舒适配置，可以看看Premium版的中排按摩、通风和电动腿托，带家人一起体验一下吧！"
+      - "比亚迪SEALION 6 DM-i|SEALION 6 DM-i是一款五座插电式混合动力SUV，可油可电，配有前排座椅通风加热和全景影像，日常和家庭出行都可以了解一下！"
+      - "比亚迪SEALION 7|SEALION 7是一款五座纯电SUV，喜欢空间和驾驶体验的朋友可以重点看看！它有后驱和四驱版本，还配有真皮座椅、前排座椅通风和丹拿音响。除了后备箱，前面还有一个储物空间，空间安排更灵活！"
+      - "腾势B5|腾势B5是一款五座插电式混合动力SUV，是喜欢户外生活的朋友可以关注的车型！智能电四驱和多种越野模式是它的亮点，车内也配有前排座椅按摩、通风和冷暖箱。既想探索户外，又看重乘坐体验，可以来了解一下它！"
+      - "腾势B8|腾势B8是一款提供六座和七座选择的插电式混合动力SUV，车身更大，适合同时关注多人出行和户外体验的朋友！它配有智能电四驱、云辇-P车身控制系统，还有前排按摩和中排通风等舒适配置。您可以带家人一起试坐，看看哪种座位布局更合适！"
+      - "腾势D9|腾势D9是一款豪华纯电MPV，更看重乘坐舒适度的话，可以重点体验它！中排大班座椅配有按摩和通风，车内还有冷暖箱及双层隔音隔热玻璃。全家出游或商务接待都可以了解一下，尤其值得坐到第二排，感受它的舒适配置！"
+      - "腾势Z9 GT|腾势Z9GT是一款豪华纯电GT，喜欢运动造型、又看重乘坐舒适度的朋友，可以重点关注它！三电机动力和后轮转向技术是它的亮点，车内还有帝瓦雷音响、带通风和按摩功能的座椅，以及车载冰箱，让日常出行和长途旅行都多一份享受！"
+    welcome_default_texts:               # 迎宾默认词（scene 未带 texts 时）
+      - "您好！欢迎来到比亚迪品牌体验中心。我是机器人导览员小T，我可以带您参观展厅、介绍车型，也可以根据您的用车需求，帮您找到想了解的车。另外您也可以扫描我屏幕上显示的二维码，留下您的联系方式，方便我们给您提供更好的服务。"
+    agent_monitor.welcome_phrases:       # agent 话术命中任一条 -> 迎宾（空=关闭）
+      - "好嘞，马上开始迎接我的顾客喽"
+    agent_monitor.qr_phrases:            # agent 话术命中任一条 -> 显示二维码3分钟（空=关闭）
+      - "收到，这就给您显示二维码，您可以扫描二维码留下您的个人信息哦"
+    agent_monitor.qr_cancel_phrases:     # agent 话术命中任一条 -> 取消二维码显示（空=关闭；
+                                         #  2026-10-17 现场需求：显示/取消是两个互斥业务，
+                                         #  各占 qr_business_timeout_seconds 窗口）
+      - "好的，这就取消二维码显示"
+    agent_monitor.relocate_phrases:      # agent 话术命中 -> 等agent说完该句再在该航点重定位；格式 "航点名|语料"
+      - "A|好的，这就在展厅A点开始重定位"   # 航点名 = t1_slam_nav_ws 航点文件点位名
+      - "B|好的，这就在展厅B点开始重定位"
+      - "C|好的，这就在展厅C点开始重定位"
+      - "D|好的，这就在展厅D点开始重定位"
+      - "E|好的，这就在展厅E点开始重定位"
+    agent_monitor.navigate_phrases:      # agent 话术命中 -> 等agent说完该句再导航到车型点位；格式 "点位名|语料"
+                                         #（点位名 = 点位映射表 name/code，App 推表下发；
+                                         #  命中后挂起等该句 TTS 播报结束（TtsStatus 终态/
+                                         #  对话回 IDLE/15s 兜底）才注入导航，占业务互斥；
+                                         #  未命中/表空则拒绝并播报 point_map_* 提示）
+      - "腾势 B5|好的，您是想了解下腾势 B5这款车吗，请稍等"
+      - "比亚迪 M9 DM-i|好的，您是想了解下比亚迪 M9 DM-i这款车吗，请稍等"
+      - "比亚迪ATTO 1|好的，您是想了解下比亚迪ATTO one这款车吗，请稍等"   # 点位名=映射表name(数字1)；语料=agent原话(英文one)
+      - "腾势 D9|好的，您是想了解下腾势 D9这款车吗，请稍等"
+      - "腾势 Z9 GT|好的，您是想了解下腾势 Z9 GT这款车吗，请稍等"
+    agent_monitor.navigate_stop_phrases: # agent 话术命中任一条 -> 停止导航（等价 navigate.stop；空=关闭）
+      - "这就停止展厅讲解"               # 取消在途导航并释放导览占用，无导航 no-op
+    motion_preset_ids: [2003]            # 播报伴随动作池（2003=双手说话动作；
+                                         #  2026-10-17 现场需求：导览播报改讲话
+                                         #  姿势，原 1001 右手挥手已弃用；
+                                         #  2004~2009=说话动作1~6 可换用）
+    # 唤醒抑制尾部宽限校准（tail = lead + 每字ms×字数×scale；播报中被
+    # 唤醒则调大 scale / tts_speech_ms_per_char）
+    tts_speech_ms_per_char: 220
+    # scale=1.0 不缩水：0.8 会使抑制早于语音结束 1~3s 解除，
+    # 尾部裸奔窗口内唤醒词直接强打断 TTS（2026-10-16 真机日志验证）
+    suppress_tail_scale: 1.0
+    suppress_tail_flush_ms: 1            # 宽限到期收尾 TTL；1=立即解除
+    mic_mute_enabled: true               # 播报期间 SSH 静音运控板麦克风
+                                         # （防旧对话轮 request_stop 强打断，
+                                         #   2026-10-16；复用 display_remote_*）

@@ -15,6 +15,7 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>rclcpp</depend>
+  <depend>ament_index_cpp</depend>
   <!-- SDK 消息包（已拷贝内置 src/aimdk_msgs，来源 sdk_t1-v0.9.4.4） -->
   <depend>aimdk_msgs</depend>
   <!-- 航点导航服务定义（已拷贝内置 src/waypoint_nav_msgs，来源 t1_slam_nav_ws） -->

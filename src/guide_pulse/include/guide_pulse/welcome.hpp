@@ -18,7 +18,9 @@ namespace guide_pulse
 // 迎宾词兜底（配置错误时也要出声，避免哑迎宾）
 inline const std::vector<std::string> & builtin_welcome_texts()
 {
-  static const std::vector<std::string> kTexts{"欢迎光临！我是展厅讲解机器人，很高兴为您服务。"};
+  static const std::vector<std::string> kTexts{
+    "您好！欢迎来到比亚迪品牌体验中心。我是机器人导览员小T，我可以带您参观展厅、介绍车型，也可以根据您的用车需求，帮您找到想了解的车。",
+    "另外您也可以扫描我屏幕上显示的二维码，留下您的联系方式，方便我们给您提供更好的服务。"};
   return kTexts;
 }
 

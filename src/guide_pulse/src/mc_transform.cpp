@@ -7,6 +7,8 @@
 #include <optional>
 #include <utility>
 
+#include <cstdlib>
+
 #include "guide_pulse/service_call.hpp"
 
 namespace guide_pulse
@@ -39,6 +41,17 @@ constexpr double kMcActionSettleSeconds = 3.0;
 
 // 上一动作可能还在切换中（status!=100），此时发动作会被拒，先等稳定
 constexpr int kMcSettleWaitSeconds = 10;
+
+// ---- 变形音：SSH 运控板 paplay 官方 wav ----
+// 出声路径选型（2026-10-16 真机排查）：固件 v2d0 起 /hal_audio 节点没了，
+// /aima/hal/audio/playback 全域无订阅者（PCM 直推死路，导航栈旧经验已
+// 失效）；PlayAudioFile 服务在 ROS 图里但请求无人应答（audio_manager
+// 日志无记录）。扬声器走运控板 PulseAudio（audio_manager 路由日志
+// snk=alsa_output.platform-ad82128b），官方变形音也在运控板上——SSH
+// paplay 直接播（实测 3.3s 含建连，声音叠在起立/变形动作上）
+constexpr const char * kChimeDefaultSoundPath =
+  "/robot/software/aimrt_agent/bin/cfg/t1/audio/transform4to2.wav";
+constexpr const char * kChimeDefaultSshTarget = "run@10.1.1.100";
 
 }  // namespace
 
@@ -110,6 +123,28 @@ McTransform::McTransform(rclcpp::Node::SharedPtr node, Config config)
     config_.set_action_service, qos, callback_group_);
   get_action_client_ = node_->create_client<aimdk_msgs::srv::GetMcAction>(
     config_.get_action_service, qos, callback_group_);
+  if (config_.camera_servo_enabled) {
+    servo_client_ = node_->create_client<aimdk_msgs::srv::SetServo>(
+      config_.servo_service, qos, callback_group_);
+  }
+  // 变形音：SSH paplay 走运控板 PulseAudio（无 ROS 依赖）。密码为空 =
+  // 无法 SSH，禁用（与麦克风静音同凭据，正常部署都配了）
+  if (config_.sound_enabled) {
+    if (config_.sound_path.empty()) {
+      config_.sound_path = kChimeDefaultSoundPath;
+    }
+    if (config_.ssh_target.empty()) {
+      config_.ssh_target = kChimeDefaultSshTarget;
+    }
+    if (config_.ssh_pass.empty() ||
+      config_.ssh_pass.find('\'') != std::string::npos)
+    {
+      RCLCPP_WARN(
+        node_->get_logger(), "变形音禁用(不影响变形): SSH 密码为空或含单引号"
+        "（display_remote_pass 未配置？）");
+      config_.sound_enabled = false;
+    }
+  }
 }
 
 McTransform::~McTransform()
@@ -148,6 +183,10 @@ void McTransform::shutdown()
 {
   if (transform_thread_.joinable()) {
     transform_thread_.join();
+  }
+  // 播放线程先于成员销毁回收（SSH+播放最长 ~5s，正常早已结束，仅收尾）
+  if (chime_thread_.joinable()) {
+    chime_thread_.join();
   }
 }
 
@@ -227,6 +266,72 @@ std::string McTransform::wait_for_action(
   return rclcpp::ok() ? ("等 " + expected + " 到位超时") : "收到关停信号，不再等动作到位";
 }
 
+std::string McTransform::raise_camera()
+{
+  if (!config_.camera_servo_enabled) {
+    return "";  // 功能关闭视为成功（不影响流程日志）
+  }
+  if (!servo_client_ || !servo_client_->service_is_ready()) {
+    return "SetServo 服务不可用";
+  }
+  auto request = std::make_shared<aimdk_msgs::srv::SetServo::Request>();
+  request->request.header.stamp = node_->now();
+  request->position = static_cast<std::uint8_t>(config_.camera_position);
+  request->speed = static_cast<std::uint16_t>(config_.camera_speed);
+  const auto response = call_with_timeout(*servo_client_, request, 3);
+  if (!response) {
+    return "SetServo 无应答";
+  }
+  // SetServo 响应：顶层 CommonResponse header（其内 ResponseHeader.header.code）
+  const auto code = static_cast<int>(response->header.header.code);
+  if (code == 0) {
+    return "";
+  }
+  return "SetServo 被拒（code=" + std::to_string(code) + "）";
+}
+
+void McTransform::start_transform_chime(const std::string & source)
+{
+  if (!config_.sound_enabled) {
+    return;  // 功能关闭（welcome_transform_sound=false 或密码为空）：静默变形
+  }
+  // 至多一个播放线程：上一段早已播完（~3s），这里只是收尾
+  if (chime_thread_.joinable()) {
+    chime_thread_.join();
+  }
+  chime_in_flight_.store(true);
+  chime_thread_ = std::thread(
+    [this, source]() {run_chime(source);});
+}
+
+void McTransform::run_chime(const std::string & source)
+{
+  const auto finish = [this]() {chime_in_flight_.store(false);};
+
+  // SSH 运控板 paplay 官方变形音（阻塞至播完，实测 ~3.3s 含建连；声音
+  // 叠在起立/变形动作上——厂家 App 的观感）。与麦克风静音同款调用方式
+  const std::string cmd = "sshpass -p '" + config_.ssh_pass + "' ssh "
+    "-o StrictHostKeyChecking=accept-new -o ConnectTimeout=3 " +
+    config_.ssh_target + " 'paplay " + config_.sound_path + "'"
+    " > /dev/null 2>&1";
+  const int rc = std::system(cmd.c_str());
+  if (!rclcpp::ok()) {
+    finish();  // 关停中：结果无从谈起，也不必再打日志
+    return;
+  }
+  if (rc != 0) {
+    RCLCPP_WARN(
+      node_->get_logger(),
+      "变形音未播(不影响变形): SSH paplay 失败 rc=%d（%s 上有 %s 吗？）:（%s）",
+      rc, config_.ssh_target.c_str(), config_.sound_path.c_str(), source.c_str());
+  } else {
+    RCLCPP_INFO(
+      node_->get_logger(), "变形音已播: %s:%s（%s）",
+      config_.ssh_target.c_str(), config_.sound_path.c_str(), source.c_str());
+  }
+  finish();
+}
+
 void McTransform::run_ensure_biped(const std::string & source)
 {
   using Clock = std::chrono::steady_clock;
@@ -287,11 +392,17 @@ void McTransform::run_ensure_biped(const std::string & source)
     }
   }
 
-  // 已是人形：什么都不发（幂等）
+  // 已是人形：什么都不发（幂等），摄像头舵机仍确保竖起
   if (current == kMcBipedTarget && status == kMcStatusRunning) {
     RCLCPP_INFO(
       node_->get_logger(), "迎宾变形: 已是 %s 且运行中，无需切换（%s）",
       kMcBipedTarget, source.c_str());
+    const std::string why_camera = raise_camera();
+    if (!why_camera.empty()) {
+      RCLCPP_WARN(
+        node_->get_logger(), "摄像头舵机竖起失败(不影响播报): %s（%s）",
+        why_camera.c_str(), source.c_str());
+    }
     finish();
     return;
   }
@@ -322,6 +433,8 @@ void McTransform::run_ensure_biped(const std::string & source)
     current.c_str(), kMcBipedTarget, path.size(),
     down ? "（含起立）" : "", source.c_str());
 
+  // 变形音在循环内贴着变形动作开口（见发 kMcToBipedAction 处）。
+
   // 逐步走完路径，每步：发动作 -> 等到位。总时限覆盖全程；中途关停
   // 不再发下一条，不把机器人留在没人要的中间动作上
   const auto deadline = Clock::now() +
@@ -334,6 +447,13 @@ void McTransform::run_ensure_biped(const std::string & source)
         step.c_str(), source.c_str());
       finish();
       return;
+    }
+    // 变形音：贴着变形动作开口、立刻发它（先开口后发动作的叠加观感，
+    // 厂家 App 同款）。不能在流程起点播：趴姿路径前置起立+行走步
+    //（物理 ~10s），起点播完时机器人还没开始变形，声音明显早于
+    // 动作（2026-10-16 真机反馈）。推流后台进行，失败只记日志
+    if (step == kMcToBipedAction) {
+      start_transform_chime(source);
     }
     RCLCPP_INFO(node_->get_logger(), "迎宾变形: 发动作 %s", step.c_str());
     why = send_action(step);
@@ -371,6 +491,17 @@ void McTransform::run_ensure_biped(const std::string & source)
   RCLCPP_INFO(
     node_->get_logger(), "迎宾变形完成: 已切到 %s 且运行中（%s）",
     kMcBipedTarget, source.c_str());
+  // 变形完成：竖起摄像头舵机（迎宾人脸检测可用；失败不阻断播报）
+  const std::string why_camera = raise_camera();
+  if (!why_camera.empty()) {
+    RCLCPP_WARN(
+      node_->get_logger(), "摄像头舵机竖起失败(不影响播报): %s（%s）",
+      why_camera.c_str(), source.c_str());
+  } else if (config_.camera_servo_enabled) {
+    RCLCPP_INFO(
+      node_->get_logger(), "摄像头舵机已竖起: position=%d（%s）",
+      config_.camera_position, source.c_str());
+  }
   finish();
 }
 

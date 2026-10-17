@@ -21,6 +21,7 @@
 
 #include <aimdk_msgs/srv/get_mc_action.hpp>
 #include <aimdk_msgs/srv/set_mc_action.hpp>
+#include <aimdk_msgs/srv/set_servo.hpp>
 
 namespace guide_pulse
 {
@@ -54,6 +55,23 @@ public:
     std::string source_name;         // SetMcAction.request.source（非空即可，
                                      // 无需信源注册——stand_if_down 实测）
     int wait_timeout_seconds{60};    // 变形全程时限（含趴姿起立最长五步）
+    // 摄像头舵机（头部相机随形态翻转：0 度=四足收平，90 度=双足竖起）。
+    // 迎宾流程到达人形后调 SetServo 竖起摄像头（幂等，已是人形也调），
+    // 失败只告警不阻断播报
+    bool camera_servo_enabled{true};
+    int camera_position{90};         // 迎宾时摄像头舵机角度（0-90）
+    int camera_speed{500};           // 舵机速度（100-1000 步/秒）
+    std::string servo_service;       // 默认 /aimdk_5Fmsgs/srv/SetServo
+    // 变形音：要发变形动作前后台 SSH 运控板 paplay 厂家官方变形音（先开口、
+    // 立刻发动作，声音与变形叠加；2026-10-16 补齐迎宾直调路径缺的这声）。
+    // 背景：固件 v2d0 起 /hal_audio 没了，/aima/hal/audio/playback 无人订阅
+    //（PCM 直推死路）；PlayAudioFile 服务在图里但请求无人应答。扬声器走
+    // 运控板 PulseAudio（audio_manager 路由日志），官方 wav 也在运控板上
+    bool sound_enabled{true};
+    std::string sound_path;      // 运控板上 wav 绝对路径（默认厂家官方
+                                 // /robot/software/aimrt_agent/bin/cfg/t1/audio/transform4to2.wav）
+    std::string ssh_target;      // SSH 目标 user@host（默认 run@10.1.1.100）
+    std::string ssh_pass;        // SSH 密码（空 = 变形音禁用；复用 display_remote_pass）
   };
 
   // enabled=true 时创建独立回调组与两个运控客户端（回执由 executor 投递，
@@ -88,14 +106,24 @@ private:
     const std::string & expected,
     std::chrono::steady_clock::time_point deadline,
     double settle_seconds = 0.0);
+  // 竖起摄像头舵机（变形线程内同步调用）。空串 = 成功；否则为失败原因
+  std::string raise_camera();
+  // 后台播变形音（先开口、立刻返回，不挡变形动作；失败只记日志）。
+  // 仅在路径含变形动作时调用；至多一个播放线程在途
+  void start_transform_chime(const std::string & source);
+  // 播放线程体：SSH 运控板 paplay 官方变形音 wav（阻塞至播完才返回）
+  void run_chime(const std::string & source);
 
   rclcpp::Node::SharedPtr node_;
   Config config_;
   rclcpp::Client<aimdk_msgs::srv::SetMcAction>::SharedPtr set_action_client_;
   rclcpp::Client<aimdk_msgs::srv::GetMcAction>::SharedPtr get_action_client_;
+  rclcpp::Client<aimdk_msgs::srv::SetServo>::SharedPtr servo_client_;
   rclcpp::CallbackGroup::SharedPtr callback_group_;
   std::thread transform_thread_;                 // 当前变形调用线程（至多一个）
   std::atomic_bool transform_in_flight_{false};  // 变形流程未结束（去重入口）
+  std::thread chime_thread_;                     // 变形音播放线程（至多一个）
+  std::atomic_bool chime_in_flight_{false};      // 播放未结束（收尾判定）
 };
 
 }  // namespace guide_pulse

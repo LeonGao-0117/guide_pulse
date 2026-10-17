@@ -34,13 +34,25 @@ backend_simulator → mosquitto(:1884) → guide_bridge → mock_tts_service(SDK
 用例（断言桥接日志 / Mock TTS 播报日志 / backend_simulator 收到的回执）：
 
 1. **tts 基线**：下发 tts → Mock TTS 收到第一条 → 收到 `tts.result(accepted)`；
-2. **迎宾**：下发 `scene(welcome)` 无 texts → Mock TTS 收到默认迎宾词一轮
-   （出现后不再重复——单轮语义）；带 texts → 播指令词；
+2. **迎宾**：下发 `scene(welcome)` 无 texts → 先播引导语
+   `welcome_lead_text`（「元气满满，小T来迎接我的顾客了」，2026-10-17
+   需求）→ 播完变形（Mock 运控完整转移序列，断言引导语播完日志先于
+   首条变形动作）→ 变形完成后播默认迎宾词一轮（出现后不再重复——
+   单轮语义）；带 texts → 播指令词；导航/重定位用例前先 `point-map`
+   推点位映射表（point_name 唯一权威数据源，落盘隔离到测试目录）；
 3. **汽车讲解**：下发 `navigate("3号展台", [讲解词])` → 日志出现
    `Mock导航到达` → Mock TTS 依次收到讲解词 → 播完不循环；
 4. **停止**：讲解播报中下发 `tts.stop` → 播报终止（无回执）；
-5. **导航替换**：navigate A 进行中再发 navigate B → 日志出现替换、只到达 B；
-6. **过期指令**：`--expires` 已过期的 navigate → 被丢弃且不导航。
+5. **取消导航**：navigate 在途下发 `navigate.stop` → 导航取消、讲解词
+   不播（v0.23.0，无回执）；无导航时再发 → no-op 日志；
+6. **导航替换**：navigate A 进行中再发 navigate B → 日志出现替换、只到达 B；
+7. **过期指令**：`--expires` 已过期的 navigate → 被丢弃且不导航；
+8. **地图重定位**（2026-10-17 接入，终态=导航模块验收）：下发 `relocate A`
+   -> 受理 -> 等待验收（`mock_relocate_hold_polls` 模拟 ~2s 窗口）->
+   Mock TTS 收到「A点重定位成功」-> backend_simulator 收到
+   `relocate.result(success)`；等待窗口内新 `navigate` 被互斥拒绝
+   （`failed/busy`）且播报「我正在重定位，请稍后」；导航在途下发
+   `relocate` 同样被拒（`failed/busy`）并播「我正在导航，请稍后」。
 
 ```bash
 bash tools/run_integration_test.sh

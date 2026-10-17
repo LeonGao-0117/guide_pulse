@@ -6,14 +6,17 @@
 ## 1. 需求与指令映射
 
 展厅讲解链路：**APP 经 Server 下发参数到 Robot，Robot 本地执行**。
-全部落在 RobotCar 协议 v0.21.0 已有指令上，**零协议变更**：
+指令面落在 RobotCar 协议 v0.24.0（P-038 起 navigate/scene 有一次性
+结果回执）：
 
 | 展厅功能 | 协议指令（down/commands） | 回执 | Robot 本地行为 |
 | --- | --- | --- | --- |
-| 迎宾 | `scene`：`scene="welcome"` + 可选 `texts` | 无 | 播迎宾词一轮（`texts` 缺省用本地默认词） |
-| 导航 + 汽车讲解 | `navigate`：`point_name` 必填 + 可选 `texts` | 无 | 本地导航到点位，到达后按序播讲解词一轮 |
+| 迎宾 | `scene`：`scene="welcome"` + 可选 `texts` | `scene.result`（v0.24.0） | 播迎宾词一轮（`texts` 缺省用本地默认词）；流程主体完成（变形结束+二维码上屏+会话已立）回 `success`，忙碌回 `failed/busy` |
+| 导航 + 汽车讲解 | `navigate`：`point_name` 必填 + 可选 `texts` | `navigate.result`（v0.24.0） | 本地导航到点位，到达回 `success`（讲解词播报与否不影响结果）后按序播讲解词一轮；失败回 `failed/navigation_failed`；被 `navigate.stop`/`tts.stop` 中止回 `failed/aborted`；忙碌回 `failed/busy` |
+| 地图重定位 | `relocate`：`point_name` 必填 + 可选 `texts`（v0.21.0，2026-10-17 接入） | `relocate.result` | **不可打断的互斥业务**：`point_name` 经点位映射表解析 -> `set_pose` 重设定位初值（机器人不动）-> 等待导航模块验收（worker 250ms 轮询 `status_json` 的 `set_pose.verified`，真机受理后 ~1.5s 出结果）-> 验收通过回 `success` 并播报（`texts` 缺省播「{point_name}点重定位成功」），验收失败/`relocate_timeout_seconds`（默认 30s）超时回 `failed/localization_failed`；受理被拒当场回 `failed/point_not_found`（航点名不在航点表，available 结构化判定）或 `failed/localization_failed`（其余归并）。等待期占业务互斥：新业务回 `failed/busy` 并播「我正在重定位，请稍后」（迎宾/播报/讲解中正在出声，被拒时不播提示）；`tts.stop` 不中止等待（初值已发，终态由导航模块给出） |
 | 独立播报 | `tts`：`texts`+`mode`+`interval_seconds` | `tts.result` | 列表单轮播完自行结束（2026-10-14 变更，原为沿用 tts_demo 列表循环播报） |
-| 停止 | `tts.stop` | 无 | 停止一切播报并取消进行中的导航（本地策略） |
+| 停止 | `tts.stop` | 无 | 停止一切播报并取消进行中的导航（本地策略，被取消的导航回 `failed/aborted`） |
+| 停止导航 | `navigate.stop` | 无 | 只取消在途导航（被取消的导航回 `failed/aborted`；无导航 no-op） |
 
 典型讲解流程：APP 下发 `scene(welcome)` 迎宾 → APP 下发
 `navigate("3号展台", [讲解词...])` → Robot 走到展台 → 到达后播报讲解词。
@@ -21,8 +24,27 @@
 不实现（明确排除）：
 
 - `condition` 拥堵播报（tts_demo 的展厅外功能，不搬运）；
-- `relocate` 重定位、`ota.start` 升级（无需求，静默忽略，由其他组件处理）；
-- `navigate.result` 等回执（协议明确后置，v1 无导航回执面）。
+- `ota.start` 升级（无需求，静默忽略，由其他组件处理）。
+
+### 回执要点（v0.24.0 P-038）
+
+- **恰好一条**：每条 navigate/relocate/scene 指令恰好一条最终回执；传输重发
+  （同 operation_id 再次到达）重发**同一信封**（同 event_id，receipt 缓存）。
+- **回执时机**：受理即终态的（忙碌/过期/载荷非法）当场回；执行类的在
+  终态确定时回（到达/失败/中止/迎宾流程完成；relocate 的终态是导航模块
+  的**验收结果**——`set_pose.verified`，不是受理应答：受理成功后等待
+  验收（真机 ~1.5s），验收通过/失败/超时（`relocate_timeout_seconds`
+  默认 30s）才回 `relocate.result` 并释放业务占用）。回执信封发送时
+  生成，执行耗时不受指令信封 TTL 约束。
+- **reason 归并**：导航失败统一 `navigation_failed`（NavOutcome 无结构化
+  分类，不猜 point_not_found/localization_lost）。重定位例外：
+  `point_not_found` 由服务端回带的 available 清单结构化判定（点名不在
+  合法航点清单 = point_not_found），其余被拒（导航在途之外的状态冲突/
+  非站立人形/定位未起）与服务不可用归并 `localization_failed`。
+- **本地注入不发回执**：语料触发（`event.local`）的 operation_id 为本地
+  生成，Server 不认识（对应不到已下发指令的结果只记日志）。
+- **掉线/重启无回执**：进程重启即丢失在途状态，契约允许无回执
+  （App 不得把「没收到回执」当失败）。
 
 ## 2. 架构
 
@@ -32,14 +54,14 @@
 └──────────┘             └──────────┘                              ▼
                        ▲           ┌─────────────────────────────────────────┐
                        │ presence/ │ guide_pulse（本工程，ROS2 ament, C++17） │
-                       │ heartbeat │  ┌──────────────────────────────────┐  │
-                       │ tts.result│  │ mqtt_guide_bridge（沿用 tts_demo │  │
-                       └───────────│  │ 框架：enroll/MQTT/队列/回执）     │  │
+                       │ heartbeat │  ┌──────────────────────────────────┐   │
+                       │ tts.result│  │ mqtt_guide_bridge                │   │
+                       └───────────│  │ (enroll/MQTT/队列/回执)           │  │
                                     │  └──────┬───────────┬──────────┬───┘  │
                                     │   ┌─────┘           │          │      │
                                     │   ▼                 ▼          ▼      │
-                                    │ WelcomeModule   TourModule  tts 播报 │
-                                    │ (scene 迎宾)   (navigate)  (单轮)   │
+                                    │ WelcomeModule   TourModule  tts 播报  │
+                                    │ (scene 迎宾)   (navigate)  (单轮)      │
                                     │   │               │          │      │
                                     │   ▼               ▼          ▼      │
                                     │ PlaylistSession（共享列表播报状态机）│
@@ -94,9 +116,19 @@
    SDK 明确勿手动再发 WBC）；趴姿由 `welcome_stand_from_down`（默认
    true）决定是否一路扶起再变形——迎宾由后端在有人到场时触发，与远程
    下发航点的场景不同；表外动作（空翻/跳舞等）拒绝不猜。
-   **时序（2026-10-15 需求：先变形、后人声）**：变形异步发起，二维码
-   处理（下载/转码/推送 ~3.5s）与变形并行重叠，两者就绪后**等变形结束
-   才开 TTS 会话**——总时长 = max(变形, 二维码)。变形失败/超时仍照常
+   **时序（2026-10-15 需求：先变形、后人声；2026-10-16 需求：二维码
+   上屏在 TTS 开播之前；2026-10-17 需求：先播引导语再变形）**：迎宾
+   到达先播引导语 `welcome_lead_text`（默认「元气满满，小T来迎接我的
+   顾客了」，空=禁用）——复用播报会话机制（麦克风静音/唤醒抑制/trace
+   前缀），播完以 TtsStatus 终态回流为准、字数估算兜底（`wait_speech_
+   done`，BEST_EFFORT 丢事件不卡流程），受理失败直接放行进变形；二
+   维码**准备**（下载/转码/推送 ~3.5s，ScreenDisplay 两阶段的阶段 1）
+   与引导语播报、变形并行重叠；引导语播完后变形异步发起，变形结束后
+   先执行二维码**上屏**（阶段 2：PlayEmotion 常驻循环，毫秒级受理）
+   再开 TTS 会话——上屏必须在变形之后：变形动画/变形结束恢复的表情
+   会顶掉变形前上屏的内容（PlayEmotion 单通道，新请求即打断），且迎宾
+   词提及「扫描我屏幕上显示的二维码」，TTS 开播时屏幕必须已是二维码。
+   总时长 = max(变形, 准备) + 上屏受理。变形失败/超时仍照常上屏与
    播报（姿态链路失败不阻断语音）。等待期间新指令在下行队列排队，
    迎宾互斥窗口自开播时起算。防抖三件套（均为真机实测教训）：
    规划前等上一个动作稳定（2003 拒绝，state=-1008）、中间动作 dwell
@@ -127,11 +159,15 @@
 输入 `navigate` 指令。状态机 `idle → navigating → (到达回调) → 讲解(PlaylistSession) → idle`：
 
 1. `goto(point_name)`：经 `NavExecutor` 发起（新导航替换进行中的导航
-   ——协议允许本地决定）；
-2. 到达（`NavOutcome.ok`）→ 开一轮讲解 PlaylistSession（`texts` 缺省
-   不播，记日志——讲解无本地默认词，点位即展台，讲解词必须由 APP 给）；
-3. 到达失败 → 记 ERROR 日志（协议无回执面，失败不上报）；
-4. `cancel()`：取消导航（`tts.stop`/新 navigate 时调用）。
+   ——协议允许本地决定；本工程单业务模型下在途导航不会被新 navigate
+   替换，忙碌互斥先行拒绝）；
+2. 到达（`NavOutcome.ok`）→ 回 `navigate.result(success)`（v0.24.0）→
+   开一轮讲解 PlaylistSession（`texts` 缺省不播，记日志——讲解无本地
+   默认词，点位即展台，讲解词必须由 APP 给）；
+3. 到达失败 → 回 `navigate.result(failed, navigation_failed)` 并记
+   ERROR 日志（reason 归并，见 §1 回执要点）；
+4. `cancel()`：取消导航（`tts.stop`/新 navigate 时调用），取消即对原
+   指令回 `failed/aborted`。
 
 ### 3.4 互斥与替换策略（本地策略，协议不约束，全部归 Robot）
 
@@ -156,33 +192,114 @@
   SDK 无播完事件（流式合成下 `estimated_duration` 恒 0 且无播完话题，
   《接口说明.md》PlayTts 节官方建议即字数预估），最后一条受理后按
   两段式估算持续续期 `tail_ms = suppress_tail_lead_ms + 字数估算秒×
-  1000 × suppress_tail_scale`（`suppress_tail_max_ms>0` 封顶；默认
-  估算×scale（scale 默认 0.8，lead 默认 0 不加；原为预估×2——120 字迎宾词
-  宽限 52s，实际 ~30s 播完，播完后唤醒被白禁 20s+；真机复测收紧后仍白禁
-  7~8s，2026-10-14 再砍两刀：scale 1.3→1.0 + 收尾刷由云端默认 3s 改 1ms
-  立即解除），到点停续期并刷 `suppress_tail_flush_ms` 立即解除；真机校准：
+  1000 × suppress_tail_scale`（`suppress_tail_max_ms>0` 封顶；历史调参：
+  原为预估×2——120 字迎宾词宽限 52s，实际 ~30s 播完，播完后唤醒被白禁
+  20s+；2026-10-14 砍 scale 1.3→1.0 + 收尾刷改 1ms 立即解除；2026-10-16
+  定稿 lead=2500（受理≠出声，云端合成 1~3s）+ scale=1.0 不缩水——0.8 会
+  使抑制早于语音结束 1~3s 解除，尾部裸奔被唤醒强打断播报，宁可多禁 3~5s），
+  到点停续期并刷 `suppress_tail_flush_ms` 立即解除；真机校准：
   掐表 2~3 条典型文本拟合 lead 与 `tts_speech_ms_per_char`。
   `tts.stop` 掐断语音即停抑制。tts（type=tts）2026-10-14 起亦为单轮，
   播报期间同样抑制唤醒（原循环模式不抑制）；抑制失败仅告警不阻断播报。
   真机验证：抑制生效期间喊唤醒词，播报完整播完（无 strong_interrupt/
   request_stop，正常 tts_status.done）。
+- **麦克风硬抑制（2026-10-16）**：唤醒抑制只拦 wuw 唤醒入口；迎宾前
+  ~30s 内的云端对话会话（cloud_event）仍开着时，用户语音被当对话轮
+  直送云端并触发 `AudioSDK request_stop` 掐断播报——绕过 TTSManager
+  优先级仲裁与 WAKEUP 抑制（证据链见 AIMDK 反馈稿
+  `aimdk_feedback_2026-10-16_dialog-turn-interrupt.md`）。兜底：
+  `mic_mute_enabled`（默认开）单轮播报会话开始时 SSH 执行运控板
+  `pactl set-source-mute @DEFAULT_SOURCE@ true`（PulseAudio 默认音源
+  静音，不依赖厂商脚本，目标/密码复用 `display_remote_*`），尾部宽限
+  到期/会话替换/tts.stop/节点关停时 `false` 恢复——无音频进入即无
+  打断之源。恢复失败自动重试一次并 ERROR 提示人工
+  `pactl set-source-mute @DEFAULT_SOURCE@ false`。
+  **唤醒抑制随之降级为备用（同日）**：静音成功时唤醒抑制整套跳过（不发
+  SetAgentSuppression、不刷续期日志——无音频即无抑制对象）；仅 SSH 静音
+  失败的会话自动武装原抑制链路（arm+续期+收尾）兜底。
+  **终态提前解除（同日）**：尾部宽限的字数估算偏保守（缓存命中实际
+  ~19s < 估算 ~24s，另加 lead 与 5s 续期粒度），AgentMonitor 收到本会话
+  trace 的 TtsStatus 终态（END/STOP/ERROR，`/interaction/tts_status`
+  回流的 item_id = 会话来源前缀+后缀）即经 `notify_tts_terminal` 唤醒
+  worker 立即恢复麦克风并解除抑制——实际播完即恢复，估算时序仅兜底
+  （BEST_EFFORT 丢事件时按原时序到期）。同一动作**即刻释放播报类
+  业务占用**（迎宾 120s 总超时、tts/讲解字数估算窗口均降级为兜底
+  超时，连续迎宾不再被固定窗口卡死）。
 - **导航单任务**：新 `navigate` 替换进行中的导航。
-- **迎宾流程互斥（2026-10-15）**：迎宾词 TTS 播完前（SDK 无播完事件，
-  按字数估算设窗口，**公式与唤醒抑制尾部宽限一致**：每条 =
-  `suppress_tail_lead_ms + 估算×suppress_tail_scale`，共用同一组参数、
-  调参同步生效；另加条间间隔），新的 `scene`/`navigate`
-  直接拒绝——两者协议均无回执面，本地丢弃记 WARN 日志（App 无感知，
-  需重发）。`tts`/`tts.stop` 不受限：tts 替换会话或 tts.stop 终止会话
-  均使互斥窗口立即失效（迎宾音频被打断 = 流程终止）。
+- **迎宾流程互斥（2026-10-15；2026-10-16 改终态驱动）**：迎宾业务占用
+  在播报终态回流时**即刻释放**（事件源与麦克风提前解除同一处：
+  AgentMonitor 收到本会话 trace 的 TtsStatus 终态，见 §3.4 唤醒抑制
+  「终态提前解除」）。`welcome_flow_timeout_seconds`（默认 120s，须
+  覆盖最坏流程 变形 60s + 默认词 ~26s）仅为终态事件丢失（BEST_EFFORT）
+  时的**兜底超时**，不是固定互斥窗口（2026-10-16 真机教训：迎宾 ~30s
+  播完、终态已回流、麦克风已恢复，固定 120s 窗口仍占用，连续两次迎宾
+  第二次被拒 `failed/busy`）。占用期间新的 `scene`/`navigate` 直接
+  拒绝，回各自 `*.result(failed, busy)`（v0.24.0，App 可感知稍后重试）。
+  `tts`/`tts.stop` 不受限：tts 替换会话或 tts.stop 终止会话均使占用
+  立即失效（迎宾音频被打断 = 流程终止）。tts/讲解业务的字数估算窗口
+  同理：终态回流即刻释放，窗口仅兜底；导览在途期不涉播报窗口
+  （以导航状态为准）。
 - `tts.stop`：掐断当前语音（SDK 最高权重 1099 抢占）+ 终止播报会话 +
   **取消进行中的导航**（展厅语义：stop = 放弃本次讲解流程；一行可改）。
 - `scene` 不打断导航：讲解途中来迎宾，导航继续，到达后讲解词按替换
   规则接管播报。
-- **迎宾任务完成语义**：迎宾 TTS 单轮播完即视为任务完成（播报会话结束，
-  协议无回执面）。二维码显示独立于播报会话：播完后**继续常驻**，
+- **迎宾任务完成语义**：迎宾 TTS 单轮播完即视为任务完成（播报会话结束；
+  协议回执在流程主体完成时已发，见 §1 回执要点）。二维码显示独立于
+  播报会话：播完后**继续常驻**，
   直至 ①任意新业务（tts/scene/navigate/tts.stop）到达立即取消
   （新 scene 重入则重新显示并重置超时）或 ②`display_show_timeout_seconds`
   （默认 180s）超时自动恢复默认表情——二者取先到者。
+- **语料触发二维码显示（2026-10-16；2026-10-17 改互斥业务）**：
+  AgentMonitor 监测 agent TTS 应答话术（trace_id 回查运控板日志原文，
+  `agent_monitor.qr_phrases` 语料表，如「收到，这就给您显示二维码，您
+  可以扫描二维码留下您的个人信息哦。」）命中 -> 本地注入 `show_qr`
+  指令（仅本地类型，与 MQTT 下行同 worker 串行链路）->
+  `handle_show_qr` 显示默认二维码图片（`config/QRCode.png`），常驻
+  `display_show_timeout_seconds`（默认 180s=3 分钟）。**2026-10-17
+  现场需求起为互斥业务**：显示二维码是一个业务，上屏成功即占
+  kShowQr 业务 `qr_business_timeout_seconds`（默认 20s）互斥窗口，
+  期间其他业务（tts/scene/navigate/relocate）被拒（App 下发 tts 回
+  `rejected(business_busy)`——二维码刚上屏不被新业务立即让位）；窗口
+  到期自然释放（无播报会话、无终态回流面），二维码常驻不受影响（仍由
+  屏幕超时或让位规则收尾）。窗口内复读被拒（business_busy），窗口外
+  复读重新上屏并重置计时；冷却（`agent_monitor.cooldown_seconds`）
+  按动作独立计时。上屏失败（默认图缺失/转码/推送失败）仅告警不占
+  业务（与 tts 受理失败不占用同语义）。
+- **语料触发取消二维码显示（2026-10-17）**：AgentMonitor 监测 agent
+  TTS 应答话术（`agent_monitor.qr_cancel_phrases` 语料表，如「好的，
+  这就取消二维码显示」）命中 -> 本地注入 `cancel_qr` 指令 ->
+  `handle_cancel_qr` 撤屏恢复默认表情（未显示 no-op 幂等）。取消
+  二维码显示是第二个互斥业务：受理即占 kCancelQr 业务
+  `qr_business_timeout_seconds`（默认 20s）与其他业务互斥；例外——
+  **可抢占 kShowQr 显示业务窗口**（取消类动作与 tts.stop/navigate.stop
+  永远放行同语义：显示保护期内「收到后取消二维码显示」必须生效），
+  抢占后业务切换为 kCancelQr 重计 20s。撤屏失败仅告警，业务照占。
+- **语料触发重定位（2026-10-16；2026-10-17 改等待验收业务）**：
+  AgentMonitor 监测 agent TTS 应答话术（`agent_monitor.relocate_phrases`，
+  每条格式「航点名|语料」，如「A|好的，这就在展厅A点开始重定位」，展厅
+  A~E 五点各一条；航点名即 t1_slam_nav_ws 航点文件点位名）命中 ->
+  本地注入 `relocate` 指令（event.local，与 MQTT 下行同 worker 串行链路）
+  -> `NavExecutor::set_pose`：真机经 waypoint_follower 的
+  `go_to_waypoints(action=set_pose)` 把定位初值重设到该航点——**机器人
+  不动**，前提是人工已把机器人摆到该点位并对准朝向（朝向比位置更要紧，
+  见 GoToWaypoints.md）。受理**不是终态**：占用 kRelocate 业务，worker
+  250ms 轮询验收（`status_json` 的 `set_pose.verified`，真机 ~1.5s 出
+  结果；`relocate_timeout_seconds` 默认 30s 超时兜底），验收通过才播报
+  （缺省「{point_name}点重定位成功」）。本地注入不发协议回执（Server
+  不认识其 operation_id）。与 MQTT 下行 relocate 同受业务互斥约束
+  （见下条）。冷却按「action+航点名」独立计时（五点互不挤占）；mock
+  执行器 `mock_relocate_hold_polls` 模拟验收延迟（联调/集成测试用）。
+- **重定位互斥与忙碌提示（2026-10-17）**：relocate 是不可打断业务——
+  等待验收期间（受理 -> verified/超时）新业务指令（tts/navigate/scene/
+  relocate）一律拒绝：tts 回 `rejected(business_busy)`，其余回各自
+  `*.result(failed, busy)`；`tts.stop`/`navigate.stop` 不中止等待（初值
+  已发，终态由导航模块给出；等待期无会话无导航，两 stop 对它本就 no-op，
+  仅业务占用不释放）。拒绝时播忙碌提示「我正在{业务}，请稍后」
+  （`busy_hint_relocate_text`/`busy_hint_navigate_text`）：**仅非语音业务
+  进行中播**（重定位等待期/导航在途——机器人没在说话，口头告知忙碌）；
+  迎宾/播报/讲解中正在出声，插提示反而打断，不播。提示
+  `is_interrupted=false` 同档排队，失败仅记日志（拒绝结果已回执，提示
+  属本地增强；本地注入指令被拒同样播——现场正在跟机器人说话）。
 - 幂等：按 `event_id` 去传输重复、按 `operation_id` 防重复副作用
   （同一 operation_id 的 scene/navigate 不重复触发；tts 重发重发同一回执）。
 
@@ -196,10 +313,12 @@ PlayTts/PlayEmotion/SetMcPresetMotion/SetMcMotion 等；`pnc` 是运控内置
 因此定义窄接口 `NavExecutor`：
 
 ```cpp
-struct NavOutcome { bool ok; std::string detail; };
+struct NavOutcome { bool ok; std::string detail; bool point_not_found; };
 class NavExecutor {
   virtual void goto_point(point_name, on_done) = 0;  // 异步；回调线程不限
   virtual void cancel() = 0;
+  virtual NavOutcome set_pose(point_name) = 0;       // 重定位受理（同步毫秒级）
+  virtual std::optional<bool> poll_set_pose_verified(point_name);  // 验收轮询
 };
 ```
 
@@ -207,8 +326,9 @@ class NavExecutor {
   - `mock`（默认）：`MockNavExecutor`，`mock_nav_seconds` 秒后回调到达
     （默认 0=立即），`cancel()` 丢弃回调。联调与集成测试用。
   - `waypoint`（真机）：`WaypointNavExecutor`，对接 `/opt/liwei/t1_slam_nav_ws`
-    航点巡航节点（节点名 `waypoint_follower`），已实现（含 6 个进程内
-    Mock 服务单测）：
+    航点巡航节点（节点名 `waypoint_follower`），已实现（含进程内 Mock 服务
+    单测：导航受理/终态/取消 6 个 + 重定位 set_pose 受理/拒因分类 3 个 +
+    验收轮询 status_json 解析 1 个）：
     - `/waypoint_follower/go_to_waypoints`：`waypoints=[point_name]`、
       `return_to_quadruped=false`（讲解机器人保持人形）、action 缺省 go；
       `accepted` 只表示「已开始执行」；
@@ -231,8 +351,14 @@ class NavExecutor {
 | `topic_prefix` | `robotCar/v1/robots` | RobotCar Server 固定 TopicPrefix（写死在 Server 代码，非部署配置） |
 | `broker_uri` / `enroll_origin` / `serial_number(_file)` | 同 tts_demo | enroll 凭 SN 换 MQTT 凭据 |
 | `welcome_default_texts` | `["欢迎光临！我是展厅讲解机器人，很高兴为您服务。"]` | scene 未带 texts 时的迎宾词 |
+| `agent_monitor.relocate_phrases` | `[]` | 语料触发重定位：每条「航点名\|语料」，命中 -> 该航点 set_pose 重定位（空=关闭） |
+| `relocate_timeout_seconds` | `30` | 重定位等待导航模块验收的超时（真机 ~1.5s 出结果，此值兜底 status 丢失/服务卡死；超时按 failed/localization_failed 收尾） |
+| `busy_hint_relocate_text` | `"我正在重定位，请稍后"` | 业务互斥拒绝提示（重定位等待期播；空=禁用） |
+| `busy_hint_navigate_text` | `"我正在导航，请稍后"` | 业务互斥拒绝提示（导航在途播；空=禁用；迎宾/播报/讲解中恒不播——正在出声） |
+| `mock_relocate_hold_polls` | `0` | Mock 重定位验收等待窗口（poll 次数，~250ms/次；联调/集成测试用） |
 | `tour_speak_interval_seconds` | `2` | 讲解词/迎宾词每两条间隔（scene/navigate 载荷无间隔字段） |
 | `welcome_motion_id` | `0`（禁用） | 迎宾预设动作 ID，机型相关，真机校准后启用 |
+| `welcome_flow_timeout_seconds` | `120` | 迎宾占用兜底超时：播报终态回流即释放占用，此值仅在终态事件丢失时兜底（须覆盖变形 60s + 默认词 ~26s） |
 | `nav_executor` | `mock` | 导航执行器：`mock`（联调/测试）或 `waypoint`（真机，对接 t1_slam_nav_ws 航点服务） |
 | `mock_nav_seconds` | `0` | Mock 导航模拟耗时（0=立即到达） |
 | `display_*`（服务名/运控板/超时/恢复表情） | 见 yaml | 迎宾二维码显示：PlayEmotion 调用与 MP4 推送运控板 |
@@ -244,7 +370,7 @@ class NavExecutor {
 
 | 层 | 用例文件 | 覆盖 |
 | --- | --- | --- |
-| 协议层（纯 C++） | `test_guide_protocol.cpp` | tts/tts.stop/scene/navigate 载荷正反例、scene.qr_sha256 格式正反例、信封校验、过期、幂等键提取、回执构造 |
+| 协议层（纯 C++） | `test_guide_protocol.cpp` | tts/tts.stop/scene/navigate/relocate 载荷正反例、scene.qr_sha256 格式正反例、信封校验、过期、幂等键提取、回执构造（含 relocate.result 枚举） |
 | enroll（纯 C++） | `test_robot_enroll.cpp` | 沿用 tts_demo（响应解析/错误码/SN 校验） |
 | 二维码缓存（纯 C++） | `test_qr_code_cache.cpp` | sha256 已知向量、PNG/JPEG 魔数、qr_sha256 格式、缓存写入/哈希拒绝/旧文件淘汰 |
 | TtsClient（进程内 Mock 服务） | `test_tts_client.cpp` | 沿用 tts_demo（字段映射/回执判定/超时） |
@@ -255,7 +381,10 @@ class NavExecutor {
 
 ## 7. 明确后置
 
-- 导航执行结果回执、导航进度、navigate.stop（协议后置，需先扩契约）；
+- 导航/场景过程事件（进度、位置上报——契约明确仅最终结果，过程后置）；
+  导航失败 reason 细分（point_not_found/localization_lost 归并
+  navigation_failed，见 §1 回执要点；relocate 的 point_not_found 已有
+  结构化判定，不属归并）；
 - 迎宾动作真机参数校准与输入源注册（`SetMcInputSource`）；
 - 多点位连续讲解（App 编排多条 navigate 即可，Robot 不做排队）；
-- relocate / ota 指令支持。
+- `ota.start` 指令支持（含 ota.result——由未来接手组件负责）。

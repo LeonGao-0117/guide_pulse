@@ -2,7 +2,8 @@
 // guide_pulse 协议层实现：下行指令报文解析/校验、tts.result 回执构造、
 // 播报列表轮序生成、时间与 ID 工具。
 // 解析框架沿用 tts_demo（工程 /opt/liwei/tts_demo），删 condition 载荷、
-// 新增 scene（v0.17.0）与 navigate（v0.16.0 + v0.20.0 可选 texts）载荷。
+// 新增 scene（v0.17.0）与 navigate（v0.16.0 + v0.20.0 可选 texts）载荷、
+// navigate.stop 停止导航（v0.23.0，与 tts.stop 同构仅 operation_id）。
 // ============================================================================
 #include "guide_pulse/guide_protocol.hpp"
 
@@ -15,6 +16,7 @@
 #include <limits>
 #include <random>
 #include <regex>
+#include <set>
 
 #include <nlohmann/json.hpp>
 
@@ -220,9 +222,11 @@ std::optional<CommandEvent> parse_command_event(
   event.event_id = root["event_id"].get<std::string>();
   event.type = root["type"].get<std::string>();
 
-  // 本组件处理 tts / tts.stop / scene / navigate；relocate / ota 等由其他组件处理
+  // 本组件处理 tts / tts.stop / scene / navigate / navigate.stop / point_map
+  // / relocate（2026-10-17 接入 MQTT 下行重定位）；ota 等由其他组件处理
   if (event.type != "tts" && event.type != "tts.stop" && event.type != "scene" &&
-    event.type != "navigate")
+    event.type != "navigate" && event.type != "navigate.stop" &&
+    event.type != "point_map" && event.type != "relocate")
   {
     error = "ignore";
     return std::nullopt;
@@ -238,11 +242,16 @@ std::optional<CommandEvent> parse_command_event(
   }
   event.operation_id = body["operation_id"].get<std::string>();
 
-  // 后续校验失败时，若为本机 tts 指令且 operation_id 已合法提取，调用方应回
-  // tts.result(rejected, invalid_request)。scene/navigate 无回执面：载荷非法
-  // 一律丢弃记日志，不参与该机制
+  // 后续校验失败时，若为本机 tts/navigate/scene/point_map/relocate 指令且
+  // operation_id 已合法提取，调用方应按类型回 rejected/invalid_request
+  //（v0.24.0 起三类均有回执面；point_map v0.25.0、relocate 2026-10-17 同）。
+  // tts.stop/navigate.stop 无回执；未知 scene 枚举值属未来版本指令（在
+  // scene 分支内单独处理，不走此通道）
   const auto fill_invalid_receipt_id = [&]() {
-      if (invalid_operation_id != nullptr && event.type == "tts") {
+      if (invalid_operation_id != nullptr &&
+        (event.type == "tts" || event.type == "navigate" || event.type == "scene" ||
+        event.type == "point_map" || event.type == "relocate"))
+      {
         *invalid_operation_id = event.operation_id;
         if (invalid_command_type != nullptr) {
           *invalid_command_type = event.type;
@@ -308,6 +317,7 @@ std::optional<CommandEvent> parse_command_event(
     // 未知字段）一律拒绝。scene 为可扩展枚举，当前契约唯一值 welcome：
     // 未知值属于「未来版本的指令」，本机丢弃记日志（无回执面），不按错误处理
     if (!body.contains("scene") || !body["scene"].is_string()) {
+      fill_invalid_receipt_id();
       error = "scene payload requires scene(string)";
       return std::nullopt;
     }
@@ -316,40 +326,48 @@ std::optional<CommandEvent> parse_command_event(
       if (key != "operation_id" && key != "scene" && key != "texts" &&
         key != "qr_sha256")
       {
+        fill_invalid_receipt_id();
         error = "scene payload has unknown fields";
         return std::nullopt;
       }
     }
     event.scene = body["scene"].get<std::string>();
     if (event.scene != SCENE_WELCOME) {
+      // 未来版本指令：不回执（不是非法请求，本机版本不认识而已）
       error = "unsupported scene value (only welcome in this version)";
       return std::nullopt;
     }
     if (body.contains("qr_sha256")) {
       if (!body["qr_sha256"].is_string()) {
+        fill_invalid_receipt_id();
         error = "qr_sha256 must be string";
         return std::nullopt;
       }
       event.qr_sha256 = body["qr_sha256"].get<std::string>();
       // 契约：64 位小写十六进制（command-event.schema.json pattern）
       if (!valid_qr_sha256(event.qr_sha256)) {
+        fill_invalid_receipt_id();
         error = "qr_sha256 must be 64 lowercase hex chars";
         return std::nullopt;
       }
     }
     if (!parse_optional_texts(body, event.texts, error)) {
+      fill_invalid_receipt_id();
       return std::nullopt;
     }
-  } else if (event.type == "navigate") {
+  } else if (event.type == "navigate" || event.type == "relocate") {
     // v0.16.0 导航载荷：operation_id + point_name 必填、texts 可选（v0.20.0）。
+    // relocate（v0.21.0）载荷形状与 navigate 完全一致，共用本分支校验。
     // 合法字段集合仅 {operation_id, point_name} 或 {operation_id, point_name, texts}
     if (!body.contains("point_name") || !body["point_name"].is_string()) {
+      fill_invalid_receipt_id();
       error = "navigate payload requires point_name(string)";
       return std::nullopt;
     }
     const bool has_optional_texts =
       body.size() == 3U && body.contains("texts");
     if (body.size() != 2U && !has_optional_texts) {
+      fill_invalid_receipt_id();
       error = "navigate payload has unknown fields";
       return std::nullopt;
     }
@@ -357,15 +375,75 @@ std::optional<CommandEvent> parse_command_event(
     // 契约按 Unicode 标量（码点）限 1..64，非 UTF-8 字节数（如「3号展台」4 标量 12 字节）
     const auto scalars = utf8_scalar_count(event.point_name);
     if (scalars < 1U || scalars > POINT_NAME_MAX_SCALARS) {
+      fill_invalid_receipt_id();
       error = "point_name length must be within 1..64 unicode scalars (contract)";
       return std::nullopt;
     }
     if (!parse_optional_texts(body, event.texts, error)) {
+      fill_invalid_receipt_id();
       return std::nullopt;
     }
+  } else if (event.type == "point_map") {
+    // v0.25.0（P-039）点位映射表载荷：严格 2 字段 operation_id/points；
+    // points 1..256 条 {code, name}（严格 2 字段，additionalProperties=false），
+    // code 1..32 Unicode 标量表内唯一（语义校验，Schema 无法表达——
+    // Server 已校验，此处是纵深防御，重复按 invalid_request 拒）、
+    // name 1..64 Unicode 标量（规则同 point_name）。语义是全量替换：
+    // App 是唯一权威来源，Robot 整表替换本地映射
+    if (!body.contains("points") || !body["points"].is_array()) {
+      fill_invalid_receipt_id();
+      error = "point_map payload requires points(array)";
+      return std::nullopt;
+    }
+    if (body.size() != 2U) {
+      fill_invalid_receipt_id();
+      error = "point_map payload has unknown fields";
+      return std::nullopt;
+    }
+    const auto & points = body["points"];
+    if (points.empty() || points.size() > POINT_MAP_POINTS_MAX) {
+      fill_invalid_receipt_id();
+      error = "points must contain 1..256 items (contract)";
+      return std::nullopt;
+    }
+    event.points.reserve(points.size());
+    std::set<std::string> seen_codes;  // code 表内唯一（语义纵深防御）
+    for (const auto & item : points) {
+      if (!item.is_object() || item.size() != 2U || !item.contains("code") ||
+        !item["code"].is_string() || !item.contains("name") ||
+        !item["name"].is_string())
+      {
+        fill_invalid_receipt_id();
+        error = "points items must be {code(string), name(string)}";
+        return std::nullopt;
+      }
+      PointMapEntry entry;
+      entry.code = item["code"].get<std::string>();
+      entry.name = item["name"].get<std::string>();
+      // code/name 均按 Unicode 标量计（如「P001」4 标量、「比亚迪ATTO 1」10 标量）
+      const auto code_scalars = utf8_scalar_count(entry.code);
+      if (code_scalars < 1U || code_scalars > POINT_CODE_MAX_SCALARS) {
+        fill_invalid_receipt_id();
+        error = "points code length must be within 1..32 unicode scalars (contract)";
+        return std::nullopt;
+      }
+      const auto name_scalars = utf8_scalar_count(entry.name);
+      if (name_scalars < 1U || name_scalars > POINT_NAME_MAX_SCALARS) {
+        fill_invalid_receipt_id();
+        error = "points name length must be within 1..64 unicode scalars (contract)";
+        return std::nullopt;
+      }
+      if (!seen_codes.insert(entry.code).second) {
+        fill_invalid_receipt_id();
+        error = "points code must be unique within the map (contract)";
+        return std::nullopt;
+      }
+      event.points.push_back(std::move(entry));
+    }
   } else if (body.size() != 1U) {
-    // tts.stop 无回执：payload 只允许 operation_id
-    error = "tts.stop payload must contain only operation_id";
+    // tts.stop / navigate.stop 无回执：payload 只允许 operation_id
+    //（navigate.stop 与 tts.stop 同构，v0.23.0）
+    error = "tts.stop/navigate.stop payload must contain only operation_id";
     return std::nullopt;
   }
 
@@ -398,6 +476,28 @@ std::optional<CommandEvent> parse_command_event(
   return event;
 }
 
+// 上行回执信封公共装配：event_id 生成于构造时并固定（重发复用同一信封），
+// TTL 与契约示例一致取 60s（仅约束回执自身，不约束执行耗时——P-038）
+TtsResultReceipt build_up_receipt_envelope(
+  const std::string & robot_id, const std::string & type, json payload)
+{
+  TtsResultReceipt receipt;
+  receipt.event_id = generate_uuid_v7();
+  const auto occurred_at = std::chrono::system_clock::now();
+  json envelope = {
+    {"spec_version", "1.0"},
+    {"event_id", receipt.event_id},
+    {"robot_id", robot_id},
+    {"direction", "up"},
+    {"type", type},
+    {"occurred_at", format_rfc3339(occurred_at)},
+    {"expires_at", format_rfc3339(occurred_at + std::chrono::seconds(60))},
+    {"payload", std::move(payload)},
+  };
+  receipt.envelope_json = envelope.dump();
+  return receipt;
+}
+
 std::optional<TtsResultReceipt> build_tts_result_event(
   const std::string & robot_id, const std::string & operation_id,
   const std::string & outcome, const std::string & reason)
@@ -415,7 +515,6 @@ std::optional<TtsResultReceipt> build_tts_result_event(
   if (!outcome_ok || !reason_ok) {
     return std::nullopt;
   }
-
   json payload = {
     {"operation_id", operation_id},
     {"outcome", outcome},
@@ -423,23 +522,65 @@ std::optional<TtsResultReceipt> build_tts_result_event(
   if (outcome == TTS_RESULT_REJECTED) {
     payload["reason"] = reason;
   }
+  return build_up_receipt_envelope(robot_id, "tts.result", std::move(payload));
+}
 
-  TtsResultReceipt receipt;
-  receipt.event_id = generate_uuid_v7();
-  const auto occurred_at = std::chrono::system_clock::now();
-  // 事件信封 TTL：与契约示例一致取 60s（仅作 Server 侧过期参考）
-  json envelope = {
-    {"spec_version", "1.0"},
-    {"event_id", receipt.event_id},
-    {"robot_id", robot_id},
-    {"direction", "up"},
-    {"type", "tts.result"},
-    {"occurred_at", format_rfc3339(occurred_at)},
-    {"expires_at", format_rfc3339(occurred_at + std::chrono::seconds(60))},
-    {"payload", std::move(payload)},
+std::optional<TtsResultReceipt> build_action_result_event(
+  const std::string & robot_id, const std::string & result_type,
+  const std::string & operation_id, const std::string & outcome,
+  const std::string & reason)
+{
+  // v0.24.0（P-038）/v0.25.0（P-039）：failed reason 按指令查表；
+  // rejected 三类指令共用 {command_expired, invalid_request}；success 禁 reason
+  std::array<const char *, 5> failed_reasons = {};
+  std::size_t failed_reason_count = 0;
+  if (result_type == NAVIGATE_RESULT_TYPE) {
+    failed_reasons = {RESULT_REASON_BUSY, RESULT_REASON_POINT_NOT_FOUND,
+      RESULT_REASON_NAVIGATION_FAILED, RESULT_REASON_ABORTED,
+      RESULT_REASON_LOCALIZATION_LOST};
+    failed_reason_count = failed_reasons.size();
+  } else if (result_type == SCENE_RESULT_TYPE) {
+    failed_reasons = {RESULT_REASON_BUSY, RESULT_REASON_SCENE_FAILED,
+      nullptr, nullptr, nullptr};
+    failed_reason_count = 2;
+  } else if (result_type == POINT_MAP_RESULT_TYPE) {
+    // point_map.result failed 枚举仅 point_map_failed（本地应用/存储失败）
+    failed_reasons = {RESULT_REASON_POINT_MAP_FAILED,
+      nullptr, nullptr, nullptr, nullptr};
+    failed_reason_count = 1;
+  } else if (result_type == RELOCATE_RESULT_TYPE) {
+    // relocate.result failed 枚举：busy / point_not_found / localization_failed
+    //（P-038 relocate 章节与 error-codes 表）
+    failed_reasons = {RESULT_REASON_BUSY, RESULT_REASON_POINT_NOT_FOUND,
+      RESULT_REASON_LOCALIZATION_FAILED, nullptr, nullptr};
+    failed_reason_count = 3;
+  } else {
+    return std::nullopt;  // ota.result 等非本工程回执面
+  }
+  const std::array<const char *, 2> kRejectedReasons = {
+    TTS_REASON_COMMAND_EXPIRED, TTS_REASON_INVALID_REQUEST};
+  const bool outcome_ok = outcome == ACTION_RESULT_SUCCESS ||
+    outcome == ACTION_RESULT_FAILED || outcome == ACTION_RESULT_REJECTED;
+  const bool reason_ok =
+    (outcome == ACTION_RESULT_SUCCESS && reason.empty()) ||
+    (outcome == ACTION_RESULT_FAILED &&
+      std::find(
+        failed_reasons.begin(), failed_reasons.begin() + failed_reason_count,
+        reason) != failed_reasons.begin() + failed_reason_count) ||
+    (outcome == ACTION_RESULT_REJECTED &&
+      std::find(kRejectedReasons.begin(), kRejectedReasons.end(), reason) !=
+      kRejectedReasons.end());
+  if (!outcome_ok || !reason_ok) {
+    return std::nullopt;
+  }
+  json payload = {
+    {"operation_id", operation_id},
+    {"outcome", outcome},
   };
-  receipt.envelope_json = envelope.dump();
-  return receipt;
+  if (outcome != ACTION_RESULT_SUCCESS) {
+    payload["reason"] = reason;  // failed/rejected 必填（契约）
+  }
+  return build_up_receipt_envelope(robot_id, result_type, std::move(payload));
 }
 
 std::vector<std::string> make_round_order(

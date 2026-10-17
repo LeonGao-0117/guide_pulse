@@ -1,4 +1,4 @@
-# guide_pulse MQTT 协议说明（RobotCar 协议 v0.22.0 子集）
+# guide_pulse MQTT 协议说明（RobotCar 协议 v0.25.0 子集）
 
 guide_pulse 消费 RobotCar Protocol 正式契约的指令子集，本文只记录
 本工程视角的要点与本地策略；完整契约见
@@ -33,8 +33,21 @@ payload：`operation_id` + `texts`(1..20 条，每条 1..2048 字节) + `mode`
 (sequence/shuffle) + `interval_seconds`(1..86400)。**2026-10-14 需求变更：
 列表单轮播完自行结束，不再无限循环**（原契约语义为循环直到替换/停止，
 `tts.stop` 仍可提前掐断）。必须回 `tts.result`（accepted / rejected+reason：
-`command_expired`/`invalid_request`/`playback_unavailable`）；同一
-operation_id 重发同一回执（同 event_id）。
+`command_expired`/`invalid_request`/`playback_unavailable`/`business_busy`）；
+同一 operation_id 重发同一回执（同 event_id）。
+
+**2026-10-16 单业务占用**：迎宾/导览/播报任一业务进行中，新 `tts`/
+`scene`/`navigate` 指令一律拒绝——`tts` 回 `rejected(business_busy)`，
+`scene`/`navigate` 回各自 `*.result` 的 `failed(busy)`（v0.24.0 P-038）。
+`tts.stop` 永远放行（停止一切并立即释放占用）；`navigate.stop` 永远
+放行（取消类指令，只取消在途导航）。业务结束口径：播报类以 TtsStatus
+终态回流为准即刻释放（迎宾固定 120s 总超时与 tts/讲解字数估算窗口
+仅为终态丢失时的兜底超时，2026-10-16）；导览另含导航在途期
+（到达/失败事件即终态）。**2026-10-17 补充**：语料触发的二维码
+显示/取消（本地注入 `show_qr`/`cancel_qr`，无协议面）亦为互斥业务，
+各占 `qr_business_timeout_seconds`（默认 20s）窗口——窗口内 App 下发
+`tts` 同样回 `rejected(business_busy)`（保护二维码刚上屏不被立即
+让位）；窗口到期自然释放。
 
 ### 2.2 `tts.stop`（无回执）
 
@@ -85,11 +98,53 @@ payload 仅 `operation_id`。本工程行为：最高权重抢占掐断语音 + 
   讲解词（间隔 `tour_speak_interval_seconds`）。
 - 过期直接丢弃；同一 `operation_id` 重发不重复触发导航。
 
+### 2.5 `navigate.stop`（无回执）——停止导航（v0.23.0 P-037）
+
+payload 仅 `operation_id`（与 `tts.stop` 同构）。契约：停止当前正在
+进行的导航；**不带** `point_name`/`texts`（停止无需知道目标）；当前没有
+导航时 no-op。停止方式（立即停车/减速停靠/是否播报）归 Robot 本地。
+本工程行为：取消在途导航并丢弃待消费的到达讲解（导览业务终止、释放
+占用）；到达后的讲解已在播或其余播报业务**不受影响**（停一切用
+`tts.stop`）。过期直接丢弃；同一 `operation_id` 重发不重复执行停止。
+
+### 2.6 `point_map`——点位映射表同步（v0.25.0 P-039，有回执）
+
+```json
+{"payload": {"operation_id": "<uuidv7，Server 铸造的子 ID>",
+             "points": [{"code": "A", "name": "比亚迪ATTO 1"},
+                        {"code": "B", "name": "比亚迪 M9 DM-i"}]}}
+```
+
+- 家庭级群发：App 是映射表唯一权威来源，Server 只校验转发不保存；
+  每台机器人一条下行、各带 Server 铸造的子 `operation_id`（App 父 ID
+  不出现在 MQTT 面）。
+- `points` 必填 1..256 条 `{code, name}`：`code` 1..32 个 Unicode 标量、
+  表内唯一（解析层纵深防御，重复回 `rejected/invalid_request`）；
+  `name` 1..64 个 Unicode 标量（规则同 `point_name`）。
+- **语义是全量替换**：每次下发都用 `points` 整表覆盖旧表（不做增量
+  合并）。本工程落盘到 `point_map_file`（临时文件 + rename 原子写，
+  部署 yaml 覆盖为持久路径 `/opt/liwei/guide_pulse/point_map.json`），
+  重启自动加载，App 无需重推。
+- **不受业务互斥拦截**（2026-10-17 需求）：纯数据同步，无音频/导航/
+  形态副作用——迎宾/导览/播报任一业务进行中也照常处理并回 success。
+- 落盘失败（磁盘满/路径不可写）：内存保留旧表（本次未生效），回
+  `failed/point_map_failed`。
+- 回执 `point_map.result`：success（已全量替换生效）/ failed
+  (`point_map_failed`) / rejected（`command_expired` / `invalid_request`）。
+  过期回 `rejected/command_expired`；同一 `operation_id` 重发重发同一
+  回执（同 event_id），不重复替换。
+- **点位解析**：此后 `navigate.point_name` 先经映射表 `name -> code`
+  解析（如「比亚迪ATTO 1」→ 航点 `A`），未命中原样透传作航点名
+  （兼容直接下发航点名/未推表的旧用法）。
+
 ## 3. 上行回执
 
-仅 `tts.result`（`up/commands`，QoS 1，direction=up）。accepted 禁带
-reason；rejected 必带 reason 枚举。回执原文缓存重发（同 event_id）。
-`scene` / `navigate` / `tts.stop` 不得发布任何上行事件（契约）。
+`up/commands`（QoS 1，direction=up）：`tts.result`（受理回执，accepted
+禁带 reason、rejected 必带 reason 枚举）与 `navigate.result` /
+`scene.result` / `point_map.result`（v0.24.0/v0.25.0 一次性最终结果回执：
+success 禁 reason / failed 必填 reason 按指令枚举 / rejected 必填
+`command_expired`|`invalid_request`）。回执原文缓存重发（同 event_id）。
+`tts.stop` / `navigate.stop` 不得发布任何上行事件（契约）。
 
 ## 4. 停止播报的实现说明
 

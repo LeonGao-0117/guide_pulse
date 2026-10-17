@@ -132,12 +132,12 @@ ScreenDisplay::Result ScreenDisplay::call_play_emotion(
   return result;
 }
 
-ScreenDisplay::Result ScreenDisplay::show(
-  const std::string & image_path, const std::string & source,
-  const std::string & content_id)
+ScreenDisplay::Result ScreenDisplay::prepare(
+  const std::string & image_path, const std::string & content_id)
 {
+  prepared_ = false;  // 每次准备重置：失败即无就绪内容（play_prepared 拒绝）
   Result result;
-  // ---- 1. 二维码图片转 848x480 MP4 并推送运控板 ----
+  // ---- 二维码图片转 848x480 MP4 并推送运控板（耗时大头，可与变形并行）----
   if (image_path.empty()) {
     result.detail = "image_path is empty (no qr image to show)";
     return result;
@@ -158,10 +158,25 @@ ScreenDisplay::Result ScreenDisplay::show(
   if (!push_to_remote(mp4_path, content_id, result.detail)) {
     return result;
   }
-  // ---- 2. 无限循环播放（loop_count=0 常驻，直至超时/新业务打断）----
+  prepared_ = true;
+  prepared_content_id_ = content_id;
+  result.ok = true;  // 就绪（play_prepared 才真正上屏）
+  return result;
+}
+
+ScreenDisplay::Result ScreenDisplay::play_prepared(const std::string & source)
+{
+  Result result;
+  if (!prepared_) {
+    result.detail = "nothing prepared (prepare failed or not called)";
+    return result;
+  }
+  prepared_ = false;  // 一次性消费：重复调用不再上屏
+  // ---- 无限循环播放（loop_count=0 常驻，直至超时/新业务打断）----
   // 内容寻址文件名：换图必是新路径，运控板播放器被迫重新加载
   //（固定路径覆盖重播时播放器不重读文件——真机踩坑）
-  const auto play = call_play_emotion("file", remote_mp4_path(content_id), {}, 0);
+  const auto play = call_play_emotion(
+    "file", remote_mp4_path(prepared_content_id_), {}, 0);
   if (!play.ok) {
     return play;
   }

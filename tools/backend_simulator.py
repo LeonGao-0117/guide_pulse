@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """后端模拟器：模拟后端（APP 经 Server）通过 MQTT 向机器人下发展厅讲解指令
-（迎宾 scene / 导航+汽车讲解 navigate / 循环播报 tts / 停止 tts.stop），
-并监听 tts.result 回执。
+（迎宾 scene / 导航+汽车讲解 navigate / 地图重定位 relocate / 循环播报 tts /
+停止 tts.stop / 停止导航 navigate.stop），并监听 tts.result / relocate.result
+回执。
 
 协议基线：RobotCar 协议 v0.5.0（tts 播报列表）+ v0.6.0（tts.result 回执）
 + v0.16.0（navigate）+ v0.17.0（scene 迎宾）+ v0.20.0（navigate/scene 可选
-随动播报 texts）。scene / navigate / tts.stop 无回执（契约）。
+随动播报 texts）+ v0.21.0（relocate 地图重定位，2026-10-17 接入）
++ v0.23.0（navigate.stop）。scene / navigate / tts.stop / navigate.stop
+无回执（契约）。
 
 用法（先确保 guide_bridge 已在运行）：
   # 迎宾（本地默认词；协议 scene=welcome，v0.17.0）
@@ -18,11 +21,22 @@
   python3 backend_simulator.py navigate 3号展台 --text "这是我们的主打车型" --text "续航一千公里"
   python3 backend_simulator.py navigate 充电桩            # 只导航，到达不播报
 
+  # 地图重定位（机器人已被摆到点位上；回 relocate.result，缺省播
+  # 「{点位名}点重定位成功」）
+  python3 backend_simulator.py relocate A
+
+  # 点位映射表全量同步（v0.25.0，navigate/relocate 的 point_name 经表
+  # 解析为航点 code；回 point_map.result）
+  python3 backend_simulator.py point-map "A=比亚迪ATTO 1" "B=腾势D9"
+
   # 循环播报（多条文本按序循环，v0.5.0）
   python3 backend_simulator.py play "第一条" "第二条" --interval 5
 
   # 停止一切播报并取消导航（tts.stop 无回执）
   python3 backend_simulator.py stop
+
+  # 只取消当前导航（v0.23.0 navigate.stop 无回执；无导航时 no-op）
+  python3 backend_simulator.py nav-stop
 
 依赖：paho-mqtt（已随工程分发 deps/，自动加载，无需额外安装）。
 """
@@ -127,6 +141,26 @@ def main():
                        help="讲解词（可重复多次=多条；缺省到达后不播报）")
     p_nav.add_argument("--expires", type=int, default=60, help="指令有效期秒（默认 60）")
 
+    p_relocate = sub.add_parser(
+        "relocate", help="下发地图重定位指令（type=relocate，回 relocate.result）")
+    p_relocate.add_argument("point", help="点位名（重定位到该航点，机器人不动）")
+    p_relocate.add_argument("--text", dest="texts", action="append", default=[],
+                            help="重定位成功后的播报词（可重复多条；缺省播"
+                                 "「{点位名}点重定位成功」）")
+    p_relocate.add_argument("--expires", type=int, default=60, help="指令有效期秒（默认 60）")
+    p_relocate.add_argument("--wait-result", type=float, default=3.0,
+                            help="发布后等待 relocate.result 回执的秒数（默认 3，0 不等待）")
+
+    p_pointmap = sub.add_parser(
+        "point-map", help="下发点位映射表全量同步（type=point_map，v0.25.0，"
+                          "回 point_map.result）")
+    p_pointmap.add_argument(
+        "entries", nargs="+", metavar="CODE=NAME",
+        help='映射条目（1..256 条，全量替换机器人本地表），如 "A=比亚迪ATTO 1"')
+    p_pointmap.add_argument("--expires", type=int, default=120, help="指令有效期秒（默认 120）")
+    p_pointmap.add_argument("--wait-result", type=float, default=3.0,
+                            help="发布后等待 point_map.result 回执的秒数（默认 3，0 不等待）")
+
     p_play = sub.add_parser("play", help="下发列表循环播报指令（type=tts，有回执）")
     p_play.add_argument("texts", nargs="+",
                         help="播报列表文本（1..20 条，空格分隔多条；允许单条）")
@@ -140,6 +174,9 @@ def main():
 
     p_stop = sub.add_parser("stop", help="下发停止指令（type=tts.stop，无回执）")
     p_stop.add_argument("--expires", type=int, default=120, help="指令有效期秒（默认 120）")
+
+    p_navstop = sub.add_parser("nav-stop", help="下发停止导航指令（type=navigate.stop，无回执）")
+    p_navstop.add_argument("--expires", type=int, default=120, help="指令有效期秒（默认 120）")
 
     args = parser.parse_args()
 
@@ -155,14 +192,15 @@ def main():
             root = json.loads(msg.payload.decode("utf-8", "replace"))
         except ValueError:
             return
-        if root.get("type") != "tts.result":
+        if not root.get("type", "").endswith(".result"):
             return
         payload = root.get("payload", {})
         receipts.append((payload.get("operation_id"), root.get("event_id"),
-                         payload.get("outcome"), payload.get("reason", "")))
+                         root.get("type"), payload.get("outcome"),
+                         payload.get("reason", "")))
         got_receipt.set()
         reason = f" reason={payload['reason']}" if payload.get("reason") else ""
-        print(f"[后端] 收到回执 type=tts.result event_id={root.get('event_id')} "
+        print(f"[后端] 收到回执 type={root.get('type')} event_id={root.get('event_id')} "
               f"outcome={payload.get('outcome')}{reason}")
 
     # 兼容 paho-mqtt 1.x 与 2.x 的构造方式
@@ -227,6 +265,22 @@ def main():
             payload["texts"] = args.texts
         event = build_event("navigate", payload, expires=args.expires)
         desc = f"导航 point={args.point} 讲解词={len(args.texts)}条（0=到达不播报）"
+    elif args.command == "relocate":
+        payload = {"operation_id": operation_id, "point_name": args.point}
+        if args.texts:
+            payload["texts"] = args.texts
+        event = build_event("relocate", payload, expires=args.expires)
+        desc = f"重定位 point={args.point} 播报词={len(args.texts)}条（0=本地默认）"
+    elif args.command == "point-map":
+        points = []
+        for entry in args.entries:
+            code, sep, name = entry.partition("=")
+            if not sep or not code or not name:
+                parser.error(f'映射条目格式应为 CODE=NAME: "{entry}"')
+            points.append({"code": code, "name": name})
+        payload = {"operation_id": operation_id, "points": points}
+        event = build_event("point_map", payload, expires=args.expires)
+        desc = f"点位映射表同步 {len(points)} 条（全量替换）"
     elif args.command == "play":
         event = build_event("tts", {
             "operation_id": operation_id,
@@ -235,9 +289,12 @@ def main():
             "interval_seconds": args.interval,
         })
         desc = f"循环播报 mode={args.mode} interval={args.interval}s 条数={len(args.texts)}"
-    else:
+    elif args.command == "stop":
         event = build_event("tts.stop", {"operation_id": operation_id})
         desc = "stop"
+    else:  # nav-stop
+        event = build_event("navigate.stop", {"operation_id": operation_id})
+        desc = "nav-stop"
 
     info = client.publish(down_topic, json.dumps(event, ensure_ascii=False), qos=1)
     info.wait_for_publish(timeout=5)
@@ -246,21 +303,25 @@ def main():
         sys.exit(1)
     print(f"[后端] 已下发 {desc} 指令: operation_id={operation_id} topic={down_topic}")
 
-    # v0.6.0：tts 必须回执；scene/navigate/tts.stop 无回执不等待
-    expects_receipt = args.command == "play"
+    # v0.6.0：tts 必须回执；relocate（2026-10-17 接入）回一次性最终结果
+    # relocate.result；point_map（v0.25.0）回 point_map.result。
+    # scene/navigate/tts.stop/navigate.stop 不在本工具等待
+    expects_receipt = args.command in ("play", "relocate", "point-map")
     if expects_receipt and args.wait_result > 0:
         deadline = time.time() + args.wait_result
-        while time.time() < deadline and not receipts:
+        while time.time() < deadline and not any(
+                r[0] == operation_id for r in receipts):
             time.sleep(0.1)
-        if not receipts:
-            print("[后端] 等待回执超时（未收到 tts.result）", file=sys.stderr)
+        if not any(r[0] == operation_id for r in receipts):
+            print("[后端] 等待回执超时（未收到 *.result）", file=sys.stderr)
     elif not expects_receipt:
         print("[后端] 该指令无回执（发后即忘）；消息观察请用 mqtt_monitor.py")
 
     client.loop_stop()
     client.disconnect()
     # 非零退出码便于脚本断言回执缺失场景
-    if expects_receipt and args.wait_result > 0 and not receipts:
+    if expects_receipt and args.wait_result > 0 and not any(
+            r[0] == operation_id for r in receipts):
         sys.exit(2)
 
 

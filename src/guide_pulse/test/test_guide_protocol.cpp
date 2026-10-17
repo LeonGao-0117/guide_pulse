@@ -1,8 +1,8 @@
 // ============================================================================
 // guide_pulse 协议层单元测试（无 ROS 依赖）
-// 覆盖：down/commands 四类指令解析/校验（tts v0.5.0 / tts.stop / scene
-// v0.17.0+v0.20.0 / navigate v0.16.0+v0.20.0）、tts.result 回执构造（v0.6.0）、
-// 播报列表轮序、优先级档位校验、工具函数。
+// 覆盖：down/commands 五类指令解析/校验（tts v0.5.0 / tts.stop / scene
+// v0.17.0+v0.20.0 / navigate v0.16.0+v0.20.0 / navigate.stop v0.23.0）、
+// tts.result 回执构造（v0.6.0）、播报列表轮序、优先级档位校验、工具函数。
 // 框架与夹具沿用 tts_demo test_tts_protocol.cpp，删 condition 用例、
 // 新增 scene / navigate 用例。
 // ============================================================================
@@ -150,8 +150,9 @@ TEST(CommandEventTest, ExpiredEventFlagged)
 
 TEST(CommandEventTest, NonGuideTypeIgnored)
 {
-  // relocate / ota.start 等由其他组件处理：error=="ignore" 静默忽略
-  for (const auto * type : {"relocate", "ota.start", "unknown.thing"}) {
+  // ota.start 等由其他组件处理：error=="ignore" 静默忽略（relocate 自
+  // 2026-10-17 起由本组件处理，见 RelocateEventTest）
+  for (const auto * type : {"ota.start", "unknown.thing"}) {
     const auto payload = build_command_json(
       type, R"({"operation_id":")" + std::string(kOperationId) + R"("})");
     std::string error;
@@ -255,7 +256,7 @@ TEST(SceneEventTest, ParseWelcomeWithTexts)
   EXPECT_EQ(event->scene, "welcome");
   ASSERT_EQ(event->texts.size(), 2U);
   EXPECT_EQ(event->texts[0], "欢迎光临");
-  // scene 无回执面：即使载荷非法也不填 invalid_operation_id
+  // 合法载荷不填回执通道（invalid_operation_id 仅校验失败时填充）
   std::string invalid_op;
   EXPECT_TRUE(invalid_op.empty());
 }
@@ -439,6 +440,215 @@ TEST(NavigateEventTest, RejectsInvalidNavigatePayloads)
 }
 
 // ---------------------------------------------------------------------------
+// type=relocate（v0.21.0 地图重定位，2026-10-17 接入；载荷形状与 navigate
+// 完全一致：operation_id + point_name 必填、texts 可选）
+// ---------------------------------------------------------------------------
+TEST(RelocateEventTest, ParseWithTexts)
+{
+  const auto payload = build_command_json(
+    "relocate",
+    R"({"operation_id":")" + std::string(kOperationId) +
+    R"(","point_name":"A","texts":["A点重定位成功"]})");
+  std::string error;
+  const auto event = guide_pulse::parse_command_event(payload, "robot-001", error);
+  ASSERT_TRUE(event.has_value()) << error;
+  EXPECT_EQ(event->type, "relocate");
+  EXPECT_EQ(event->point_name, "A");
+  ASSERT_EQ(event->texts.size(), 1U);
+  EXPECT_EQ(event->texts[0], "A点重定位成功");
+}
+
+TEST(RelocateEventTest, ParseWithoutTexts)
+{
+  const auto payload = build_command_json(
+    "relocate", R"({"operation_id":")" + std::string(kOperationId) + R"(","point_name":"东门路口"})");
+  std::string error;
+  const auto event = guide_pulse::parse_command_event(payload, "robot-001", error);
+  ASSERT_TRUE(event.has_value()) << error;
+  EXPECT_EQ(event->type, "relocate");
+  EXPECT_EQ(event->point_name, "东门路口");
+  EXPECT_TRUE(event->texts.empty());
+}
+
+TEST(RelocateEventTest, RejectsInvalidPayloads)
+{
+  const std::vector<std::string> bad_payloads = {
+    R"({"operation_id":")" + std::string(kOperationId) + R"(","texts":["a"]})",   // 缺 point_name
+    R"({"operation_id":")" + std::string(kOperationId) + R"(","point_name":""})",  // 空点位名
+    R"({"operation_id":")" + std::string(kOperationId) + R"(","point_name":"A","texts":[]})",  // 空 texts
+    R"({"operation_id":")" + std::string(kOperationId) + R"(","point_name":"A","mode":"sequence"})",  // 未知字段
+  };
+  for (const auto & body : bad_payloads) {
+    std::string error;
+    std::string invalid_op;
+    std::string invalid_type;
+    EXPECT_FALSE(guide_pulse::parse_command_event(
+      build_command_json("relocate", body), "robot-001", error,
+      &invalid_op, &invalid_type)) << body;
+    // 载荷非法但能解析出 operation_id：填 invalid 通道回 rejected/invalid_request
+    EXPECT_EQ(invalid_op, kOperationId) << body;
+    EXPECT_EQ(invalid_type, "relocate") << body;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// type=navigate.stop（v0.23.0 停止导航，与 tts.stop 同构仅 operation_id）
+// ---------------------------------------------------------------------------
+TEST(NavigateStopEventTest, ParsesMinimalPayload)
+{
+  const auto payload = build_command_json(
+    "navigate.stop", R"({"operation_id":")" + std::string(kOperationId) + R"("})");
+  std::string error;
+  const auto event = guide_pulse::parse_command_event(payload, "robot-001", error);
+  ASSERT_TRUE(event.has_value()) << error;
+  EXPECT_EQ(event->type, "navigate.stop");
+  EXPECT_EQ(event->operation_id, kOperationId);
+  EXPECT_FALSE(event->expired);
+}
+
+TEST(NavigateStopEventTest, RejectsExtraPayloadFields)
+{
+  // 契约 navigateStopPayload：additionalProperties=false，仅 operation_id
+  //（不带 point_name/texts——停止当前导航无需知道目标）
+  const auto payload = build_command_json(
+    "navigate.stop",
+    R"({"operation_id":")" + std::string(kOperationId) + R"(","point_name":"东门"})");
+  std::string error;
+  EXPECT_FALSE(guide_pulse::parse_command_event(payload, "robot-001", error));
+  EXPECT_NE(error.find("only operation_id"), std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// type=point_map（v0.25.0 P-039 点位映射表全量下发）
+// ---------------------------------------------------------------------------
+TEST(PointMapEventTest, ParsesValidPointMap)
+{
+  // 现场样例形态：A..E 五点（比亚迪/腾势车型展位）
+  const auto payload = build_command_json(
+    "point_map",
+    R"({"operation_id":")" + std::string(kOperationId) +
+    R"(","points":[{"code":"A","name":"比亚迪ATTO 1"},)"
+    R"({"code":"B","name":"比亚迪 M9 DM-i"},{"code":"C","name":"腾势 B5"},)"
+    R"({"code":"D","name":"腾势 D9"},{"code":"E","name":"腾势 Z9 GT"}]})");
+  std::string error;
+  const auto event = guide_pulse::parse_command_event(payload, "robot-001", error);
+  ASSERT_TRUE(event.has_value()) << error;
+  EXPECT_EQ(event->type, "point_map");
+  EXPECT_EQ(event->operation_id, kOperationId);
+  ASSERT_EQ(event->points.size(), 5U);
+  EXPECT_EQ(event->points[0].code, "A");
+  EXPECT_EQ(event->points[0].name, "比亚迪ATTO 1");
+  EXPECT_EQ(event->points[4].code, "E");
+  EXPECT_EQ(event->points[4].name, "腾势 Z9 GT");
+  EXPECT_FALSE(event->expired);
+}
+
+TEST(PointMapEventTest, ParsesSinglePoint)
+{
+  const auto payload = build_command_json(
+    "point_map",
+    R"({"operation_id":")" + std::string(kOperationId) +
+    R"(","points":[{"code":"P001","name":"东门路口"}]})");
+  std::string error;
+  const auto event = guide_pulse::parse_command_event(payload, "robot-001", error);
+  ASSERT_TRUE(event.has_value()) << error;
+  ASSERT_EQ(event->points.size(), 1U);
+  EXPECT_EQ(event->points[0].code, "P001");
+}
+
+TEST(PointMapEventTest, RejectsInvalidPointMapPayloads)
+{
+  // 结构反例：缺 points / 空 points / 条目多字段 / 缺 name / 非法类型
+  const std::vector<std::string> bad_payloads = {
+    R"({"operation_id":")" + std::string(kOperationId) + R"("})",                 // 缺 points
+    R"({"operation_id":")" + std::string(kOperationId) + R"(","points":[]})",     // 空 points
+    R"({"operation_id":")" + std::string(kOperationId) + R"(","points":"A"})",    // points 非数组
+    R"({"operation_id":")" + std::string(kOperationId) + R"(","points":[{}]})",   // 条目缺字段
+    R"({"operation_id":")" + std::string(kOperationId) +
+    R"(","points":[{"code":"A","name":"x","extra":1}]})",                          // 条目未知字段
+    R"({"operation_id":")" + std::string(kOperationId) +
+    R"(","points":[{"code":"A","name":123}]})",                                    // name 非字符串
+    R"({"operation_id":")" + std::string(kOperationId) + R"(","points":[],"extra":1})",  // 顶层未知字段
+  };
+  for (const auto & body : bad_payloads) {
+    std::string error;
+    std::string invalid_op;
+    std::string invalid_type;
+    EXPECT_FALSE(guide_pulse::parse_command_event(
+      build_command_json("point_map", body), "robot-001", error, &invalid_op,
+      &invalid_type)) << body;
+    // 结构非法但 operation_id 已解析：填回执通道（rejected/invalid_request）
+    EXPECT_EQ(invalid_op, kOperationId) << body;
+    EXPECT_EQ(invalid_type, "point_map") << body;
+  }
+}
+
+TEST(PointMapEventTest, RejectsDuplicateCodes)
+{
+  // code 表内唯一是语义校验（Schema 无法表达）：Robot 侧纵深防御，
+  // 按契约回 rejected/invalid_request
+  const auto payload = build_command_json(
+    "point_map",
+    R"({"operation_id":")" + std::string(kOperationId) +
+    R"(","points":[{"code":"A","name":"x"},{"code":"A","name":"y"}]})");
+  std::string error;
+  std::string invalid_op;
+  std::string invalid_type;
+  EXPECT_FALSE(guide_pulse::parse_command_event(
+    payload, "robot-001", error, &invalid_op, &invalid_type));
+  EXPECT_NE(error.find("unique"), std::string::npos);
+  EXPECT_EQ(invalid_op, kOperationId);
+  EXPECT_EQ(invalid_type, "point_map");
+}
+
+TEST(PointMapEventTest, RejectsLengthViolations)
+{
+  // code 1..32 标量、name 1..64 标量（Unicode 标量计，同 point_name）
+  std::string han33;
+  for (int i = 0; i < 33; ++i) {
+    han33 += "\xe4\xb8\x80";  // 「一」
+  }
+  std::string han65;
+  for (int i = 0; i < 65; ++i) {
+    han65 += "\xe4\xb8\x80";
+  }
+  const std::vector<std::pair<std::string, std::string>> cases = {
+    {"code 超长（33 汉字）",
+      R"({"operation_id":")" + std::string(kOperationId) + R"(","points":[{"code":")" +
+      han33 + R"(","name":"x"}]})"},
+    {"name 超长（65 汉字）",
+      R"({"operation_id":")" + std::string(kOperationId) + R"(","points":[{"code":"A","name":")" +
+      han65 + R"("}]})"},
+    {"code 为空",
+      R"({"operation_id":")" + std::string(kOperationId) + R"(","points":[{"code":"","name":"x"}]})"},
+    {"name 为空",
+      R"({"operation_id":")" + std::string(kOperationId) + R"(","points":[{"code":"A","name":""}]})"},
+  };
+  for (const auto & [label, body] : cases) {
+    std::string error;
+    EXPECT_FALSE(guide_pulse::parse_command_event(
+      build_command_json("point_map", body), "robot-001", error)) << label;
+  }
+}
+
+TEST(PointMapEventTest, PointsOver256Rejected)
+{
+  // points 上限 256 条（契约 maxItems）
+  std::string body = R"({"operation_id":")" + std::string(kOperationId) + R"(","points":[)";
+  for (int i = 0; i < 257; ++i) {
+    if (i > 0) {
+      body += ",";
+    }
+    body += "{\"code\":\"P" + std::to_string(i) + "\",\"name\":\"n\"}";
+  }
+  body += "]}";
+  std::string error;
+  EXPECT_FALSE(guide_pulse::parse_command_event(
+    build_command_json("point_map", body), "robot-001", error));
+  EXPECT_NE(error.find("1..256"), std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
 // 播报时长估算（沿用 tts_demo 真机校准结论）
 // ---------------------------------------------------------------------------
 TEST(GuideProtocolTest, EstimateSpeechSecondsByCharacterCount)
@@ -522,6 +732,238 @@ TEST(BuildTtsResultTest, EachBuildGetsFreshEventId)
   ASSERT_TRUE(a.has_value());
   ASSERT_TRUE(b.has_value());
   EXPECT_NE(a->event_id, b->event_id);
+}
+
+// ---------------------------------------------------------------------------
+// navigate.result / relocate.result / scene.result / point_map.result
+// 一次性最终结果回执构造（v0.24.0 P-038 / v0.25.0 P-039）
+// ---------------------------------------------------------------------------
+using guide_pulse::ACTION_RESULT_FAILED;
+using guide_pulse::ACTION_RESULT_REJECTED;
+using guide_pulse::ACTION_RESULT_SUCCESS;
+using guide_pulse::NAVIGATE_RESULT_TYPE;
+using guide_pulse::RELOCATE_RESULT_TYPE;
+using guide_pulse::RESULT_REASON_ABORTED;
+using guide_pulse::RESULT_REASON_BUSY;
+using guide_pulse::RESULT_REASON_LOCALIZATION_FAILED;
+using guide_pulse::RESULT_REASON_LOCALIZATION_LOST;
+using guide_pulse::RESULT_REASON_NAVIGATION_FAILED;
+using guide_pulse::RESULT_REASON_POINT_NOT_FOUND;
+using guide_pulse::RESULT_REASON_SCENE_FAILED;
+using guide_pulse::SCENE_RESULT_TYPE;
+using guide_pulse::TTS_REASON_COMMAND_EXPIRED;
+using guide_pulse::TTS_REASON_INVALID_REQUEST;
+
+TEST(BuildActionResultTest, SuccessForbidsReason)
+{
+  for (const char * type :
+    {NAVIGATE_RESULT_TYPE, RELOCATE_RESULT_TYPE, SCENE_RESULT_TYPE})
+  {
+    const auto receipt = guide_pulse::build_action_result_event(
+      "robot-001", type, kOperationId, ACTION_RESULT_SUCCESS);
+    ASSERT_TRUE(receipt.has_value()) << type;
+    const auto envelope = json::parse(receipt->envelope_json);
+    EXPECT_EQ(envelope["direction"], "up");
+    EXPECT_EQ(envelope["type"], type);
+    EXPECT_EQ(envelope["payload"]["operation_id"], kOperationId);
+    EXPECT_EQ(envelope["payload"]["outcome"], "success");
+    EXPECT_FALSE(envelope["payload"].contains("reason"));
+    // success 带 reason 非法
+    EXPECT_FALSE(guide_pulse::build_action_result_event(
+      "robot-001", type, kOperationId, ACTION_RESULT_SUCCESS, "busy"));
+  }
+}
+
+TEST(BuildActionResultTest, FailedReasonsPerType)
+{
+  // navigate.result failed 枚举（P-038 error-codes 表）
+  for (const char * reason :
+    {RESULT_REASON_BUSY, RESULT_REASON_POINT_NOT_FOUND,
+      RESULT_REASON_NAVIGATION_FAILED, RESULT_REASON_ABORTED,
+      RESULT_REASON_LOCALIZATION_LOST})
+  {
+    const auto receipt = guide_pulse::build_action_result_event(
+      "robot-001", NAVIGATE_RESULT_TYPE, kOperationId, ACTION_RESULT_FAILED, reason);
+    ASSERT_TRUE(receipt.has_value()) << reason;
+    EXPECT_EQ(
+      json::parse(receipt->envelope_json)["payload"]["reason"], reason);
+  }
+  // scene.result failed 枚举：busy / scene_failed
+  for (const char * reason : {RESULT_REASON_BUSY, RESULT_REASON_SCENE_FAILED}) {
+    const auto receipt = guide_pulse::build_action_result_event(
+      "robot-001", SCENE_RESULT_TYPE, kOperationId, ACTION_RESULT_FAILED, reason);
+    ASSERT_TRUE(receipt.has_value()) << reason;
+    EXPECT_EQ(
+      json::parse(receipt->envelope_json)["payload"]["reason"], reason);
+  }
+  // relocate.result failed 枚举：busy / point_not_found / localization_failed
+  for (const char * reason :
+    {RESULT_REASON_BUSY, RESULT_REASON_POINT_NOT_FOUND,
+      RESULT_REASON_LOCALIZATION_FAILED})
+  {
+    const auto receipt = guide_pulse::build_action_result_event(
+      "robot-001", RELOCATE_RESULT_TYPE, kOperationId, ACTION_RESULT_FAILED, reason);
+    ASSERT_TRUE(receipt.has_value()) << reason;
+    EXPECT_EQ(
+      json::parse(receipt->envelope_json)["payload"]["reason"], reason);
+  }
+  // 跨指令枚举互不接受：scene 不认 navigation_failed，navigate 不认
+  // scene_failed，relocate 不认 navigation_failed / localization_lost
+  EXPECT_FALSE(guide_pulse::build_action_result_event(
+    "robot-001", SCENE_RESULT_TYPE, kOperationId, ACTION_RESULT_FAILED,
+    RESULT_REASON_NAVIGATION_FAILED));
+  EXPECT_FALSE(guide_pulse::build_action_result_event(
+    "robot-001", NAVIGATE_RESULT_TYPE, kOperationId, ACTION_RESULT_FAILED,
+    RESULT_REASON_SCENE_FAILED));
+  EXPECT_FALSE(guide_pulse::build_action_result_event(
+    "robot-001", RELOCATE_RESULT_TYPE, kOperationId, ACTION_RESULT_FAILED,
+    RESULT_REASON_NAVIGATION_FAILED));
+  EXPECT_FALSE(guide_pulse::build_action_result_event(
+    "robot-001", RELOCATE_RESULT_TYPE, kOperationId, ACTION_RESULT_FAILED,
+    RESULT_REASON_LOCALIZATION_LOST));
+}
+
+TEST(BuildActionResultTest, RejectedSharesExpiryAndInvalidRequest)
+{
+  for (const char * type :
+    {NAVIGATE_RESULT_TYPE, RELOCATE_RESULT_TYPE, SCENE_RESULT_TYPE})
+  {
+    for (const char * reason : {TTS_REASON_COMMAND_EXPIRED, TTS_REASON_INVALID_REQUEST}) {
+      const auto receipt = guide_pulse::build_action_result_event(
+        "robot-001", type, kOperationId, ACTION_RESULT_REJECTED, reason);
+      ASSERT_TRUE(receipt.has_value()) << type << " " << reason;
+      EXPECT_EQ(json::parse(receipt->envelope_json)["payload"]["reason"], reason);
+    }
+  }
+}
+
+TEST(BuildActionResultTest, RejectsInvalidArguments)
+{
+  // 未知回执类型（ota.result——升级回执由其他组件负责）
+  EXPECT_FALSE(guide_pulse::build_action_result_event(
+    "robot-001", "ota.result", kOperationId, ACTION_RESULT_SUCCESS));
+  // failed/rejected 缺 reason；success/failed/rejected 之外的 outcome
+  EXPECT_FALSE(guide_pulse::build_action_result_event(
+    "robot-001", NAVIGATE_RESULT_TYPE, kOperationId, ACTION_RESULT_FAILED));
+  EXPECT_FALSE(guide_pulse::build_action_result_event(
+    "robot-001", SCENE_RESULT_TYPE, kOperationId, ACTION_RESULT_REJECTED));
+  EXPECT_FALSE(guide_pulse::build_action_result_event(
+    "robot-001", NAVIGATE_RESULT_TYPE, kOperationId, "accepted"));
+  // rejected 不接受 failed 枚举的 reason
+  EXPECT_FALSE(guide_pulse::build_action_result_event(
+    "robot-001", NAVIGATE_RESULT_TYPE, kOperationId, ACTION_RESULT_REJECTED,
+    RESULT_REASON_BUSY));
+}
+
+TEST(BuildActionResultTest, EachBuildGetsFreshEventId)
+{
+  const auto a = guide_pulse::build_action_result_event(
+    "robot-001", NAVIGATE_RESULT_TYPE, kOperationId, ACTION_RESULT_SUCCESS);
+  const auto b = guide_pulse::build_action_result_event(
+    "robot-001", NAVIGATE_RESULT_TYPE, kOperationId, ACTION_RESULT_SUCCESS);
+  ASSERT_TRUE(a.has_value());
+  ASSERT_TRUE(b.has_value());
+  EXPECT_NE(a->event_id, b->event_id);
+}
+
+// ---------------------------------------------------------------------------
+// point_map.result 回执构造（v0.25.0 P-039：failed 枚举仅 point_map_failed）
+// ---------------------------------------------------------------------------
+using guide_pulse::POINT_MAP_RESULT_TYPE;
+using guide_pulse::RESULT_REASON_POINT_MAP_FAILED;
+
+TEST(BuildPointMapResultTest, SuccessWithoutReason)
+{
+  const auto receipt = guide_pulse::build_action_result_event(
+    "robot-001", POINT_MAP_RESULT_TYPE, kOperationId, ACTION_RESULT_SUCCESS);
+  ASSERT_TRUE(receipt.has_value());
+  const auto envelope = json::parse(receipt->envelope_json);
+  EXPECT_EQ(envelope["direction"], "up");
+  EXPECT_EQ(envelope["type"], "point_map.result");
+  EXPECT_EQ(envelope["payload"]["operation_id"], kOperationId);
+  EXPECT_EQ(envelope["payload"]["outcome"], "success");
+  EXPECT_FALSE(envelope["payload"].contains("reason"));
+  // success 带 reason 非法
+  EXPECT_FALSE(guide_pulse::build_action_result_event(
+    "robot-001", POINT_MAP_RESULT_TYPE, kOperationId, ACTION_RESULT_SUCCESS,
+    "point_map_failed"));
+}
+
+TEST(BuildPointMapResultTest, FailedOnlyAcceptsPointMapFailed)
+{
+  const auto receipt = guide_pulse::build_action_result_event(
+    "robot-001", POINT_MAP_RESULT_TYPE, kOperationId, ACTION_RESULT_FAILED,
+    RESULT_REASON_POINT_MAP_FAILED);
+  ASSERT_TRUE(receipt.has_value());
+  EXPECT_EQ(
+    json::parse(receipt->envelope_json)["payload"]["reason"], "point_map_failed");
+  // 跨指令枚举不接受：busy/navigation_failed 等属 navigate.result
+  for (const char * reason :
+    {"busy", "navigation_failed", "scene_failed", "point_not_found"})
+  {
+    EXPECT_FALSE(guide_pulse::build_action_result_event(
+      "robot-001", POINT_MAP_RESULT_TYPE, kOperationId, ACTION_RESULT_FAILED,
+      reason)) << reason;
+  }
+  // failed 缺 reason 非法
+  EXPECT_FALSE(guide_pulse::build_action_result_event(
+    "robot-001", POINT_MAP_RESULT_TYPE, kOperationId, ACTION_RESULT_FAILED));
+}
+
+TEST(BuildPointMapResultTest, RejectedSharesExpiryAndInvalidRequest)
+{
+  for (const char * reason : {TTS_REASON_COMMAND_EXPIRED, TTS_REASON_INVALID_REQUEST}) {
+    const auto receipt = guide_pulse::build_action_result_event(
+      "robot-001", POINT_MAP_RESULT_TYPE, kOperationId, ACTION_RESULT_REJECTED,
+      reason);
+    ASSERT_TRUE(receipt.has_value()) << reason;
+    EXPECT_EQ(json::parse(receipt->envelope_json)["payload"]["reason"], reason);
+  }
+  // rejected 不接受 failed 枚举
+  EXPECT_FALSE(guide_pulse::build_action_result_event(
+    "robot-001", POINT_MAP_RESULT_TYPE, kOperationId, ACTION_RESULT_REJECTED,
+    RESULT_REASON_POINT_MAP_FAILED));
+  // 非法 type 拼写（如 point_map 不带 .result）
+  EXPECT_FALSE(guide_pulse::build_action_result_event(
+    "robot-001", "point_map", kOperationId, ACTION_RESULT_SUCCESS));
+}
+
+TEST(CommandEventTest, InvalidNavigateScenePayloadsFillReceiptId)
+{
+  // v0.24.0：navigate/scene 载荷结构性非法（operation_id 已解析）须填
+  // invalid_operation_id + invalid_command_type 供调用方回 rejected/
+  // invalid_request；未知 scene 枚举值是未来指令，不填
+  const std::vector<std::pair<std::string, std::string>> cases = {
+    {"navigate", R"({"operation_id":")" + std::string(kOperationId) + R"("})"},
+    {"navigate",
+      R"({"operation_id":")" + std::string(kOperationId) +
+      R"(","point_name":"","texts":["x"]})"},
+    {"scene",
+      R"({"operation_id":")" + std::string(kOperationId) + R"(","extra":1})"},
+    {"scene",
+      R"({"operation_id":")" + std::string(kOperationId) +
+      R"(","scene":"welcome","qr_sha256":"zz"})"},
+  };
+  for (const auto & [type, body] : cases) {
+    std::string error;
+    std::string invalid_op;
+    std::string invalid_type;
+    EXPECT_FALSE(guide_pulse::parse_command_event(
+      build_command_json(type, body), "robot-001", error, &invalid_op,
+      &invalid_type)) << type << " " << body;
+    EXPECT_EQ(invalid_op, kOperationId) << type;
+    EXPECT_EQ(invalid_type, type) << type;
+  }
+
+  // 未知 scene 枚举值（farewell）：未来版本指令，不填回执通道
+  std::string error;
+  std::string invalid_op;
+  EXPECT_FALSE(guide_pulse::parse_command_event(
+    build_command_json(
+      "scene", R"({"operation_id":")" + std::string(kOperationId) +
+      R"(","scene":"farewell"})"),
+    "robot-001", error, &invalid_op));
+  EXPECT_TRUE(invalid_op.empty());
 }
 
 }  // namespace

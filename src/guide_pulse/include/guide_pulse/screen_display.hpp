@@ -1,8 +1,11 @@
 // ============================================================================
-// 屏幕二维码显示组件（迎宾场景）：
+// 屏幕二维码显示组件（迎宾场景），两阶段（迎宾时序：上屏必须在变形
+// 完成之后、TTS 开播之前——变形动画/结束表情会顶掉变形前上屏的内容，
+// PlayEmotion 单通道新请求即打断）：
 //   迎宾指令触发 -> QrCodeCache 提供本地二维码图片（缓存/下载见
-//   qr_code_cache.hpp）-> 本地 ffmpeg 转 848x480 H.264 MP4 -> sshpass scp
-//   推送到运控板 -> PlayEmotion(file, loop_count=0) 无限循环常驻 ->
+//   qr_code_cache.hpp）-> prepare()：本地 ffmpeg 转 848x480 H.264 MP4
+//   + sshpass scp 推送到运控板（耗时大头，与迎宾变形并行重叠）->
+//   play_prepared()：PlayEmotion(file, loop_count=0) 无限循环常驻 ->
 //   3 分钟超时或新业务到达时 cancel() 恢复默认表情打断视频。
 //
 // 多板架构（实测结论，见 docs/design.md §屏幕显示）：
@@ -50,7 +53,8 @@ public:
     std::string local_tmp_dir{"/tmp/guide_pulse"};  // MP4 本地暂存
     // ---- 行为参数 ----
     int request_timeout_seconds{5};           // 单次 PlayEmotion 调用超时
-    int show_timeout_seconds{180};            // 二维码常驻时长（默认 3 分钟）
+    int show_timeout_seconds{180};            // 二维码常驻时长（默认 3 分钟，
+                                               // 与迎宾流程超时独立计时互不影响）
     int restore_emotion_id{90};               // 取消显示后恢复的默认表情
   };
 
@@ -64,15 +68,20 @@ public:
   // node: 所属节点（桥接节点）；config: 见上
   ScreenDisplay(rclcpp::Node::SharedPtr node, Config config);
 
-  // 显示二维码。image_path：本地二维码图片文件（PNG/JPEG，QrCodeCache
-  // 提供的缓存路径）-> ffmpeg 转码 -> scp 推送 -> PlayEmotion 无限循环。
-  // content_id：内容标识（二维码 sha256），非空时远程 MP4 以它命名——
-  // 固定同名覆盖 + 同路径重播时运控板播放器不重新加载（真机：换图后
-  // 屏幕仍是上一张），换内容必换文件名才能强制重载。
-  // 成功后 active()=true 且 deadline() 生效。失败不改变当前显示状态。
-  Result show(
-    const std::string & image_path, const std::string & source,
-    const std::string & content_id = "");
+  // ---- 两阶段显示（迎宾时序用：上屏必须在变形完成之后、TTS 开播
+  // 之前——变形动画/结束表情会顶掉变形前上屏的内容，PlayEmotion 单
+  // 通道新请求即打断；下载/转码/推送是耗时大头，仍可与变形并行）----
+
+  // 阶段 1（可与迎宾变形并行重叠）：ffmpeg 转码 + scp 推送运控板。
+  // ok=true 表示内容就绪（可 play_prepared）；失败清除就绪状态并带
+  // detail 原因（本次不显示，不影响后续重试）
+  Result prepare(
+    const std::string & image_path, const std::string & content_id = "");
+
+  // 阶段 2（变形完成后、TTS 开播前调用）：PlayEmotion 无限循环上屏。
+  // 无就绪内容（prepare 未成功/已被消费）时返回失败，不改变显示状态。
+  // 成功后 active()=true 且 deadline() 生效
+  Result play_prepared(const std::string & source);
 
   // 取消显示（超时/新业务到达）：恢复默认表情打断循环视频。
   // 未显示时为空操作（幂等）。
@@ -100,6 +109,8 @@ private:
   Config config_;
   bool showing_{false};                              // 仅 worker 线程访问
   std::chrono::steady_clock::time_point deadline_;   // 仅 worker 线程访问
+  bool prepared_{false};          // prepare 成功待上屏（仅 worker 线程访问）
+  std::string prepared_content_id_;  // 就绪内容的寻址文件名（QRCode_{id}.mp4）
   rclcpp::Client<aimdk_msgs::srv::PlayEmotion>::SharedPtr client_;
   rclcpp::CallbackGroup::SharedPtr callback_group_;
 };
