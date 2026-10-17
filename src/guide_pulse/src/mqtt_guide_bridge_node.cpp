@@ -1352,8 +1352,10 @@ void MqttGuideBridgeNode::worker_loop()
             }
           } else {
             RCLCPP_ERROR(
-              get_logger(), "导航失败: %s (%s)，已回执 navigate.result/failed:navigation_failed",
-              tour_->current_point().c_str(), arrival->detail.c_str());
+              get_logger(), "导航失败: %s (%s)，%s",
+              tour_->current_point().c_str(), arrival->detail.c_str(),
+              nav_local_ ? "不发协议回执（语料触发，Server 不认识本地 id）"
+                         : "已回执 navigate.result/failed:navigation_failed");
             // 导航失败：导览业务结束，释放占用
             business_ = Business::kNone;
             business_busy_until_.reset();
@@ -1455,8 +1457,9 @@ void MqttGuideBridgeNode::handle_command(const CommandEvent & event)
         event.operation_id, TTS_RESULT_REJECTED, TTS_REASON_BUSINESS_BUSY);
     } else {
       RCLCPP_WARN(
-        get_logger(), "业务互斥: %s进行中，拒绝 type=%s operation_id=%s（回执 failed/busy）",
-        business_name(), event.type.c_str(), event.operation_id.c_str());
+        get_logger(), "业务互斥: %s进行中，拒绝 type=%s operation_id=%s（%s）",
+        business_name(), event.type.c_str(), event.operation_id.c_str(),
+        event.local ? "不发协议回执（语料触发）" : "回执 failed/busy");
       if (!event.local) {
         send_action_result(
           event.type + ".result", event.operation_id,
@@ -1604,8 +1607,9 @@ void MqttGuideBridgeNode::handle_command(const CommandEvent & event)
       business_ = Business::kNone;  // 导览业务到此终止，释放占用
       business_busy_until_.reset();
       RCLCPP_INFO(
-        get_logger(), "停止导航: point=%s operation_id=%s（已回执 failed/aborted）",
-        tour_->current_point().c_str(), event.operation_id.c_str());
+        get_logger(), "停止导航: point=%s operation_id=%s（%s）",
+        tour_->current_point().c_str(), event.operation_id.c_str(),
+        nav_local_ ? "不发协议回执（语料触发的导航）" : "已回执 failed/aborted");
     } else {
       RCLCPP_INFO(
         get_logger(), "停止导航: 无导航在途 no-op operation_id=%s",
@@ -1695,7 +1699,9 @@ void MqttGuideBridgeNode::handle_cancel_qr(const CommandEvent & event)
 //（2026-10-17 现场需求，与 navigate 对齐：未命中即拒绝——映射表是
 // 唯一权威，未命中=表与现场不同步，透传航点名只会把错误下发给
 // 导航模块；播报提示 + 回执 failed:point_not_found，不发起 set_pose
-// 也不占用业务）-> NavExecutor::set_pose 受理（真机经 waypoint_follower 的
+// 也不占用业务；语料触发解析命中即发 relocate.triggered 上报——
+// 2026-10-17 现场确认与 navigate 统一都回推，此后服务不可用/受理被拒
+// 不撤销上报）-> NavExecutor::set_pose 受理（真机经 waypoint_follower 的
 // go_to_waypoints(action=set_pose) **机器人不动**，只发一次 /initialpose
 // 重设定位）-> 置 kRelocate 等待态（占业务互斥，新业务被拒 + 语音提示
 //「我正在重定位，请稍后」）-> worker 每 250ms 轮询验收
@@ -1721,9 +1727,9 @@ void MqttGuideBridgeNode::handle_relocate(const CommandEvent & event)
       event.point_name.c_str(), waypoint.c_str());
   } else {
     RCLCPP_WARN(
-      get_logger(),
-      "重定位被拒绝: 「%s」未命中点位映射表（%zu 条），回执 failed/point_not_found",
-      event.point_name.c_str(), point_map_->size());
+      get_logger(), "重定位被拒绝: 「%s」未命中点位映射表（%zu 条），%s",
+      event.point_name.c_str(), point_map_->size(),
+      event.local ? "不发协议回执（语料触发）" : "回执 failed/point_not_found");
     speak_hint(
       replace_point_placeholder(point_map_unmatched_text_, event.point_name),
       "point_map_unmatched");
@@ -1735,6 +1741,15 @@ void MqttGuideBridgeNode::handle_relocate(const CommandEvent & event)
     return;
   }
 
+  // v0.26.0（P-040）语音触发上报：点位解析命中即上报（2026-10-17 现场
+  // 确认与 navigate 统一都回推——上报点 = 语音触发成立、进入执行流程；
+  // 此后服务不可用/受理被拒属执行故障，不撤销上报。语料触发无 result
+  // 回执，App 拿到的是「语音触发了去该点」的事实，不跟踪后续执行）
+  if (event.local) {
+    send_nav_triggered(
+      RELOCATE_TRIGGERED_TYPE, point_display_name(waypoint, event.point_name));
+  }
+
   // 同步受理（真机毫秒级，受理超时兜底 5s）。受理被拒当场终态：
   // 不占业务、不等待（导航在途的冲突在 handle_command 互斥分支已被拒，
   // 这里的被拒来自服务端其余前置校验）
@@ -1743,9 +1758,13 @@ void MqttGuideBridgeNode::handle_relocate(const CommandEvent & event)
     const char * reason = outcome.point_not_found
       ? RESULT_REASON_POINT_NOT_FOUND
       : RESULT_REASON_LOCALIZATION_FAILED;
+    // 回执文案按来源区分：语料触发不发协议回执（Server 不认识本地 id）
+    const std::string receipt_note = event.local
+      ? std::string("不发协议回执（语料触发）")
+      : "回执 failed/" + std::string(reason);
     RCLCPP_WARN(
-      get_logger(), "%s重定位被拒: 航点「%s」operation_id=%s，回执 failed/%s（%s）",
-      source, waypoint.c_str(), event.operation_id.c_str(), reason,
+      get_logger(), "%s重定位被拒: 航点「%s」operation_id=%s，%s（%s）",
+      source, waypoint.c_str(), event.operation_id.c_str(), receipt_note.c_str(),
       outcome.detail.c_str());
     if (!event.local) {
       send_action_result(
@@ -1791,8 +1810,9 @@ void MqttGuideBridgeNode::finish_relocate(bool verified)
   business_busy_until_.reset();
   if (verified) {
     RCLCPP_INFO(
-      get_logger(), "%s重定位验收通过: 航点「%s」operation_id=%s，回执 success",
-      source, relocate_waypoint_.c_str(), relocate_operation_id_.c_str());
+      get_logger(), "%s重定位验收通过: 航点「%s」operation_id=%s，%s",
+      source, relocate_waypoint_.c_str(), relocate_operation_id_.c_str(),
+      relocate_local_ ? "不发协议回执（语料触发）" : "回执 success");
     if (!relocate_local_) {
       send_action_result(
         RELOCATE_RESULT_TYPE, relocate_operation_id_, ACTION_RESULT_SUCCESS);
@@ -1808,9 +1828,10 @@ void MqttGuideBridgeNode::finish_relocate(bool verified)
       /*mute_mic=*/false);  // 重定位播报：短内容，不静音（唤醒抑制照常）
   } else {
     RCLCPP_WARN(
-      get_logger(),
-      "%s重定位未通过: 航点「%s」operation_id=%s，回执 failed/localization_failed",
-      source, relocate_waypoint_.c_str(), relocate_operation_id_.c_str());
+      get_logger(), "%s重定位未通过: 航点「%s」operation_id=%s，%s",
+      source, relocate_waypoint_.c_str(), relocate_operation_id_.c_str(),
+      relocate_local_ ? "不发协议回执（语料触发，Server 不认识本地 id）"
+                      : "回执 failed/localization_failed");
     if (!relocate_local_) {
       send_action_result(
         RELOCATE_RESULT_TYPE, relocate_operation_id_, ACTION_RESULT_FAILED,
@@ -2138,6 +2159,17 @@ void MqttGuideBridgeNode::speak_hint(const std::string & text, const char * trac
   }
 }
 
+std::string MqttGuideBridgeNode::point_display_name(
+  const std::string & waypoint, const std::string & fallback) const
+{
+  for (const auto & entry : point_map_->points()) {
+    if (entry.code == waypoint) {
+      return entry.name;
+    }
+  }
+  return fallback;
+}
+
 namespace
 {
 // 点位名归一化（去全部空白 + 转小写）：现场映射表 name 的空格风格
@@ -2204,8 +2236,8 @@ void MqttGuideBridgeNode::handle_navigate(const CommandEvent & event)
   // 不启动导航也不占用业务（配好表后 App 重发即可）
   if (point_map_->size() == 0U) {
     RCLCPP_WARN(
-      get_logger(),
-      "导航被拒绝: 点位映射表为空（未配置），回执 failed/point_not_found");
+      get_logger(), "导航被拒绝: 点位映射表为空（未配置），%s",
+      event.local ? "不发协议回执（语料触发）" : "回执 failed/point_not_found");
     speak_hint(point_map_missing_text_, "point_map_missing");
     if (!event.local) {  // 语料触发不发回执，拒绝语音照播（现场能听到）
       send_action_result(
@@ -2229,9 +2261,9 @@ void MqttGuideBridgeNode::handle_navigate(const CommandEvent & event)
       event.point_name.c_str(), waypoint.c_str());
   } else {
     RCLCPP_WARN(
-      get_logger(),
-      "导航被拒绝: 「%s」未命中点位映射表（%zu 条），回执 failed/point_not_found",
-      event.point_name.c_str(), point_map_->size());
+      get_logger(), "导航被拒绝: 「%s」未命中点位映射表（%zu 条），%s",
+      event.point_name.c_str(), point_map_->size(),
+      event.local ? "不发协议回执（语料触发）" : "回执 failed/point_not_found");
     speak_hint(
       replace_point_placeholder(point_map_unmatched_text_, event.point_name),
       "point_map_unmatched");
@@ -2247,13 +2279,7 @@ void MqttGuideBridgeNode::handle_navigate(const CommandEvent & event)
   screen_->cancel("navigate");
   // 引导语显示名（{point} 替换用）：映射表反查 code 对应的车型名，
   // 查不到用原始点位名（表结构上 code 必来自表内，反查失败仅防御）
-  nav_point_display_ = event.point_name;
-  for (const auto & entry : point_map_->points()) {
-    if (entry.code == waypoint) {
-      nav_point_display_ = entry.name;
-      break;
-    }
-  }
+  nav_point_display_ = point_display_name(waypoint, event.point_name);
   RCLCPP_INFO(
     get_logger(), "导航开始: point=%s 讲解词=%zu 条 operation_id=%s",
     waypoint.c_str(), event.texts.size(), event.operation_id.c_str());
@@ -2266,6 +2292,14 @@ void MqttGuideBridgeNode::handle_navigate(const CommandEvent & event)
   tour_->start(waypoint, event.texts);
   business_ = Business::kTour;
   business_busy_until_.reset();  // 导航在途：占用由 tour_->navigating() 表达
+  // v0.26.0（P-040）语音触发上报：语料触发的导航点位解析命中、进入
+  // 执行流程，发布恰好一条 navigate.triggered 回推 App（point_name 取
+  // 映射表显示名；此后服务不可用等执行故障不撤销上报——2026-10-17
+  // 现场确认与 relocate 统一都回推；App 下发的 navigate 不产生本上报
+  // ——App 已知自己触发了什么）
+  if (event.local) {
+    send_nav_triggered(NAVIGATE_TRIGGERED_TYPE, nav_point_display_);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2605,6 +2639,23 @@ void MqttGuideBridgeNode::publish_receipt(
   }
   // 不再单独打回执日志：publish_json 的"MQTT 发出"行已含完整 payload
   publish_json(up_commands_topic_, envelope, 1, false);
+}
+
+void MqttGuideBridgeNode::send_nav_triggered(
+  const std::string & triggered_type, const std::string & point_name)
+{
+  // v0.26.0（P-040）：仅语料触发（event.local）调用方才走到这里——
+  // App 下发指令不产生本上报（App 已知自己触发了什么），本地拒绝
+  //（busy/point_not_found）也不发布，只表达「已开始执行」
+  auto receipt = build_nav_triggered_event(
+    robot_id_, triggered_type, point_name, TRIGGER_VOICE);
+  if (!receipt) {
+    RCLCPP_ERROR(
+      get_logger(), "语音触发上报参数非法: type=%s point=%s（不发送）",
+      triggered_type.c_str(), point_name.c_str());
+    return;
+  }
+  publish_json(up_commands_topic_, receipt->envelope_json, 1, false);
 }
 
 void MqttGuideBridgeNode::publish_presence(const std::string & state, const std::string & reason)

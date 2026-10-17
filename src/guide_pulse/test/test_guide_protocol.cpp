@@ -966,4 +966,71 @@ TEST(CommandEventTest, InvalidNavigateScenePayloadsFillReceiptId)
   EXPECT_TRUE(invalid_op.empty());
 }
 
+// ---------------------------------------------------------------------------
+// 语音触发上报构造（v0.26.0 P-040：navigate.triggered / relocate.triggered
+// 仅上行自主事件，payload {point_name, trigger} 无 operation_id）
+// ---------------------------------------------------------------------------
+using guide_pulse::NAVIGATE_TRIGGERED_TYPE;
+using guide_pulse::RELOCATE_TRIGGERED_TYPE;
+using guide_pulse::TRIGGER_VOICE;
+
+TEST(BuildNavTriggeredTest, EnvelopeShapePerContract)
+{
+  // 两个类型同构：direction=up、payload 恰好 point_name + trigger，
+  // 不得携带 operation_id（契约 additionalProperties=false）
+  for (const char * type : {NAVIGATE_TRIGGERED_TYPE, RELOCATE_TRIGGERED_TYPE}) {
+    const auto receipt = guide_pulse::build_nav_triggered_event(
+      "robot-001", type, "比亚迪ATTO 1", TRIGGER_VOICE);
+    ASSERT_TRUE(receipt.has_value()) << type;
+    const auto envelope = json::parse(receipt->envelope_json);
+    EXPECT_EQ(envelope["spec_version"], "1.0");
+    EXPECT_EQ(envelope["robot_id"], "robot-001");
+    EXPECT_EQ(envelope["direction"], "up");
+    EXPECT_EQ(envelope["type"], type);
+    EXPECT_EQ(envelope["payload"]["point_name"], "比亚迪ATTO 1");
+    EXPECT_EQ(envelope["payload"]["trigger"], "voice");
+    EXPECT_FALSE(envelope["payload"].contains("operation_id"));
+    EXPECT_EQ(envelope["payload"].size(), 2U);
+  }
+}
+
+TEST(BuildNavTriggeredTest, RejectsInvalidArguments)
+{
+  // 未知上报类型（tts.result / navigate.result 均非本构造面的类型）
+  EXPECT_FALSE(guide_pulse::build_nav_triggered_event(
+    "robot-001", "tts.result", "A", TRIGGER_VOICE));
+  EXPECT_FALSE(guide_pulse::build_nav_triggered_event(
+    "robot-001", guide_pulse::NAVIGATE_RESULT_TYPE, "A", TRIGGER_VOICE));
+  // 触发类型可扩展枚举：当前唯一值 voice，其余一律拒绝
+  EXPECT_FALSE(guide_pulse::build_nav_triggered_event(
+    "robot-001", NAVIGATE_TRIGGERED_TYPE, "A", "app"));
+  EXPECT_FALSE(guide_pulse::build_nav_triggered_event(
+    "robot-001", RELOCATE_TRIGGERED_TYPE, "A", ""));
+  // point_name 1..64 Unicode 标量：空串 / 65 标量均非法（按码点非字节）
+  EXPECT_FALSE(guide_pulse::build_nav_triggered_event(
+    "robot-001", NAVIGATE_TRIGGERED_TYPE, "", TRIGGER_VOICE));
+  EXPECT_FALSE(guide_pulse::build_nav_triggered_event(
+    "robot-001", RELOCATE_TRIGGERED_TYPE, std::string(65, 'A'), TRIGGER_VOICE));
+  // 64 个中文 = 64 标量（UTF-8 字节数 192 远大于 64）：合法，验证按码点计
+  std::string cjk64;
+  for (int i = 0; i < 64; ++i) {
+    cjk64 += "点";
+  }
+  EXPECT_TRUE(guide_pulse::build_nav_triggered_event(
+    "robot-001", NAVIGATE_TRIGGERED_TYPE, cjk64, TRIGGER_VOICE));
+}
+
+TEST(BuildNavTriggeredTest, EachBuildGetsFreshEventId)
+{
+  // 一次触发恰好一条：每次构造独立 event_id（QoS 1 重发须由调用方复用
+  // 同一信封原文，与回执面同策略）
+  const auto a = guide_pulse::build_nav_triggered_event(
+    "robot-001", NAVIGATE_TRIGGERED_TYPE, "A", TRIGGER_VOICE);
+  const auto b = guide_pulse::build_nav_triggered_event(
+    "robot-001", NAVIGATE_TRIGGERED_TYPE, "A", TRIGGER_VOICE);
+  ASSERT_TRUE(a.has_value());
+  ASSERT_TRUE(b.has_value());
+  EXPECT_NE(a->event_id, b->event_id);
+}
+
 }  // namespace

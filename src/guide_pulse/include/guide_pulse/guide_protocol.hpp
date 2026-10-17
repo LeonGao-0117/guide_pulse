@@ -9,7 +9,8 @@
 // scene 可选 qr_sha256 迎宾二维码哈希快照 + v0.23.0 navigate.stop
 // + v0.24.0 navigate/scene 一次性结果回执 P-038 + v0.25.0 point_map
 // 点位映射表同步 P-039 + v0.21.0 relocate 地图重定位（2026-10-17 接入
-// MQTT 下行处理，含 relocate.result 回执）)。
+// MQTT 下行处理，含 relocate.result 回执） + v0.26.0 语音触发导航/
+// 重定位上报 navigate.triggered/relocate.triggered P-040）。
 // ============================================================================
 #pragma once
 
@@ -53,6 +54,21 @@ inline constexpr const char * TTS_REASON_BUSINESS_BUSY = "business_busy";
 
 // scene 场景值（可扩展枚举，当前唯一值 welcome；扩枚举须先改契约再改这里）
 inline constexpr const char * SCENE_WELCOME = "welcome";
+
+// ---------------------------------------------------------------------------
+// 语音触发上报（v0.26.0 P-040）：TTS 话术命中 agent_monitor.*_phrases
+// 语料（语音自主触发）并受理开始执行导航/重定位时，发布恰好一条
+// navigate.triggered / relocate.triggered（仅上行，payload {point_name,
+// trigger}，无 operation_id——协议首个不由 App 指令驱动的上行事件，
+// App 下发的指令不产生本上报，本地拒绝触发也不发布）。Server 按
+// event_id 去重后推 App（WebSocket robot.navigation.triggered）
+// ---------------------------------------------------------------------------
+inline constexpr const char * NAVIGATE_TRIGGERED_TYPE = "navigate.triggered";
+inline constexpr const char * RELOCATE_TRIGGERED_TYPE = "relocate.triggered";
+
+// 触发类型 trigger（可扩展枚举，当前唯一值 voice；扩枚举须先改契约
+// 再改这里，同 SCENE_WELCOME 模式）
+inline constexpr const char * TRIGGER_VOICE = "voice";
 
 // ---------------------------------------------------------------------------
 // 一次性最终结果回执（v0.24.0 P-038）：navigate / scene 执行完成或失败
@@ -200,6 +216,16 @@ std::optional<TtsResultReceipt> build_action_result_event(
   const std::string & robot_id, const std::string & result_type,
   const std::string & operation_id, const std::string & outcome,
   const std::string & reason = "");
+
+// 构造 navigate.triggered / relocate.triggered 语音触发上报信封
+//（v0.26.0 P-040，仅上行自主事件）。triggered_type 仅接受
+// NAVIGATE_TRIGGERED_TYPE / RELOCATE_TRIGGERED_TYPE；trigger 仅接受
+// TRIGGER_VOICE（可扩展枚举当前唯一值）；point_name 须为 1..64 个
+// Unicode 标量。payload 无 operation_id（契约：无下发指令可关联）。
+// 参数非法返回 nullopt
+std::optional<TtsResultReceipt> build_nav_triggered_event(
+  const std::string & robot_id, const std::string & triggered_type,
+  const std::string & point_name, const std::string & trigger);
 
 // 生成一轮播放顺序：sequence 原序返回；shuffle 每轮重新洗牌（Fisher-Yates）。
 // 契约建议 shuffle 每轮开始前重新洗牌，避免固定顺序。

@@ -583,6 +583,33 @@ std::optional<TtsResultReceipt> build_action_result_event(
   return build_up_receipt_envelope(robot_id, result_type, std::move(payload));
 }
 
+std::optional<TtsResultReceipt> build_nav_triggered_event(
+  const std::string & robot_id, const std::string & triggered_type,
+  const std::string & point_name, const std::string & trigger)
+{
+  // v0.26.0（P-040）语音触发上报：type 与 trigger 都是可扩展枚举的
+  // 白名单校验；point_name 与下行指令同规（1..64 Unicode 标量，非字节数）
+  if (triggered_type != NAVIGATE_TRIGGERED_TYPE &&
+    triggered_type != RELOCATE_TRIGGERED_TYPE)
+  {
+    return std::nullopt;
+  }
+  if (trigger != TRIGGER_VOICE) {
+    return std::nullopt;
+  }
+  const auto scalars = utf8_scalar_count(point_name);
+  if (scalars < 1U || scalars > POINT_NAME_MAX_SCALARS) {
+    return std::nullopt;
+  }
+  // 契约 additionalProperties=false：payload 恰好 point_name + trigger，
+  // 不得携带 operation_id（自主触发无下发指令可关联，无幂等诉求）
+  json payload = {
+    {"point_name", point_name},
+    {"trigger", trigger},
+  };
+  return build_up_receipt_envelope(robot_id, triggered_type, std::move(payload));
+}
+
 std::vector<std::string> make_round_order(
   const std::vector<std::string> & texts, const std::string & mode)
 {

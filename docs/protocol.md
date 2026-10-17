@@ -1,4 +1,4 @@
-# guide_pulse MQTT 协议说明（RobotCar 协议 v0.25.0 子集）
+# guide_pulse MQTT 协议说明（RobotCar 协议 v0.26.0 子集）
 
 guide_pulse 消费 RobotCar Protocol 正式契约的指令子集，本文只记录
 本工程视角的要点与本地策略；完整契约见
@@ -9,7 +9,7 @@ guide_pulse 消费 RobotCar Protocol 正式契约的指令子集，本文只记�
 | 主题（前缀 `robotCar/v1/robots`，Server 固定值） | 方向 | QoS | Retain |
 | --- | --- | --- | --- |
 | `.../{robot_id}/down/commands` | Server→Robot | 1 | false |
-| `.../{robot_id}/up/commands` | Robot→Server（仅 `tts.result`） | 1 | false |
+| `.../{robot_id}/up/commands` | Robot→Server（回执 + 语音触发上报） | 1 | false |
 | `.../{robot_id}/heartbeat` | Robot→Server | 0 | false |
 | `.../{robot_id}/presence` | Robot/遗嘱 | 1 | true |
 
@@ -145,6 +145,30 @@ payload 仅 `operation_id`（与 `tts.stop` 同构）。契约：停止当前正
 success 禁 reason / failed 必填 reason 按指令枚举 / rejected 必填
 `command_expired`|`invalid_request`）。回执原文缓存重发（同 event_id）。
 `tts.stop` / `navigate.stop` 不得发布任何上行事件（契约）。
+
+### 3.1 `navigate.triggered` / `relocate.triggered`——语音触发上报（v0.26.0 P-040）
+
+协议首个不由 App 指令驱动的上行事件。TTS 话术命中
+`agent_monitor.navigate_phrases` / `agent_monitor.relocate_phrases` 语料
+（语音自主触发）**且受理开始执行**时发布恰好一条：
+
+```json
+{"payload": {"point_name": "比亚迪ATTO 1", "trigger": "voice"}}
+```
+
+- **无 `operation_id`**：自主触发没有下发指令可关联，无幂等诉求
+  （`event_id` 已承担传输去重）；payload 恰好 `point_name` + `trigger`。
+- `point_name`：映射表显示名（`point_map` 的 name，反查失败用原始
+  点位名）；Server 原样转发进 App WebSocket 事件
+  `robot.navigation.triggered`（payload `{command, point_name, trigger}`）。
+- `trigger`：可扩展枚举，当前唯一值 `voice`。
+- **不发布的场景**：App 下发的 `navigate` / `relocate` 指令（App 已知
+  自己触发了什么）；业务互斥 busy 拒绝、点位映射表空/未命中（本地
+  策略拒绝，未进入执行流程）。
+- **仍上报的场景**（2026-10-17 现场确认 navigate/relocate 统一都回推）：
+  点位解析命中进入执行流程后，服务不可用/受理被拒等执行故障不撤销
+  上报——App 拿到的是「语音触发了去该点」的事实，执行结果不跟踪
+  （语料触发无 `*.result` 回执；Server 不认识本地铸造的 operation_id）。
 
 ## 4. 停止播报的实现说明
 

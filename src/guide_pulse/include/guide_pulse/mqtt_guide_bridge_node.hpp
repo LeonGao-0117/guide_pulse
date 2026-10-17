@@ -145,12 +145,25 @@ private:
     const std::string & outcome, const std::string & reason = "");
   // v0.25.0（P-039）point_map.result 同走 send_action_result（共用回执
   // 缓存与幂等通道，无需独立函数）
+  // v0.26.0（P-040）语音触发上报：TTS 话术命中语料自主触发导航/重定位
+  // 且点位解析命中、进入执行流程时发布恰好一条 navigate.triggered /
+  // relocate.triggered（payload {point_name, trigger:voice}，无
+  // operation_id）。2026-10-17 现场确认 navigate/relocate 统一都回推：
+  // 此后服务不可用/受理被拒属执行故障，不撤销上报（语料触发无 result
+  // 回执，App 不跟踪后续执行）。一次性事件不进 receipt_cache_
+  //（无指令重发场景，publish 失败与回执同策略仅告警）
+  void send_nav_triggered(const std::string & triggered_type, const std::string & point_name);
   // 回执发布公共段：查缓存 -> 构造 -> 缓存（含淘汰）-> 发布（worker 线程）
   void publish_receipt(
     const std::string & operation_id, std::optional<TtsResultReceipt> receipt);
   // 播报一条业务拒绝提示（worker 线程）：不强抢进行中的其他播报、
   // 失败仅告警不影响回执；text 空则跳过（配置禁用）。回执由调用方负责
   void speak_hint(const std::string & text, const char * trace_id);
+  // 航点 code -> 映射表显示名（App 界面展示的人话名，如 A ->
+  // 比亚迪ATTO 1）；反查失败返回 fallback（表结构上 code 必来自表内，
+  // 仅防御）。navigate 引导语 {point} 替换与 P-040 语音触发上报共用
+  std::string point_display_name(
+    const std::string & waypoint, const std::string & fallback) const;
   // 导览到达默认讲解词匹配（worker 线程）：指令未携带 texts 时按当前
   // 航点兜底——配置「点位名|讲解词」的点位名与航点 code、映射表反查的
   // name 归一化（去空格+小写）比对，返回命中点位的全部讲解词
