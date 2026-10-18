@@ -16,6 +16,8 @@ namespace
 
 constexpr const char * kToBiped = "QUADRUPED_TO_BIPED_ROTATE";
 constexpr const char * kBipedTarget = "BIPED_LOCOMOTION_WBC";
+constexpr const char * kToQuadruped = "BIPED_TO_QUADRUPED";
+constexpr const char * kQuadrupedTarget = "QUADRUPED_LOCOMOTION_DEFAULT";
 
 // 趴姿集合的每个动作都在路径表里有起点（否则趴姿查表会走到「未知路径」
 // 分支，与「默认扶起」语义矛盾）
@@ -73,6 +75,62 @@ TEST(McTransformTables, ReasonTextCoverage)
   }
   for (int reason : {0, 1, 99, -1}) {
     EXPECT_TRUE(mc_reason_text(reason).empty()) << "未知 reason=" << reason << " 应返回空串";
+  }
+}
+
+// ---- 四足方向路径表（2026-10-18 迎宾准备模式）不变式 ----
+
+// 趴姿集合的每个动作在四足路径表里也有起点（否则趴姿查表会走到
+// 「未知路径」分支，与「默认扶起」语义矛盾）
+TEST(McTransformQuadrupedTables, DownActionsAllHavePaths)
+{
+  for (const auto & action : mc_down_actions()) {
+    EXPECT_TRUE(mc_path_to_quadruped().count(action) > 0)
+      << "趴姿动作缺少四足路径表起点: " << action;
+  }
+}
+
+// 非空路径必须以变形动作（B2Q 自动落四足行走态）或四足站立（趴姿扶起
+// 的终点）收尾，且不含空串步骤
+TEST(McTransformQuadrupedTables, EveryPathEndsInQuadruped)
+{
+  for (const auto & [start, path] : mc_path_to_quadruped()) {
+    if (path.empty()) {
+      continue;  // 空路径 = 已是四足只收摄像头，合法
+    }
+    EXPECT_TRUE(path.back() == kToQuadruped || path.back() == "QUADRUPED_STAND_DEFAULT")
+      << "起点 " << start << " 的路径未以四足形态收尾";
+    for (const auto & step : path) {
+      EXPECT_FALSE(step.empty()) << "起点 " << start << " 的路径含空步骤";
+    }
+  }
+}
+
+// 四足起点（快速通道集合）的路径为空，且都在路径表里（已达标：只收
+// 摄像头不动作）
+TEST(McTransformQuadrupedTables, QuadrupedStartsNeedNoAction)
+{
+  for (const auto & action : mc_quadruped_actions()) {
+    const auto it = mc_path_to_quadruped().find(action);
+    ASSERT_NE(it, mc_path_to_quadruped().end())
+      << "四足动作不在路径表: " << action;
+    EXPECT_TRUE(it->second.empty())
+      << "四足动作 " << action << " 不应再有动作步骤";
+  }
+  EXPECT_GT(mc_quadruped_actions().count(kQuadrupedTarget), 0);
+}
+
+// 中间步骤只允许出现在已知动作集合内（被动急停/四足站立/变形）
+TEST(McTransformQuadrupedTables, IntermediateStepsAreKnown)
+{
+  const std::set<std::string> known = {
+    "PASSIVE_DEFAULT", "QUADRUPED_STAND_DEFAULT", kToQuadruped,
+  };
+  for (const auto & [start, path] : mc_path_to_quadruped()) {
+    for (const auto & step : path) {
+      EXPECT_TRUE(known.count(step) > 0)
+        << "起点 " << start << " 的中间步骤不在已知集合: " << step;
+    }
   }
 }
 

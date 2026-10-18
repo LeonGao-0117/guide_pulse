@@ -162,6 +162,11 @@ success 禁 reason / failed 必填 reason 按指令枚举 / rejected 必填
   点位名）；Server 原样转发进 App WebSocket 事件
   `robot.navigation.triggered`（payload `{command, point_name, trigger}`）。
 - `trigger`：可扩展枚举，当前唯一值 `voice`。
+- **配套终态（2026-10-18 现场需求）**：语料触发的导航被 `navigate.stop`
+  停止时，也发一条 `navigate.result`（`failed/aborted`），`operation_id`
+  用触发时本地生成的 uuid（与 `navigate.triggered` 一样无下发指令可
+  关联，Server 侧按孤儿终态处理或与 triggered 事件按时间序对应）——
+  后端对语音触发的导览既有「开始」也有「被停止」终态可感知。
 - **不发布的场景**：App 下发的 `navigate` / `relocate` 指令（App 已知
   自己触发了什么）；业务互斥 busy 拒绝、点位映射表空/未命中（本地
   策略拒绝，未进入执行流程）。

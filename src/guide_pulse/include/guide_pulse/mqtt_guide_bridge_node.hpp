@@ -83,9 +83,13 @@ private:
   void connect_loop();                     // 连接管理线程：enroll -> 连接 -> 重试
   void worker_loop();
   void maintain_connection();   // 回调线程外的订阅恢复/上线通告（防 paho 自死锁）
-  void handle_command(const CommandEvent & event);  // tts / tts.stop / scene / navigate / navigate.stop / point_map / show_qr / cancel_qr / relocate（MQTT 下行 + 本地注入）
+  void handle_command(const CommandEvent & event);  // tts / tts.stop / scene / navigate / navigate.stop / point_map / show_qr / cancel_qr / relocate / welcome_prep（MQTT 下行 + 本地注入）
   void handle_scene(const CommandEvent & event);        // 迎宾模块入口
   void handle_navigate(const CommandEvent & event);     // 讲解模块入口
+  // 迎宾准备模块入口（2026-10-18 现场需求，仅本地注入：AgentMonitor 命中
+  // agent_monitor.welcome_prep_phrases 语料）：先确保人形（导航前置）->
+  // 导航去迎宾点 -> 到达后变四足收摄像头 -> 播就位语。不发协议回执
+  void handle_welcome_prep(const CommandEvent & event);
   void handle_point_map(const CommandEvent & event);    // 点位映射表全量替换入口（v0.25.0）
   void handle_show_qr(const CommandEvent & event);      // 语料触发二维码显示入口（本地注入，占业务互斥 20s）
   void handle_cancel_qr(const CommandEvent & event);    // 语料触发取消二维码显示入口（本地注入，占业务互斥 20s）
@@ -281,10 +285,21 @@ private:
   std::string busy_hint_relocate_text_; // 互斥拒绝提示（重定位中，空=不播）
   std::string busy_hint_navigate_text_; // 互斥拒绝提示（导航在途，空=不播）
   std::string navigate_failed_text_;    // 导航失败提示（回执后播，空=不播）
+  std::string navigate_transform_failed_text_;  // 变形未确认双足拒绝下发的
+                                       // 提示（navigate/relocate 共用，空=不播）
   std::string relocate_failed_text_;    // 重定位失败提示（回执后播，空=不播）
   // 导览受理成功后的引导语（2026-10-17 现场需求：确认 [导航] 收到应答
   // accepted=true 后播「请跟我来…」；{point} 替换点位显示名。空=禁用）
   std::string navigate_lead_text_;
+  // 导航出发播报语（2026-10-18 现场需求）：收到导航指令（语音/MQTT）
+  // 受理后先播「稍等，马上出发」再起身变形人形（先开口、立刻动）；
+  // 迎宾准备去迎宾点的导航不播（agent 已说过「好嘞，马上前去迎宾点」，
+  // handle_welcome_prep 独立链路天然跳过）。空=禁用
+  std::string navigate_depart_text_;
+  // 重定位出发播报语（2026-10-18 现场需求）：仅 MQTT 下行的 relocate
+  // 先播「马上开始重定位，请稍后」再起身变形人形；语料触发不播（agent
+  // 已说「好的，这就在A点开始重定位」）。空=禁用
+  std::string relocate_depart_text_;
   std::string nav_point_display_;       // 本次导航点位显示名（映射表 name，引导语用）
   // ---- 点位映射表（v0.25.0 P-039）----
   std::string point_map_file_;          // 落盘路径（空=纯内存，联调用）
@@ -298,6 +313,14 @@ private:
   // 触发）时到达后按点位兜底播报；空表 = 关闭（到达不播报）
   std::vector<std::pair<std::string, std::string>> nav_default_texts_;
   std::unique_ptr<PointMapStore> point_map_;  // 表本体（仅 worker 线程访问，免锁）
+  // ---- 迎宾准备（2026-10-18 现场需求）----
+  // 迎宾准备就位播报语：语料触发导航去迎宾点，到达变四足（摄像头收平）
+  // 后最后播报（如「元气满满，做好准备迎接顾客」）。空串 = 禁用
+  std::string welcome_prep_done_text_;
+  // 当前在途导航是否迎宾准备（本地注入）：是则到达后变四足 + 播就位语，
+  // 不做默认车型讲解词兜底、不播 navigate 引导语；仅 worker 线程访问
+  bool nav_welcome_prep_{false};
+
   // ---- 迎宾变形（scene=welcome 时确保人形形态）：由 McTransform 模块
   // 承担，参数校验在 start() 内完成（welcome_transform 等）----
 
@@ -394,7 +417,7 @@ private:
   // ---- 重定位等待态（2026-10-17：业务终态 = 导航模块验收结果，非受理）。
   // 仅 worker 线程访问，免锁；relocate_pending_=true 期间业务互斥生效
   //（新业务被拒 + TTS 提示「我正在重定位，请稍后」），终态/超时清空 ----
-  bool relocate_pending_{false};      // 已受理、等待 waypoint_follower 验收
+  bool relocate_pending_{false};      // 已受理、等待导航模块验收（set_pose goal result）
   std::string relocate_operation_id_;  // 在途重定位的 operation_id（回执用）
   std::string relocate_waypoint_;      // 解析后的航点名（验收轮询匹配用）
   std::string relocate_point_name_;    // 原始 point_name（默认播报文案用）

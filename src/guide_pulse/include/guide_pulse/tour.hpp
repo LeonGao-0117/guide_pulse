@@ -128,7 +128,7 @@ private:
     std::string detail;
   };
 
-  // 受理结果单槽（SPSC 同上）：go_to_waypoints 应答到达时发布
+  // 受理结果单槽（SPSC 同上）：导航 goal 受理（或被拒试探现形）时发布
   struct AcceptedSlot
   {
     std::uint64_t seq;

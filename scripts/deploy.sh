@@ -252,7 +252,7 @@ build_workspace() {
   log "colcon 编译（-j${JOBS}，${COLCON_WORKERS} 个包一起编）"
   colcon build \
     --symlink-install \
-    --packages-select aimdk_msgs guide_pulse \
+    --packages-select aimdk_msgs liwei_nav_msgs guide_pulse \
     --parallel-workers "${COLCON_WORKERS}" \
     --cmake-args -DCMAKE_BUILD_TYPE=Release
 

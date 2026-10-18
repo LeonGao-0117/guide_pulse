@@ -13,7 +13,7 @@
 | --- | --- | --- | --- |
 | 迎宾 | `scene`：`scene="welcome"` + 可选 `texts` | `scene.result`（v0.24.0） | 播迎宾词一轮（`texts` 缺省用本地默认词）；流程主体完成（变形结束+二维码上屏+会话已立）回 `success`，忙碌回 `failed/busy` |
 | 导航 + 汽车讲解 | `navigate`：`point_name` 必填 + 可选 `texts` | `navigate.result`（v0.24.0） | 本地导航到点位，到达回 `success`（讲解词播报与否不影响结果）后按序播讲解词一轮；失败回 `failed/navigation_failed`；被 `navigate.stop`/`tts.stop` 中止回 `failed/aborted`；忙碌回 `failed/busy` |
-| 地图重定位 | `relocate`：`point_name` 必填 + 可选 `texts`（v0.21.0，2026-10-17 接入） | `relocate.result` | **不可打断的互斥业务**：`point_name` 经点位映射表解析 -> `set_pose` 重设定位初值（机器人不动）-> 等待导航模块验收（worker 250ms 轮询 `status_json` 的 `set_pose.verified`，真机受理后 ~1.5s 出结果）-> 验收通过回 `success` 并播报（`texts` 缺省播「{point_name}点重定位成功」），验收失败/`relocate_timeout_seconds`（默认 30s）超时回 `failed/localization_failed`；受理被拒当场回 `failed/point_not_found`（航点名不在航点表，available 结构化判定）或 `failed/localization_failed`（其余归并）。等待期占业务互斥：新业务回 `failed/busy` 并播「我正在重定位，请稍后」（迎宾/播报/讲解中正在出声，被拒时不播提示）；`tts.stop` 不中止等待（初值已发，终态由导航模块给出） |
+| 地图重定位 | `relocate`：`point_name` 必填 + 可选 `texts`（v0.21.0，2026-10-17 接入） | `relocate.result` | **不可打断的互斥业务**：`point_name` 经点位映射表解析 -> `set_pose` goal 重设定位初值（机器人不动）-> 等待导航模块验收（worker 250ms 轮询 goal 的 result（服务端验收完才回），真机受理后 ~1.5s 出结果）-> 验收通过回 `success` 并播报（`texts` 缺省播「{point_name}点重定位成功」），验收失败/`relocate_timeout_seconds`（默认 30s）超时回 `failed/localization_failed`；受理被拒当场回 `failed/point_not_found`（航点名不在航点表，query 服务 available 结构化判定）或 `failed/localization_failed`（其余归并）。等待期占业务互斥：新业务回 `failed/busy` 并播「我正在重定位，请稍后」（迎宾/播报/讲解中正在出声，被拒时不播提示）；`tts.stop` 不中止等待（初值已发，终态由导航模块给出） |
 | 独立播报 | `tts`：`texts`+`mode`+`interval_seconds` | `tts.result` | 列表单轮播完自行结束（2026-10-14 变更，原为沿用 tts_demo 列表循环播报） |
 | 停止 | `tts.stop` | 无 | 停止一切播报并取消进行中的导航（本地策略，被取消的导航回 `failed/aborted`） |
 | 停止导航 | `navigate.stop` | 无 | 只取消在途导航（被取消的导航回 `failed/aborted`；无导航 no-op） |
@@ -32,15 +32,16 @@
   （同 operation_id 再次到达）重发**同一信封**（同 event_id，receipt 缓存）。
 - **回执时机**：受理即终态的（忙碌/过期/载荷非法）当场回；执行类的在
   终态确定时回（到达/失败/中止/迎宾流程完成；relocate 的终态是导航模块
-  的**验收结果**——`set_pose.verified`，不是受理应答：受理成功后等待
+  的**验收结果**——set_pose goal 的 result，不是受理应答：受理成功后等待
   验收（真机 ~1.5s），验收通过/失败/超时（`relocate_timeout_seconds`
   默认 30s）才回 `relocate.result` 并释放业务占用）。回执信封发送时
   生成，执行耗时不受指令信封 TTL 约束。
 - **reason 归并**：导航失败统一 `navigation_failed`（NavOutcome 无结构化
   分类，不猜 point_not_found/localization_lost）。重定位例外：
-  `point_not_found` 由服务端回带的 available 清单结构化判定（点名不在
-  合法航点清单 = point_not_found），其余被拒（导航在途之外的状态冲突/
-  非站立人形/定位未起）与服务不可用归并 `localization_failed`。
+  `point_not_found` 由 `/liwei_navigation/query` 服务回带的 available
+  清单结构化判定（点名不在合法航点清单 = point_not_found），其余被拒
+  （导航在途之外的状态冲突/非站立人形/定位未起）与服务不可用归并
+  `localization_failed`。
 - **本地注入不发回执**：语料触发（`event.local`）的 operation_id 为本地
   生成，Server 不认识（对应不到已下发指令的结果只记日志）。
 - **掉线/重启无回执**：进程重启即丢失在途状态，契约允许无回执
@@ -138,7 +139,9 @@
    `src/aimdk_msgs` 已按固件版补齐该字段；
 1b. **播报伴随动作**（2026-10-15）：每条语音（迎宾/讲解/tts）PlayTts
    受理成功时从 `motion_preset_ids` 轮换池取一个 `SetMcPresetMotion`
-   预设动作触发（默认 1001 右手挥手打招呼），动作与语音并行、
+   预设动作触发（2026-10-18 现场需求：讲解动作幅度加大，改用 T1
+   说话动作族 2004~2009 轮换；此前 1001 右手挥手→2003 双手说话动作
+   均已弃用），动作与语音并行、
    `interrupt=true` 打断上一个伴随动作；worker 同步短超时调用（正常
    毫秒级），失败仅 WARN 不重试不阻断播报。独立于迎宾变形开关；
 2. 确定迎宾词：指令 `texts` 优先，缺省用参数 `welcome_default_texts`；
@@ -279,18 +282,19 @@
   每条格式「航点名|语料」，如「A|好的，这就在展厅A点开始重定位」，展厅
   A~E 五点各一条；航点名即 t1_slam_nav_ws 航点文件点位名）命中 ->
   本地注入 `relocate` 指令（event.local，与 MQTT 下行同 worker 串行链路）
-  -> `NavExecutor::set_pose`：真机经 waypoint_follower 的
-  `go_to_waypoints(action=set_pose)` 把定位初值重设到该航点——**机器人
-  不动**，前提是人工已把机器人摆到该点位并对准朝向（朝向比位置更要紧，
-  见 GoToWaypoints.md）。受理**不是终态**：占用 kRelocate 业务，worker
-  250ms 轮询验收（`status_json` 的 `set_pose.verified`，真机 ~1.5s 出
-  结果；`relocate_timeout_seconds` 默认 30s 超时兜底），验收通过才播报
+  -> `NavExecutor::set_pose`：真机发 `/liwei_navigation/navigate` 的
+  `set_pose` goal 把定位初值重设到该航点——**机器人不动**，前提是
+  人工已把机器人摆到该点位并对准朝向（朝向比位置更要紧，见
+  NavigateAction.md）。受理**不是终态**：占用 kRelocate 业务，worker
+  250ms 轮询验收（goal 的 result（服务端验收完才回，通常零点几秒），
+  真机 ~1.5s 出结果；`relocate_timeout_seconds` 默认 30s 超时兜底），
+  验收通过才播报
   （缺省「{point_name}点重定位成功」）。本地注入不发协议回执（Server
   不认识其 operation_id）。与 MQTT 下行 relocate 同受业务互斥约束
   （见下条）。冷却按「action+航点名」独立计时（五点互不挤占）；mock
   执行器 `mock_relocate_hold_polls` 模拟验收延迟（联调/集成测试用）。
 - **重定位互斥与忙碌提示（2026-10-17）**：relocate 是不可打断业务——
-  等待验收期间（受理 -> verified/超时）新业务指令（tts/navigate/scene/
+  等待验收期间（受理 -> result/超时）新业务指令（tts/navigate/scene/
   relocate）一律拒绝：tts 回 `rejected(business_busy)`，其余回各自
   `*.result(failed, busy)`；`tts.stop`/`navigate.stop` 不中止等待（初值
   已发，终态由导航模块给出；等待期无会话无导航，两 stop 对它本就 no-op，
@@ -326,22 +330,33 @@ class NavExecutor {
   - `mock`（默认）：`MockNavExecutor`，`mock_nav_seconds` 秒后回调到达
     （默认 0=立即），`cancel()` 丢弃回调。联调与集成测试用。
   - `waypoint`（真机）：`WaypointNavExecutor`，对接 `/opt/liwei/t1_slam_nav_ws`
-    航点巡航节点（节点名 `waypoint_follower`），已实现（含进程内 Mock 服务
-    单测：导航受理/终态/取消 6 个 + 重定位 set_pose 受理/拒因分类 3 个 +
-    验收轮询 status_json 解析 1 个）：
-    - `/waypoint_follower/go_to_waypoints`：`waypoints=[point_name]`、
-      `return_to_quadruped=false`（讲解机器人保持人形）、action 缺省 go；
-      `accepted` 只表示「已开始执行」；
-    - `/waypoint_follower/get_status`：1s 轮询，终态
-      `SUCCEEDED`（到达）/ `FAILED` / `CANCELLED`（失败回调，带 reason）
-      停住不回落，判定安全；`awaiting_pose` 时 RUNNING 但未动，继续等；
-      轮询兜底超时 600s；
-    - `/waypoint_follower/cancel`（Trigger）：取消当前任务就地停。
+    的导航 action（接口文档 `t1_slam_nav_ws/docs/NavigateAction.md`），
+    已实现（含进程内 Mock action 服务单测：导航受理/终态/被拒/取消 +
+    重定位 set_pose 受理/拒因分类/验收轮询）：
+    - action `/liwei_navigation/navigate`
+      （`liwei_nav_msgs/action/Navigate`）：去航点、取消、重定位都是发
+      一个 goal，`command` 区分。`goto_point` 发 `command=go`、
+      `waypoints=[point_name]`、`return_to_quadruped=false`（讲解机器人
+      保持人形），结果经 action result 直接回给客户端（终态
+      `SUCCEEDED`（到达）/ `FAILED` / `CANCELLED`，轮询兜底超时 600s）；
+      取消走 action 自带的 `cancel_goal`（停在原地、保持人形）。
+    - **被拒的 goal 也先「已接受」**，随后马上以 `state=REJECTED` 的
+      result 结束（action 拒绝应答带不了文字，导航栈刻意如此）——受理
+      判定不看 goal 应答，统一在 goal 应答后做 500ms（go）/ 1s（set_pose）
+      的 result 试探：REJECTED 毫秒级紧随 goal 应答，试探窗口内现形即按
+      被拒处理（go 不播受理引导语、set_pose 同步返回失败）。
+    - `set_pose`（重定位）goal 的 result 即验收终态（服务端发完初始
+      位姿并验收完才回，通常零点几秒、最多 ~3s）；受理后 result 未回
+      时挂起由 `poll_set_pose_verified` 消费（250ms 轮询，语义与验收
+      三态一致）。拒因分类：goal 被拒时查 `/liwei_navigation/query`
+      的 `available` 清单做 `point_not_found` 结构化判定（点名不在
+      清单 = point_not_found，其余归并 localization_failed）。
     - 协议 `point_name` 直接映射航点名（航点文件即本地「点位→坐标」
       映射表，恰好满足契约「映射归 Robot 本地」）。
     - 真机启用：`config/guide_pulse.yaml` 设 `nav_executor: "waypoint"`，
-      前置条件：t1_slam_nav_ws 航点巡航（阶段 5）在该机上可用。
-    - 服务消息包已拷贝内置 `src/waypoint_nav_msgs`（拷自 t1_slam_nav_ws）。
+      前置条件：t1_slam_nav_ws 导航栈（liwei_navigation）在该机上可用。
+    - 接口包已拷贝内置 `src/liwei_nav_msgs`（拷自 t1_slam_nav_ws；
+      接口包更新后客户端必须重编——Humble 只按类型名匹配不核对字段）。
 - 本工程不存地图；航点表归 t1_slam_nav_ws 的航点文件维护。
 
 ## 5. 关键参数（config/guide_pulse.yaml）
@@ -352,7 +367,7 @@ class NavExecutor {
 | `broker_uri` / `enroll_origin` / `serial_number(_file)` | 同 tts_demo | enroll 凭 SN 换 MQTT 凭据 |
 | `welcome_default_texts` | `["欢迎光临！我是展厅讲解机器人，很高兴为您服务。"]` | scene 未带 texts 时的迎宾词 |
 | `agent_monitor.relocate_phrases` | `[]` | 语料触发重定位：每条「航点名\|语料」，命中 -> 该航点 set_pose 重定位（空=关闭） |
-| `relocate_timeout_seconds` | `30` | 重定位等待导航模块验收的超时（真机 ~1.5s 出结果，此值兜底 status 丢失/服务卡死；超时按 failed/localization_failed 收尾） |
+| `relocate_timeout_seconds` | `30` | 重定位等待导航模块验收的超时（set_pose goal 的 result（验收完才回，正常 ~1.5s），此值兜底 result 丢失/服务卡死；超时按 failed/localization_failed 收尾） |
 | `busy_hint_relocate_text` | `"我正在重定位，请稍后"` | 业务互斥拒绝提示（重定位等待期播；空=禁用） |
 | `busy_hint_navigate_text` | `"我正在导航，请稍后"` | 业务互斥拒绝提示（导航在途播；空=禁用；迎宾/播报/讲解中恒不播——正在出声） |
 | `mock_relocate_hold_polls` | `0` | Mock 重定位验收等待窗口（poll 次数，~250ms/次；联调/集成测试用） |

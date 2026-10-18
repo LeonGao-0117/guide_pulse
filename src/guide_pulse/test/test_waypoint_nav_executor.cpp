@@ -1,169 +1,188 @@
 // ============================================================================
-// WaypointNavExecutor 单元测试：进程内拉起 Mock 航点巡航服务端
-//（go_to_waypoints / cancel 两个服务 + status 话题推送），校验
-// 受理拒绝、终态判定（SUCCEEDED/FAILED）、RUNNING->SUCCEEDED 转移与取消语义。
+// WaypointNavExecutor 单元测试：进程内拉起 Mock Navigate action 服务端
+//（liwei_nav_msgs/action/Navigate + /query 服务），校验受理/被拒试探、
+// 终态判定（SUCCEEDED/FAILED/REJECTED）、set_pose 受理与验收轮询、取消语义。
 // 夹具模式沿用 test_tts_client.cpp（进程内服务 + MultiThreadedExecutor）。
-// 状态通道对齐真机 follower_node：不再提供 get_status 服务，每次状态变化
-// 向 ~/status（std_msgs/String，latched JSON 快照）推一帧。
+// 对齐真机语义（NavigateAction.md）：被拒的 goal 也先「已接受」，拒因走
+// result 的 state=REJECTED（毫秒级）；set_pose 的 result 即验收终态。
 // ============================================================================
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
 #include <gtest/gtest.h>
-#include <nlohmann/json.hpp>
 #include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/string.hpp>
-#include <std_srvs/srv/trigger.hpp>
-#include <waypoint_nav_msgs/srv/go_to_waypoints.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
+
+#include <liwei_nav_msgs/action/navigate.hpp>
+#include <liwei_nav_msgs/srv/query.hpp>
 
 #include "guide_pulse/waypoint_nav_executor.hpp"
 
 namespace
 {
 
-using GoToWaypoints = waypoint_nav_msgs::srv::GoToWaypoints;
-using Trigger = std_srvs::srv::Trigger;
+using Navigate = liwei_nav_msgs::action::Navigate;
+using GoalHandleNavigate = rclcpp_action::ServerGoalHandle<Navigate>;
+using Query = liwei_nav_msgs::srv::Query;
 
 // ---------------------------------------------------------------------------
-// Mock 航点巡航服务端：记录 go_to_waypoints 请求，按预设返回受理结果；
-// 状态变化即向 status 话题推 JSON 快照帧；cancel 置 CANCELLED
+// Mock 导航 action 服务端：记录 goal 字段，execute 按预设立即给终态
+//（REJECTED/FAILED/SUCCEEDED）或挂起等测试触发；cancel 终结挂起 goal；
+// /query 回带合法航点清单（set_pose 拒因 point_not_found 的结构化判定依据）
 // ---------------------------------------------------------------------------
-class MockWaypointServer final : public rclcpp::Node
+class MockNavigateServer final : public rclcpp::Node
 {
 public:
-  MockWaypointServer()
-  : Node("mock_waypoint_server")
+  MockNavigateServer()
+  : Node("mock_navigate_server")
   {
-    goto_service_ = create_service<GoToWaypoints>(
-      "/test/waypoint_nav/go_to_waypoints",
+    action_server_ = rclcpp_action::create_server<Navigate>(
+      this, "/test/navigate",
       [this](
-        const std::shared_ptr<GoToWaypoints::Request> request,
-        std::shared_ptr<GoToWaypoints::Response> response) {
-        last_waypoints_ = request->waypoints;
-        last_return_to_quadruped_ = request->return_to_quadruped;
-        last_action_ = request->action;
-        goto_count_++;
-        response->accepted = next_accepted_.load();
-        response->message = next_accepted_.load() ? "ok" : "任务冲突：已有任务在跑";
-        // 真机语义（follower_node._srv_goto）：available 无论受理与否都回带
-        // 全部合法航点名（set_pose 拒因 point_not_found 的结构化判定依据）
-        response->available = available();
-        response->plan = request->waypoints;
-        if (next_accepted_.load()) {
-          // 受理即开始任务：置 RUNNING；auto_terminal 非空则直接进入该终态
-          //（模拟"任务很快完成/失败"；持续 RUNNING 由测试切状态）。
-          // 受理帧先于服务应答发布（真机 _begin_set_pose 同款时序）
+        const rclcpp_action::GoalUUID &,
+        std::shared_ptr<const Navigate::Goal> goal) {
+        {
           std::lock_guard<std::mutex> lock(mutex_);
-          const auto terminal = auto_terminal_;
-          snapshot_["state"] = terminal.empty() ? "RUNNING" : terminal;
-          if (request->action == "set_pose") {
-            // 真机 follower_node._begin_set_pose：受理时同步覆盖 set_pose
-            // 记录（verified 重置 null），应答前先推这帧
-            snapshot_["set_pose"] = {
-              {"waypoint", request->waypoints.empty() ? "" : request->waypoints[0]},
-              {"sent", true}, {"verified", nullptr}};
-          }
-          publish_no_lock();
+          last_command_ = goal->command;
+          last_waypoints_ = goal->waypoints;
+          last_return_to_quadruped_ = goal->return_to_quadruped;
+          goal_count_++;
         }
-      });
-    cancel_service_ = create_service<Trigger>(
-      "/test/waypoint_nav/cancel",
-      [this](
-        const std::shared_ptr<Trigger::Request>,
-        std::shared_ptr<Trigger::Response> response) {
+        // 真机语义：被拒也 accept（拒因走 result 的 REJECTED）
+        return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+      },
+      [this](const std::shared_ptr<GoalHandleNavigate> goal_handle) {
         cancel_count_++;
+        // Humble：本回调返回 ACCEPT 后 rcl 才把 goal 转 CANCELING——
+        // 直接在 EXECUTING 上调 canceled() 是非法转移。终结交给
+        // 一次性 timer（回调返回后触发，goal 已在 CANCELING）
         std::lock_guard<std::mutex> lock(mutex_);
-        snapshot_["state"] = "CANCELLED";
-        publish_no_lock();
-        response->success = true;
-        response->message = "cancelled";
+        if (goal_handle != pending_gh_) {
+          return rclcpp_action::CancelResponse::ACCEPT;  // 已终结：忽略
+        }
+        cancel_timer_ = create_wall_timer(
+          std::chrono::milliseconds(10), [this, goal_handle]() {
+            cancel_timer_->cancel();  // 一次性
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (pending_gh_ != goal_handle) {
+              return;
+            }
+            pending_gh_.reset();
+            auto result = std::make_shared<Navigate::Result>();
+            result->state = "CANCELLED";
+            result->message = "cancelled";
+            goal_handle->canceled(result);
+          });
+        return rclcpp_action::CancelResponse::ACCEPT;
+      },
+      [this](std::shared_ptr<GoalHandleNavigate> goal_handle) {
+        const auto goal = goal_handle->get_goal();
+        auto result = std::make_shared<Navigate::Result>();
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto auto_result = auto_result_;
+        result->message = (auto_result == "REJECTED") ? reject_message_
+          : (auto_result == "FAILED" ? fail_reason_ : "ok");
+        result->state = auto_result.empty() ? "" : auto_result;
+        result->success = (auto_result == "SUCCEEDED");
+        if (auto_result.empty()) {
+          pending_gh_ = goal_handle;  // 挂起：等测试触发/取消后终结
+          return;
+        }
+        finish_no_lock(goal_handle, result, auto_result);
       });
-    // status 话题：QoS 与真机 _LATCHED 对齐（执行器订阅 transient_local，
-    // 这里 volatile 发布会 QoS 不兼容、安静连不上）
-    status_pub_ = create_publisher<std_msgs::msg::String>(
-      "/test/waypoint_nav/status",
-      rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
+    // /query：只读状态快照（available 清单供拒因分类）
+    query_service_ = create_service<Query>(
+      "/test/navigate/query",
+      [this](
+        const std::shared_ptr<Query::Request>,
+        std::shared_ptr<Query::Response> response) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        response->available = available_;
+        response->state = "IDLE";
+      });
   }
 
-  // 状态/原因由 executor 线程（服务回调）写、测试线程读：mutex 保护
-  //（std::atomic<std::string> 非平凡可拷贝，不可用）
-  void set_state(const std::string & s)
+  // 预设 execute 结果：SUCCEEDED（默认）/ FAILED / REJECTED / ""（挂起）
+  void set_auto_result(const std::string & r, const std::string & message = "")
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    snapshot_["state"] = s;
-    publish_no_lock();
-  }
-  void set_reason(const std::string & r)
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    snapshot_["reason"] = r;
-    publish_no_lock();
+    auto_result_ = r;
+    if (r == "REJECTED") {
+      reject_message_ = message;
+    } else if (r == "FAILED") {
+      fail_reason_ = message;
+    }
   }
 
-  // 服务端合法航点名清单（available 回带；默认含 A/B/home 三点）
+  // 挂起 goal 的测试侧终结（真机「走到/失败」对应面）
+  void finish_succeed()
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!pending_gh_) {
+      return;
+    }
+    auto result = std::make_shared<Navigate::Result>();
+    result->state = "SUCCEEDED";
+    result->success = true;
+    result->message = "ok";
+    finish_no_lock(pending_gh_, result, "SUCCEEDED");
+    pending_gh_.reset();
+  }
+  void finish_fail(const std::string & reason)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!pending_gh_) {
+      return;
+    }
+    auto result = std::make_shared<Navigate::Result>();
+    result->state = "FAILED";
+    result->success = false;
+    result->message = reason;
+    finish_no_lock(pending_gh_, result, "FAILED");
+    pending_gh_.reset();
+  }
+
+  // 服务端合法航点名清单（query 回带；默认含 A/B/home 三点）
   void set_available(const std::vector<std::string> & names)
   {
     std::lock_guard<std::mutex> lock(mutex_);
     available_ = names;
   }
-  std::vector<std::string> available()
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return available_;
-  }
 
-  // 注入任意快照字段（set_pose.verified 等）：合法 JSON 合并进快照后
-  // 推帧；非法 JSON 原样推坏帧（测执行器解析容错——真机不会发，防御在）
-  void set_status_json(const std::string & j)
+  // goal 字段快照（goal 回调线程写、测试线程读：mutex 保护）
+  std::string last_command_;               // 最近 goal 的 command（go/set_pose）
+  std::vector<std::string> last_waypoints_;
+  bool last_return_to_quadruped_{false};
+  std::atomic<int> goal_count_{0};
+  std::atomic<int> cancel_count_{0};
+
+private:
+  // 持锁终结挂起/即时 goal（status 码与 state 对齐：REJECTED/FAILED -> ABORTED）
+  void finish_no_lock(
+    const std::shared_ptr<GoalHandleNavigate> & gh,
+    const std::shared_ptr<Navigate::Result> & result, const std::string & auto_result)
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    try {
-      snapshot_.update(nlohmann::json::parse(j));
-      publish_no_lock();
-    } catch (const nlohmann::json::exception &) {
-      raw_publish_no_lock(j);
+    if (auto_result == "SUCCEEDED") {
+      gh->succeed(result);
+    } else {
+      gh->abort(result);  // REJECTED / FAILED（真机两者都是 goal ABORTED）
     }
   }
 
-  std::atomic<bool> next_accepted_{true};
-  // 受理后的目标状态：默认直接 SUCCEEDED（快速到达）；"" = 停在 RUNNING
-  //（测试随后切终态）；"FAILED" = 受理即失败
-  void set_auto_terminal(const std::string & t)
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto_terminal_ = t;
-  }
-  std::atomic<int> goto_count_{0};
-  std::atomic<int> cancel_count_{0};
-  std::atomic<bool> last_return_to_quadruped_{false};
-  std::string last_action_;  // 最近一次 go_to_waypoints 请求的 action（"" = go）
-  std::vector<std::string> last_waypoints_;
-
-private:
-  // 持锁推帧（真机 _publish_status 同款：状态一变就发全量快照）
-  void publish_no_lock()
-  {
-    std_msgs::msg::String msg;
-    msg.data = snapshot_.dump();
-    status_pub_->publish(msg);
-  }
-  void raw_publish_no_lock(const std::string & raw)
-  {
-    std_msgs::msg::String msg;
-    msg.data = raw;
-    status_pub_->publish(msg);
-  }
-
   std::mutex mutex_;
-  nlohmann::json snapshot_{{"state", "IDLE"}, {"reason", ""}};
-  std::string auto_terminal_{"SUCCEEDED"};
+  std::string auto_result_{"SUCCEEDED"};
+  std::string reject_message_{"任务冲突：已有任务在跑"};
+  std::string fail_reason_{"Nav2 goal aborted"};
   std::vector<std::string> available_{"A", "B", "home"};
-  rclcpp::Service<GoToWaypoints>::SharedPtr goto_service_;
-  rclcpp::Service<Trigger>::SharedPtr cancel_service_;
-  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
+  std::shared_ptr<GoalHandleNavigate> pending_gh_;
+  rclcpp::TimerBase::SharedPtr cancel_timer_;
+  rclcpp_action::Server<Navigate>::SharedPtr action_server_;
+  rclcpp::Service<Query>::SharedPtr query_service_;
 };
 
 class WaypointNavExecutorTest : public ::testing::Test
@@ -174,7 +193,7 @@ protected:
     if (!rclcpp::ok()) {
       rclcpp::init(0, nullptr);
     }
-    server_ = std::make_shared<MockWaypointServer>();
+    server_ = std::make_shared<MockNavigateServer>();
     client_node_ = std::make_shared<rclcpp::Node>("waypoint_nav_executor_test_node");
 
     executor_ = std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
@@ -182,16 +201,16 @@ protected:
     executor_->add_node(client_node_);
     spin_thread_ = std::thread([this]() {executor_->spin();});
 
-    // 轮询 50ms 加速测试；超时 5s
+    // 轮询分片 250ms；超时 5s
     executor_nav_ = std::make_unique<guide_pulse::WaypointNavExecutor>(
-      client_node_, "/test/waypoint_nav/go_to_waypoints",
-      "/test/waypoint_nav/status", "/test/waypoint_nav/cancel",
-      std::chrono::milliseconds(50), std::chrono::seconds(5));
+      client_node_, "/test/navigate", "/test/navigate/query",
+      std::chrono::seconds(5));
   }
 
   void TearDown() override
   {
-    // 先停 executor 再销毁客户端（guard condition 仍在 executor wait set 中）
+    // 先停 executor 再销毁客户端（guard condition 仍在 executor wait set 中）；
+    // 挂起 goal 的导航线程至多等一个 result 分片超时后自行退出
     if (executor_) {
       executor_->cancel();
     }
@@ -216,13 +235,7 @@ protected:
     return called_.load();
   }
 
-  // 等订阅端消化刚推送的帧（进程内 DDS 传递 + executor 调度余量）
-  void settle() const
-  {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  }
-
-  std::shared_ptr<MockWaypointServer> server_;
+  std::shared_ptr<MockNavigateServer> server_;
   rclcpp::Node::SharedPtr client_node_;
   rclcpp::executors::MultiThreadedExecutor::SharedPtr executor_;
   std::thread spin_thread_;
@@ -234,7 +247,7 @@ protected:
 
 TEST_F(WaypointNavExecutorTest, ArriveOnSucceeded)
 {
-  // 夹具默认：受理后直接 SUCCEEDED（任务很快完成）
+  // 夹具默认：goal 受理后直接 SUCCEEDED（任务很快完成）
   executor_nav_->goto_point(
     "3号展台", [this](guide_pulse::NavOutcome o) {
       outcome_ = o;
@@ -243,15 +256,15 @@ TEST_F(WaypointNavExecutorTest, ArriveOnSucceeded)
   ASSERT_TRUE(wait_callback()) << "未收到到达回调";
   EXPECT_TRUE(outcome_.ok);
   EXPECT_NE(outcome_.detail.find("3号展台"), std::string::npos);
-  // 请求字段：单航点 + 不变狗形（讲解机器人保持人形）
+  // goal 字段：command=go + 单航点 + 不变狗形（讲解机器人保持人形）
+  EXPECT_EQ(server_->last_command_, "go");
   EXPECT_EQ(server_->last_waypoints_, (std::vector<std::string>{"3号展台"}));
-  EXPECT_FALSE(server_->last_return_to_quadruped_.load());
+  EXPECT_FALSE(server_->last_return_to_quadruped_);
 }
 
 TEST_F(WaypointNavExecutorTest, FailOnFailedWithReason)
 {
-  server_->set_auto_terminal("FAILED");
-  server_->set_reason("Nav2 goal aborted");
+  server_->set_auto_result("FAILED", "Nav2 goal aborted");
   executor_nav_->goto_point(
     "东门", [this](guide_pulse::NavOutcome o) {
       outcome_ = o;
@@ -263,10 +276,11 @@ TEST_F(WaypointNavExecutorTest, FailOnFailedWithReason)
   EXPECT_NE(outcome_.detail.find("Nav2 goal aborted"), std::string::npos);
 }
 
+// 被拒的 goal 也先「已接受」（真机语义），拒因毫秒级走 result REJECTED：
+// 执行器在受理试探窗口内现形为失败，不误判为在途
 TEST_F(WaypointNavExecutorTest, RejectMapsToFailure)
 {
-  server_->next_accepted_.store(false);
-  server_->set_state("IDLE");
+  server_->set_auto_result("REJECTED", "路线里没有叫 '不存在的点' 的航点");
   executor_nav_->goto_point(
     "不存在的点", [this](guide_pulse::NavOutcome o) {
       outcome_ = o;
@@ -274,26 +288,61 @@ TEST_F(WaypointNavExecutorTest, RejectMapsToFailure)
     });
   ASSERT_TRUE(wait_callback());
   EXPECT_FALSE(outcome_.ok);
-  EXPECT_NE(outcome_.detail.find("航点任务被拒"), std::string::npos);
+  EXPECT_NE(outcome_.detail.find("导航任务被拒"), std::string::npos);
 }
 
-// 重定位：受理即返回（不进任务状态机）；请求字段 action=set_pose
+TEST_F(WaypointNavExecutorTest, RunningThenSucceeded)
+{
+  // goal 挂起（RUNNING：出发前 posture/nav2_wake 等阶段或行走中）
+  // → 测试触发 SUCCEEDED：终态判定正确
+  server_->set_auto_result("");
+  executor_nav_->goto_point(
+    "充电桩A", [this](guide_pulse::NavOutcome o) {
+      outcome_ = o;
+      called_.store(true);
+    });
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  EXPECT_FALSE(called_.load());  // 在途期间不回调
+  server_->finish_succeed();
+  ASSERT_TRUE(wait_callback());
+  EXPECT_TRUE(outcome_.ok);
+}
+
+TEST_F(WaypointNavExecutorTest, CancelDropsCallback)
+{
+  server_->set_auto_result("");
+  executor_nav_->goto_point(
+    "A展台", [this](guide_pulse::NavOutcome) {called_.store(true);});
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  executor_nav_->cancel();
+  // 取消链路：250ms 分片检测 -> cancel_goal -> server 转 CANCELING ->
+  // mock 终结 CANCELLED -> client 收 result（DDS 往返数跳，留足余量）
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+  EXPECT_FALSE(called_.load());  // 取消后不回调（语义由 cancel 定义）
+  EXPECT_GE(server_->cancel_count_.load(), 1);  // action cancel 已下发
+}
+
+// 重定位：result（验收完成才回）在受理试探窗口内回来 = set_pose 直接
+// 带回终态；poll 首调即回缓存 true
 TEST_F(WaypointNavExecutorTest, SetPoseAcceptedIsTerminal)
 {
   const auto outcome = executor_nav_->set_pose("A");
   EXPECT_TRUE(outcome.ok);
   EXPECT_NE(outcome.detail.find("A"), std::string::npos);
-  // 请求字段：单航点 + set_pose 动作 + 保持人形（服务端硬约束）
+  // goal 字段：command=set_pose + 单航点 + 保持人形（服务端硬约束）
+  EXPECT_EQ(server_->last_command_, "set_pose");
   EXPECT_EQ(server_->last_waypoints_, (std::vector<std::string>{"A"}));
-  EXPECT_EQ(server_->last_action_, "set_pose");
-  EXPECT_FALSE(server_->last_return_to_quadruped_.load());
+  EXPECT_FALSE(server_->last_return_to_quadruped_);
+  const auto verified = executor_nav_->poll_set_pose_verified("A");
+  ASSERT_TRUE(verified.has_value());
+  EXPECT_TRUE(*verified);
 }
 
 // 重定位被拒（导航在途/非站立人形/定位未起）：失败 + 服务端 message 透传；
 // 点名在 available 清单中 = 非 point_not_found（状态冲突类拒因）
 TEST_F(WaypointNavExecutorTest, SetPoseRejectedMapsToFailure)
 {
-  server_->next_accepted_.store(false);
+  server_->set_auto_result("REJECTED", "任务冲突：已有任务在跑");
   const auto outcome = executor_nav_->set_pose("A");
   EXPECT_FALSE(outcome.ok);
   EXPECT_NE(outcome.detail.find("set_pose 被拒"), std::string::npos);
@@ -301,114 +350,36 @@ TEST_F(WaypointNavExecutorTest, SetPoseRejectedMapsToFailure)
   EXPECT_FALSE(outcome.point_not_found);  // A 在 available 清单：非点位名错
 }
 
-// 重定位被拒且点名不在 available 清单：point_not_found 置位（结构化分类，
-// 桥接层据此映射 relocate.result 的 point_not_found）
+// 重定位被拒且点名不在 available 清单：point_not_found 置位（query 结构化
+// 分类，桥接层据此映射 relocate.result 的 point_not_found）
 TEST_F(WaypointNavExecutorTest, SetPoseRejectedUnknownWaypointClassified)
 {
-  server_->next_accepted_.store(false);
+  server_->set_auto_result("REJECTED", "路线里没有叫 'X9' 的航点");
   const auto outcome = executor_nav_->set_pose("X9");
   EXPECT_FALSE(outcome.ok);
   EXPECT_TRUE(outcome.point_not_found);  // X9 不在 {A, B, home} 清单
 }
 
-// 验收查询（2026-10-17：重定位终态 = set_pose.verified）：status 快照的
-// set_pose 记录三态——无记录/航点名不符/verified 仍 null 均为「继续等」
-//（nullopt），verified 出 bool 才是终态。注：本用例直接推帧（无受理），
-// watermark=0，凡到达的帧都算新帧；受理-防串窗口由下面用例覆盖
-TEST_F(WaypointNavExecutorTest, PollSetPoseVerifiedReadsStatusJson)
+// 重定位受理后验收结果异步回（真机 ~1.5s 窗口）：set_pose 受理即返回，
+// poll 三态——nullopt（未出）-> true（验收通过）；再一轮 -> false（验收失败）
+TEST_F(WaypointNavExecutorTest, SetPosePendingThenVerified)
 {
   using R = std::optional<bool>;
-  // 1. 无 set_pose 记录（受理前/其他航点残留）-> 继续等
-  server_->set_status_json(R"({"state":"IDLE"})");
-  settle();
-  EXPECT_EQ(executor_nav_->poll_set_pose_verified("A"), R(std::nullopt));
-  // 2. 航点名不匹配（上次别的航点的记录）-> 继续等
-  server_->set_status_json(
-    R"({"set_pose":{"waypoint":"B","sent":true,"verified":true}})");
-  settle();
-  EXPECT_EQ(executor_nav_->poll_set_pose_verified("A"), R(std::nullopt));
-  // 3. 航点名匹配但验收未出（真机受理后 ~1.5s 窗口）-> 继续等
-  server_->set_status_json(
-    R"({"set_pose":{"waypoint":"A","sent":true,"verified":null,"note":""}})");
-  settle();
-  EXPECT_EQ(executor_nav_->poll_set_pose_verified("A"), R(std::nullopt));
-  // 4. 验收通过 -> true
-  server_->set_status_json(
-    R"({"set_pose":{"waypoint":"A","sent":true,"verified":true,"note":""}})");
-  settle();
-  const auto ok = executor_nav_->poll_set_pose_verified("A");
-  ASSERT_TRUE(ok.has_value());
-  EXPECT_TRUE(*ok);
-  // 5. 验收失败（注入后位姿仍不匹配）-> false
-  server_->set_status_json(
-    R"({"set_pose":{"waypoint":"A","sent":true,"verified":false,)"
-    R"("note":"注入后仍差 0.42 m。"}})");
-  settle();
-  const auto bad = executor_nav_->poll_set_pose_verified("A");
-  ASSERT_TRUE(bad.has_value());
-  EXPECT_FALSE(*bad);
-  // 6. 快照非法（空串/坏 JSON）-> 继续等（超时兜底由调用方负责）
-  server_->set_status_json("");
-  settle();
-  EXPECT_EQ(executor_nav_->poll_set_pose_verified("A"), R(std::nullopt));
-  server_->set_status_json("not-json");
-  settle();
-  EXPECT_EQ(executor_nav_->poll_set_pose_verified("A"), R(std::nullopt));
-}
-
-// 验收防串：受理前的旧帧（上次同航点 verified=true）不得误判为本次结果。
-// 真机语义（follower_node._begin_set_pose）：受理时同步重置 set_pose.
-// verified=null 并先于服务应答推帧——Mock 的 goto 回调在 action=set_pose
-// 时同样重置。本用例预置旧帧后受理，验证「继续等 -> 本次验收结果」
-TEST_F(WaypointNavExecutorTest, PollIgnoresStaleFramesBeforeAccept)
-{
-  // 预置旧帧：上次 A 航点验收通过（latched 语义 = 受理前最后一帧）
-  server_->set_status_json(
-    R"({"set_pose":{"waypoint":"A","sent":true,"verified":true}})");
-  settle();
-  // 本次重定位受理：服务端重置 verified=null 并推帧
-  server_->set_auto_terminal("");
+  // mock 终结 -> client 收 result 要经 DDS 往返 + executor 调度，
+  // 每次触发后留 settle 余量再 poll
+  server_->set_auto_result("");  // 挂起：验收未出
   ASSERT_TRUE(executor_nav_->set_pose("A").ok);
-  settle();
-  // 本次记录 verified 未出：继续等（watermark 保证受理前旧帧的
-  // verified=true 不越过受理窗口被当作本次结果）
-  EXPECT_EQ(executor_nav_->poll_set_pose_verified("A"),
-    std::optional<bool>(std::nullopt));
-  // 本次验收失败：结果是 false，不是旧帧的 true
-  server_->set_status_json(
-    R"({"set_pose":{"waypoint":"A","sent":true,"verified":false}})");
-  settle();
-  const auto bad = executor_nav_->poll_set_pose_verified("A");
-  ASSERT_TRUE(bad.has_value());
-  EXPECT_FALSE(*bad);
-}
-
-TEST_F(WaypointNavExecutorTest, RunningThenSucceeded)
-{
-  // 受理后保持 RUNNING（等位姿/行走中）→ 测试切 SUCCEEDED：转移仍正确判达
-  server_->set_auto_terminal("");
-  executor_nav_->goto_point(
-    "充电桩A", [this](guide_pulse::NavOutcome o) {
-      outcome_ = o;
-      called_.store(true);
-    });
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
-  EXPECT_FALSE(called_.load());  // RUNNING 期间不回调
-  server_->set_state("SUCCEEDED");
-  ASSERT_TRUE(wait_callback());
-  EXPECT_TRUE(outcome_.ok);
-}
-
-TEST_F(WaypointNavExecutorTest, CancelDropsCallback)
-{
-  server_->set_auto_terminal("");
-  executor_nav_->goto_point(
-    "A展台", [this](guide_pulse::NavOutcome) {called_.store(true);});
+  EXPECT_EQ(executor_nav_->poll_set_pose_verified("A"), R(std::nullopt));
+  server_->finish_succeed();  // 验收通过
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  executor_nav_->cancel();
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
-  EXPECT_FALSE(called_.load());  // 取消后不回调（语义由 cancel 定义）
-  EXPECT_GE(server_->cancel_count_.load(), 1);  // cancel Trigger 已下发
+  EXPECT_EQ(executor_nav_->poll_set_pose_verified("A"), R(true));
+
+  // 第二轮：验收失败（注入后位姿仍不匹配）
+  ASSERT_TRUE(executor_nav_->set_pose("A").ok);
+  EXPECT_EQ(executor_nav_->poll_set_pose_verified("A"), R(std::nullopt));
+  server_->finish_fail("注入后仍差 0.42 m。");
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  EXPECT_EQ(executor_nav_->poll_set_pose_verified("A"), R(false));
 }
 
 }  // namespace

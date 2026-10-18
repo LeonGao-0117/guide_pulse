@@ -1,0 +1,74 @@
+# Liwei 导航的对外接口：去航点、取消、充电、在航点上重定位，都是发一个 goal。
+#
+# action 名：/liwei_navigation/navigate
+#
+# 每个 goal 结束时把成败回给发它的那个客户端（Result）；去航点的过程中有进度
+# （Feedback）。任务与 ~/goto 话题、~/start 等 Trigger 下发的共用同一个状态机。
+
+# ---------------------------------------------------------------- Goal
+# 做什么。不填 = go。只认下面四个小写词，别的值拒收。
+#
+#   go       去 `waypoints` 里的航点。有任务在跑时拒收，不抢占——要换任务先取消。
+#   cancel   取消正在跑的任务，机器人**停在原地**（不回 Home）。`waypoints` 留空。
+#            带 `return_to_quadruped=true` 则停稳后记下位姿、变成狗形。
+#            被取消的那个 go goal 以 state=CANCELLED 结束；这个 cancel goal 自己
+#            在停稳（要变狗形时等变完）后结束。没有任务在跑时拒收。
+#            对正在跑的 go goal 调 action 自带的 cancel 也行，效果同不带变形的这条。
+#   charge   去充电：就地**记下人形位姿 → 变成狗形 → 趴下**，趴下后结束。有任务在跑
+#            就先停掉。`waypoints` 留空，`return_to_quadruped` 不看。
+#   set_pose 机器人已被人摆在某个航点上（位置与朝向都对准），把定位重设到这个
+#            航点。**机器人不动。** `waypoints` 正好一个航点名，`return_to_quadruped`
+#            必须 false。只在没有任务在跑、且已是站立人形时受理（不替你切形态：
+#            切形态自带约 180° 转身）。定位验收完才结束，通常零点几秒，最多约 3 s。
+string COMMAND_GO=go
+string COMMAND_CANCEL=cancel
+string COMMAND_CHARGE=charge
+string COMMAND_SET_POSE=set_pose
+string command
+# 航点名。go：按给定顺序走，不去重，['*'] = 整条路线；set_pose：正好一个；
+# cancel / charge：留空。
+string[] waypoints
+# go：走完后变回狗形（只在全部走完时才变，失败一律保持人形）。
+# cancel：停稳后变成狗形。不填 = false = 保持人形。
+bool return_to_quadruped
+---
+# ---------------------------------------------------------------- Result
+# 任务编号，与 ~/result 话题、~/query 的 last_result 里的一致。
+# 0 = 没受理（被拒），这时 state = REJECTED，原因在 message。
+uint32 task_id
+# 要的事情全部做成了：go 是全部到达、没有跳过的航点、要求变狗形时也变成了；
+# cancel 是停下（并按要求变成狗形）；charge 是趴下了；set_pose 是定位对上了。
+bool success
+# 结束时的状态：SUCCEEDED / FAILED / CANCELLED / REJECTED。
+# go 的 success=false 而 state=SUCCEEDED：导航成了，但跳过了航点或没变成狗形。
+string state
+# 人可读说明，失败或被拒时写了原因。
+string message
+# go：展开后的航点序列；set_pose：那个航点；其余为空。
+string[] plan
+# 没到达就被跳过的航点（只有 go 有）。
+string[] skipped
+# 变狗形 / 趴下这一步：done 已变狗形、failed 变形失败、skipped 没做、
+# charged 已趴下、lie_failed 变了狗形但没趴下；空 = 没要求。
+string park
+string park_message
+---
+# ---------------------------------------------------------------- Feedback
+# 只有 go 发。
+uint32 task_id
+# RUNNING / PAUSED；做完后的变形阶段是 SUCCEEDED。
+string state
+# 当前阶段：
+#   posture / switching / settle / nav2_wake  出发前确认形态、切人形、等站稳、等导航起来
+#   awaiting_pose                             等新鲜位姿，目标还没下发
+#   driving                                   正在去 current
+#   parking                                   走完了，正在变回狗形
+#   paused                                    暂停中
+string phase
+# 正在去的航点；出发前为空。
+string current
+# 第几个（从 1 起）/ 共几个。
+uint32 step
+uint32 total
+# 离 current 的直线距离（米）；不知道时为 -1。绕障时会先涨后跌。
+float64 remaining_m

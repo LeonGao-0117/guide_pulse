@@ -103,6 +103,10 @@ inline constexpr const char * RESULT_REASON_LOCALIZATION_FAILED = "localization_
     // 非站立人形、定位未起、验收窗口占用）
 inline constexpr const char * RESULT_REASON_SCENE_FAILED = "scene_failed";
 inline constexpr const char * RESULT_REASON_POINT_MAP_FAILED = "point_map_failed";
+inline constexpr const char * RESULT_REASON_TRANSFORM_FAILED = "transform_failed";
+    // navigate/relocate.result 专属：变形未确认双足即拒绝下发导航指令
+    //（2026-10-18 现场需求：运控不可用/变形动作被拒/未到位等，未确认
+    //  人形前不得向 t1_slam_nav_ws 发 navigate/set_pose goal）
     // point_map.result 专属：本地应用/存储失败（如磁盘不可写）
 
 // scene.qr_sha256 格式校验（v0.22.0 P-036）：64 位小写十六进制

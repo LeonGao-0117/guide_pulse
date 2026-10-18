@@ -260,7 +260,7 @@ void AgentMonitor::on_asr_msg(const AsrResult::SharedPtr msg)
 // ---------------------------------------------------------------------------
 // agent TTS 话术的语料匹配（工作线程串行执行，成员免锁）
 // ---------------------------------------------------------------------------
-void AgentMonitor::match_phrases(const std::string & text, const std::string & trace_id)
+bool AgentMonitor::match_phrases(const std::string & text, const std::string & trace_id)
 {
   const auto now = std::chrono::steady_clock::now();
   for (const auto & rule : config_.rules) {
@@ -282,20 +282,21 @@ void AgentMonitor::match_phrases(const std::string & text, const std::string & t
         node_->get_logger(), "语料命中但冷却中(%lds): action=%s",
         std::chrono::duration_cast<std::chrono::seconds>(until - now).count(),
         rule.action.c_str());
-      return;  // 一条话术至多触发第一个命中的规则
+      return true;  // 一条话术至多触发第一个命中的规则（已被消化）
     }
     until = now + std::chrono::seconds(config_.cooldown_seconds);
     RCLCPP_INFO(
       node_->get_logger(), "语料命中: action=%s point=%s agent话术「%s」",
       rule.action.c_str(), rule.point.c_str(), text.c_str());
-    // navigate/relocate 延迟触发（2026-10-17 现场需求）：命中时 agent
-    // 正在说这句话（「请稍等」/「开始重定位」），立即执行体验差——
-    // navigate 边说边动身、relocate 话音未落就发「重定位成功」自产播报
+    // navigate/relocate/welcome_prep 延迟触发（2026-10-17 现场需求；
+    // welcome_prep 2026-10-18 迎宾准备）：命中时 agent
+    // 正在说这句话（「请稍等」/「开始重定位」/「马上去迎宾点」），立即执行体验差——navigate 边说边动身、relocate 话音未落就发「重定位成功」自产播报
     // 与 agent 话音相撞——挂起等该 trace 的 TTS 终态再触发。该 trace
     // 已结束（话术回查慢于终态的乱序，如本地链路 BEGIN 触发的回查落空
     // 重试）则立即触发不等待。15s 为 TtsStatus 丢失的兜底上限（话术
     // ~20 字 ≈ 5s 播完，宽裕；到期由 check_deferred_deadline 强制触发）
-    if ((rule.action == "navigate" || rule.action == "relocate") && !trace_id.empty() &&
+    if ((rule.action == "navigate" || rule.action == "relocate" ||
+         rule.action == "welcome_prep") && !trace_id.empty() &&
       finished_traces_.count(trace_id) == 0)
     {
       deferred_ = DeferredPhrase{
@@ -305,14 +306,15 @@ void AgentMonitor::match_phrases(const std::string & text, const std::string & t
         node_->get_logger(),
         "语料挂起等播报结束: action=%s point=%s trace=%s（说完再触发，15s 兜底）",
         rule.action.c_str(), rule.point.c_str(), trace_id.c_str());
-      return;
+      return true;
     }
     auto cb = on_phrase;
     emit([cb, action = rule.action, point = rule.point, text] {
       if (cb) {cb(action, point, text);}
     });
-    return;  // 一条话术至多触发第一个命中的规则
+    return true;  // 一条话术至多触发第一个命中的规则
   }
+  return false;  // 未命中任何规则
 }
 
 // ---------------------------------------------------------------------------
@@ -325,9 +327,9 @@ void AgentMonitor::fire_deferred(const char * why)
   }
   const auto d = std::move(*deferred_);
   deferred_.reset();
-  RCLCPP_INFO(
-    node_->get_logger(), "延迟语料触发(%s): action=%s point=%s agent话术「%s」",
-    why, d.action.c_str(), d.point.c_str(), d.text.c_str());
+  // 不打印触发行（2026-10-18 日志整理：挂起行已预告「说完再触发」，
+  // 触发时刻由后续业务行体现）；why 仅调试期排查用
+  (void)why;
   auto cb = on_phrase;
   if (cb) {
     cb(d.action, d.point, d.text);  // 调用点已在工作线程，直接调不经队列
@@ -489,10 +491,24 @@ void AgentMonitor::fetch_tts_text(const std::string & trace_id)
       if (a != std::string::npos) {
         std::string text = out.local_line.substr(
           a + 5, b != std::string::npos && b > a ? b - a - 5 : std::string::npos);
+        // 自产播报过滤（2026-10-18 日志整理）：本地 TTS 日志行带
+        // domain=<self_domain> 即本进程发的 PlayTts（话术请求侧已知，
+        // 「稍等，马上出发」等提示回查再打一遍纯冗余），直接丢弃。
+        // TtsStatus.domain 恒空的原有过滤不生效，此处按日志行解析兜底
+        std::string domain;
+        if (b != std::string::npos && b > a) {
+          domain = out.local_line.substr(b + 8);
+        }
         if (!text.empty()) {
-          auto cb = on_tts_text;
-          emit([cb, trace_id, text] { if (cb) cb(trace_id, text); });
-          match_phrases(text, trace_id);  // 语料检测：只认 agent 说的话术
+          if (!domain.empty() && domain == config_.self_domain) {
+            return;  // 自产播报：不打不匹配
+          }
+          // 先匹配语料：命中则「语料命中」行已含话术，跳过 on_tts_text
+          //（免同句双打）；未命中才打「agent 事件: TTS 话术」观测行
+          if (!match_phrases(text, trace_id)) {
+            auto cb = on_tts_text;
+            emit([cb, trace_id, text] { if (cb) cb(trace_id, text); });
+          }
           return;
         }
       }
@@ -500,9 +516,10 @@ void AgentMonitor::fetch_tts_text(const std::string & trace_id)
     // 路径 2：输出已是纯文本
     if (!out.cloud_line.empty()) {
       const std::string text = out.cloud_line;
-      auto cb = on_tts_text;
-      emit([cb, trace_id, text] { if (cb) cb(trace_id, text); });
-      match_phrases(text, trace_id);  // 语料检测：只认 agent 说的话术
+      if (!match_phrases(text, trace_id)) {
+        auto cb = on_tts_text;
+        emit([cb, trace_id, text] { if (cb) cb(trace_id, text); });
+      }
       return;
     }
     if (attempt == 0) {

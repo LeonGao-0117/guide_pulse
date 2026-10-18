@@ -22,18 +22,20 @@ guide_bridge:
     # 是两个业务，与其他业务互斥，超时 20s；只管互斥占用，二维码常驻
     # 时长仍由 display_show_timeout_seconds 独立计时默认 180s）
     qr_business_timeout_seconds: 20
-    # 真机航点导航：对接 t1_slam_nav_ws waypoint_follower 服务
-    #（navigate=go / relocate=set_pose，验收轮询 set_pose.verified）
+    # 真机航点导航：对接 t1_slam_nav_ws 的 /liwei_navigation/navigate
+    # action（navigate=go / relocate=set_pose；接口文档见 t1_slam_nav_ws/
+    # docs/NavigateAction.md）
     nav_executor: "waypoint"
     mock_nav_seconds: 0                  # mock 导航模拟耗时秒
-    # 导航在途兜底超时秒（默认 600）：go_to_waypoints 受理后 ~/status 终态
-    # 推送断流/导航栈卡死时，到期按 failed:navigation_failed 收尾并释放
+    # 导航在途兜底超时秒（默认 600）：navigate goal 受理后 result 终态
+    # 断流/导航栈卡死时，到期按 failed:navigation_failed 收尾并释放
     # 导览业务——等待期所有新业务被拒（failed/busy），超时过长现场感受
     # 就是「一直拒绝」。按场地最大行程时长配置（展厅通常几十秒）
     nav_timeout_seconds: 600
     # 重定位（relocate）等待导航模块验收的超时秒（2026-10-17：终态 =
-    # waypoint_follower 的 set_pose.verified 验收结果，正常 ~1.5s 出结果，
-    # 此值为 status 丢失/服务卡死的兜底；超时按 failed/localization_failed 收尾）
+    # set_pose goal 的 result（服务端发初值并验收完才回），正常 ~1.5s 出
+    # 结果，此值为 result 丢失/服务卡死的兜底；超时按
+    # failed/localization_failed 收尾）
     relocate_timeout_seconds: 30
     # 业务互斥拒绝时的语音提示（重定位/导航在途播——机器人没在说话；
     # 迎宾/播报/讲解中正在出声不播；空串 = 禁用）
@@ -44,14 +46,31 @@ guide_bridge:
     # service）；回执照发，播报属本地增强；空串 = 禁用
     navigate_failed_text: "导航失败，请检查navigation service是否正常"
     relocate_failed_text: "重定位失败，请检查navigation service是否正常"
+    # 变形未确认双足即拒绝下发导航/重定位的提示（2026-10-18 现场需求：
+    # 一定是双足形态确认后才向 t1_slam_nav_ws 发导航指令；运控不可用/
+    # 变形被拒/动作未到位时拒绝并播此提示；回执 failed/transform_failed，
+    # 播报属本地增强；空串 = 禁用播报）
+    navigate_transform_failed_text: "变形未完成，暂时无法导航，请检查机器人姿态"
     # 导览受理成功后的引导语（2026-10-17 现场需求：确认 [导航] 收到
     # 应答 accepted=true 后播报；{point} 替换点位显示名=映射表 name，
     # 如「比亚迪 M9 DM-i」；空串 = 禁用）
     navigate_lead_text: "请跟我来，让我带您去看看{point}这款车"
+    # 导航出发播报语（2026-10-18 现场需求）：收到导航指令（无论语音还是
+    # MQTT）受理后先播这句再起身变形人形（先开口、立刻动）；迎宾准备去
+    # Y 点的导航不播（agent 已说「好嘞，马上前去迎宾点」，再说就重复了）。
+    # 空串 = 禁用
+    navigate_depart_text: "稍等，马上出发"
+    # 重定位出发播报语（2026-10-18 现场需求）：仅 MQTT 下行的 relocate 先
+    # 播这句再起身变形人形（set_pose 有双足站立硬约束）；语料触发不播
+    #（agent 已说「好的，这就在A点开始重定位」）。空串 = 禁用
+    relocate_depart_text: "马上开始重定位，请稍后"
     # 迎宾引导语（2026-10-17 现场需求：迎宾先播引导语，播完（TtsStatus
     # 终态回流/字数估算兜底）再变形，变形完成播迎宾词；空串 = 禁用
     #（直接变形，回退原时序））
     welcome_lead_text: "元气满满，小T来迎接我的顾客了。"
+    # 迎宾准备就位播报语（2026-10-18 现场需求：语料触发导航去迎宾点，
+    # 到达变形四足、摄像头收平后最后播报；空串 = 禁用）
+    welcome_prep_done_text: "元气满满，做好准备迎接顾客"
     # 点位映射表落盘文件（v0.25.0 P-039 point_map 全量替换）：App 每次推表
     # 整表覆盖此文件，重启自动加载（App 无需重推）。默认放平台持久化
     # 数据目录 /robot/persist/var/guide_pulse/（与其他模块 var 数据同级，
@@ -86,6 +105,10 @@ guide_bridge:
       - "您好！欢迎来到比亚迪品牌体验中心。我是机器人导览员小T，我可以带您参观展厅、介绍车型，也可以根据您的用车需求，帮您找到想了解的车。另外您也可以扫描我屏幕上显示的二维码，留下您的联系方式，方便我们给您提供更好的服务。"
     agent_monitor.welcome_phrases:       # agent 话术命中任一条 -> 迎宾（空=关闭）
       - "好嘞，马上开始迎接我的顾客喽"
+    agent_monitor.welcome_prep_phrases:  # agent 话术命中 -> 等 agent 说完
+                                         #  先确保人形再导航去该迎宾点，到达变
+                                         #  四足收摄像头、播就位语；格式 "点位名|语料"
+      - "Y|好嘞，马上前去迎宾点"
     agent_monitor.qr_phrases:            # agent 话术命中任一条 -> 显示二维码3分钟（空=关闭）
       - "收到，这就给您显示二维码，您可以扫描二维码留下您的个人信息哦"
     agent_monitor.qr_cancel_phrases:     # agent 话术命中任一条 -> 取消二维码显示（空=关闭；
@@ -93,27 +116,46 @@ guide_bridge:
                                          #  各占 qr_business_timeout_seconds 窗口）
       - "好的，这就取消二维码显示"
     agent_monitor.relocate_phrases:      # agent 话术命中 -> 等agent说完该句再在该航点重定位；格式 "航点名|语料"
-      - "A|好的，这就在展厅A点开始重定位"   # 航点名 = t1_slam_nav_ws 航点文件点位名
-      - "B|好的，这就在展厅B点开始重定位"
-      - "C|好的，这就在展厅C点开始重定位"
-      - "D|好的，这就在展厅D点开始重定位"
-      - "E|好的，这就在展厅E点开始重定位"
+      - "A|好的，这就在A点开始重定位"   # 航点名 = t1_slam_nav_ws 航点文件点位名
+      - "B|好的，这就在B点开始重定位"
+      - "C|好的，这就在C点开始重定位"
+      - "D|好的，这就在D点开始重定位"
+      - "E|好的，这就在E点开始重定位"
+      - "F|好的，这就在F点开始重定位"
+      - "G|好的，这就在G点开始重定位"
+      - "H|好的，这就在H点开始重定位"
+      - "I|好的，这就在I点开始重定位"
+      - "J|好的，这就在J点开始重定位"
+      - "K|好的，这就在K点开始重定位"
+      - "Y|好的，这就在Y点开始重定位"
     agent_monitor.navigate_phrases:      # agent 话术命中 -> 等agent说完该句再导航到车型点位；格式 "点位名|语料"
                                          #（点位名 = 点位映射表 name/code，App 推表下发；
                                          #  命中后挂起等该句 TTS 播报结束（TtsStatus 终态/
                                          #  对话回 IDLE/15s 兜底）才注入导航，占业务互斥；
                                          #  未命中/表空则拒绝并播报 point_map_* 提示）
-      - "腾势 B5|好的，您是想了解下腾势 B5这款车吗，请稍等"
-      - "比亚迪 M9 DM-i|好的，您是想了解下比亚迪 M9 DM-i这款车吗，请稍等"
-      - "比亚迪ATTO 1|好的，您是想了解下比亚迪ATTO one这款车吗，请稍等"   # 点位名=映射表name(数字1)；语料=agent原话(英文one)
-      - "腾势 D9|好的，您是想了解下腾势 D9这款车吗，请稍等"
-      - "腾势 Z9 GT|好的，您是想了解下腾势 Z9 GT这款车吗，请稍等"
+      - "比亚迪ATTO 1|要去看比亚迪ATTO 1，没问题"
+      - "比亚迪ATTO 2|要去看比亚迪ATTO 2，没问题"
+      - "比亚迪ATTO 3|要去看比亚迪ATTO 3，没问题"
+      - "比亚迪 M6|要去看比亚迪M6，没问题"
+      - "比亚迪 M9 DM-i|要去看比亚迪M9 DMi，没问题"
+      - "比亚迪 SEALION 6 DM-i|要去看比亚迪sea lion 6 DM-i，没问题"
+      - "比亚迪 SEALION 7|要去看比亚迪sea lion 7，没问题"
+      - "腾势 B5|要去看腾势 B5，没问题"
+      - "腾势 B8|要去看腾势 B8，没问题"
+      - "腾势 D9|要去看腾势 D9，没问题"
+      - "腾势 Z9 GT|要去看腾势 Z9 GT，没问题"
     agent_monitor.navigate_stop_phrases: # agent 话术命中任一条 -> 停止导航（等价 navigate.stop；空=关闭）
-      - "这就停止展厅讲解"               # 取消在途导航并释放导览占用，无导航 no-op
-    motion_preset_ids: [2003]            # 播报伴随动作池（2003=双手说话动作；
-                                         #  2026-10-17 现场需求：导览播报改讲话
-                                         #  姿势，原 1001 右手挥手已弃用；
-                                         #  2004~2009=说话动作1~6 可换用）
+      - "好的，马上停止导航"             # 2026-10-18 现场需求：语音要求停止导航时
+                                         #  agent 应答此话术，命中即停（立即触发不等
+                                         #  播报结束，取消要快）
+    motion_preset_ids: [2004, 2005, 2006, 2007, 2008, 2009]
+                                         # 播报伴随动作池（2004~2009=T1
+                                         #  说话动作1~6；2026-10-18 现场
+                                         #  需求：讲解动作幅度加大，由
+                                         #  2003（双手说话动作，幅度小）
+                                         #  改用 T1 说话动作族轮换；
+                                         #  现场看效果可删减或固定某一个，
+                                         #  原始范围 1001=右手挥手已弃用）
     # 唤醒抑制尾部宽限校准（tail = lead + 每字ms×字数×scale；播报中被
     # 唤醒则调大 scale / tts_speech_ms_per_char）
     tts_speech_ms_per_char: 220

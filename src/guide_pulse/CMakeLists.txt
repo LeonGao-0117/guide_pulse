@@ -11,11 +11,9 @@ find_package(ament_index_cpp REQUIRED)  # 定位 share 目录（默认二维码�
 # aimdk_msgs 已拷贝内置 src/aimdk_msgs（来源 sdk_t1-v0.9.4.4，与 tts_demo
 # 内置副本一致），TTS 服务定义 (PlayTts/CommonRequest 等) 全部以 SDK 为准。
 find_package(aimdk_msgs REQUIRED)
-# 航点导航服务定义（已拷贝内置 src/waypoint_nav_msgs，来源 t1_slam_nav_ws）
-find_package(waypoint_nav_msgs REQUIRED)
-# ~/status 话题（std_msgs/String JSON 快照，waypoint_follower 推送）
-find_package(std_msgs REQUIRED)
-find_package(std_srvs REQUIRED)
+# 导航 action 定义（已拷贝内置 src/liwei_nav_msgs，来源 t1_slam_nav_ws）
+find_package(liwei_nav_msgs REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(nlohmann_json REQUIRED)
 # enroll 注册面 HTTP 客户端（RobotCar 协议 v0.9.0+，系统 libcurl）；
 # 迎宾二维码下载校验用系统 OpenSSL（sha256，v0.22.0 P-036）
@@ -87,7 +85,7 @@ target_include_directories(guide_pulse_core PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 target_compile_options(guide_pulse_core PRIVATE -Wall -Wextra)
-ament_target_dependencies(guide_pulse_core rclcpp ament_index_cpp aimdk_msgs waypoint_nav_msgs std_srvs std_msgs)
+ament_target_dependencies(guide_pulse_core rclcpp ament_index_cpp aimdk_msgs liwei_nav_msgs rclcpp_action)
 # 注意：与 ament_target_dependencies 保持一致的 plain 签名（勿加 PUBLIC/PRIVATE）
 target_link_libraries(guide_pulse_core
   guide_pulse_protocol
@@ -181,11 +179,11 @@ if(BUILD_TESTING)
   ament_target_dependencies(agent_monitor_test rclcpp aimdk_msgs)
   target_link_libraries(agent_monitor_test Threads::Threads)
 
-  # 4. 真机导航执行器单测：进程内拉起 Mock 航点服务
-  #    （go_to_waypoints/cancel 服务 + status 话题推送），校验受理/终态/取消逻辑
+  # 4. 真机导航执行器单测：进程内拉起 Mock Navigate action 服务端
+  #    （liwei_nav_msgs/action/Navigate + query 服务），校验受理/终态/取消逻辑
   ament_add_gtest(waypoint_nav_executor_test test/test_waypoint_nav_executor.cpp)
   target_include_directories(waypoint_nav_executor_test PRIVATE include)
-  ament_target_dependencies(waypoint_nav_executor_test rclcpp waypoint_nav_msgs std_srvs std_msgs)
+  ament_target_dependencies(waypoint_nav_executor_test rclcpp rclcpp_action liwei_nav_msgs)
   target_link_libraries(waypoint_nav_executor_test guide_pulse_protocol Threads::Threads)
 endif()
 

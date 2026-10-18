@@ -4,6 +4,7 @@
 #include <csignal>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <string>
 
@@ -22,7 +23,7 @@ namespace
 // console handler 对齐：ERROR 及以上走 stderr，单次 fprintf 整行输出
 // 避免多线程日志交错。
 void rfc3339_log_output_handler(
-  const rcutils_log_location_t *, int severity, const char * name,
+  const rcutils_log_location_t * location, int severity, const char * name,
   rcutils_time_point_value_t timestamp, const char * format, va_list * args)
 {
   // 先测长度再格式化，避免长 payload 日志（播报列表文本可达 ~4KB）被截断
@@ -59,10 +60,23 @@ void rfc3339_log_output_handler(
   const char * severity_name =
     (idx >= 1 && idx <= 5) ? kNames[idx] : kNames[0];
 
+  // 源码位置（2026-10-18 现场需求：排查时按日志直接定位打印点）：取
+  // 文件名 basename 免绝对路径刷屏；location 为空的日志（第三方库）
+  // 不带该段
+  char where_buf[192];
+  const char * where = "";
+  if (location != nullptr && location->file_name != nullptr) {
+    const char * base = std::strrchr(location->file_name, '/');
+    base = (base != nullptr) ? base + 1 : location->file_name;
+    std::snprintf(
+      where_buf, sizeof(where_buf), " [%s:%d]", base, location->line_number);
+    where = where_buf;
+  }
+
   std::fprintf(
     severity >= RCUTILS_LOG_SEVERITY_ERROR ? stderr : stdout,
-    "[%s] [%s] [%s]: %s\n", severity_name, time_buf,
-    (name != nullptr) ? name : "", message.c_str());
+    "[%s] [%s] [%s]%s: %s\n", severity_name, time_buf,
+    (name != nullptr) ? name : "", where, message.c_str());
 }
 
 }  // namespace
@@ -151,6 +165,23 @@ int main(int argc, char ** argv)
   if (!navigate_stop_phrases.empty()) {
     monitor_cfg.rules.push_back({"navigate_stop", "", navigate_stop_phrases});
   }
+  // 迎宾准备语料（2026-10-18 现场需求：agent 说「好嘞，马上前去迎宾点
+  // 需要先导航去Y点」类话术 -> 等 agent 说完 -> 先确保人形再导航去
+  // point 迎宾点，到达变四足收摄像头、播就位语）：每条格式「点位名|
+  // 语料」，点位名 = 点位映射表 name/code（如 Y）。非法条目跳过并告警
+  const auto welcome_prep_phrases =
+    node->get_parameter("agent_monitor.welcome_prep_phrases").as_string_array();
+  for (const auto & item : welcome_prep_phrases) {
+    const auto sep = item.find('|');
+    if (sep == std::string::npos || sep == 0 || sep + 1 >= item.size()) {
+      RCLCPP_WARN(
+        node->get_logger(),
+        "迎宾准备语料格式非法（应为 点位名|语料），跳过该条: 「%s」", item.c_str());
+      continue;
+    }
+    monitor_cfg.rules.push_back(
+      {"welcome_prep", item.substr(0, sep), {item.substr(sep + 1)}});
+  }
   // TTS 话术回查（trace_id -> 运控板日志）：SSH 目标复用屏幕推送配置；
   // self_domain 过滤自产播报回环（话术请求侧已知，运控板日志无记录）
   monitor_cfg.fetch_tts_text =
@@ -176,28 +207,29 @@ int main(int argc, char ** argv)
   agent_monitor->on_wakeup = [n = node->get_logger()]() {
       RCLCPP_INFO(n, "agent 唤醒（IDLE->LISTENING）");
     };
-  agent_monitor->on_tts_event = [n = node->get_logger(), node](
-    std::uint8_t status, const std::string & trace_id) {
-      RCLCPP_INFO(n, "TTS 事件: status=%u trace=%s", status, trace_id.c_str());
+  agent_monitor->on_tts_event = [node](std::uint8_t status, const std::string & trace_id) {
       // 终态（3=END/4=STOP/5=ERROR，TtsStatusType 枚举数值）：通知桥接
-      // 节点提前解除麦克风静音与唤醒抑制（事件驱动，估算时序兜底）
+      // 节点提前解除麦克风静音与唤醒抑制（事件驱动，估算时序兜底）。
+      // 事件本身不打印（2026-10-18 现场需求：只有 trace id 没有话术
+      // 内容的行没有排查价值，话术见「agent 事件: TTS 话术」行）
       if (status >= 3 && status <= 5) {
         node->notify_tts_terminal(trace_id);
       }
     };
-  // 语料命中 -> 按动作分发：welcome 注入 scene=welcome（与 MQTT 下发迎宾
-  // 指令完全同链路：互斥窗口/变形/二维码/播报/伴随动作全部复用）；
-  // show_qr / cancel_qr 注入本地纯屏幕指令（默认二维码上屏常驻 3 分钟 /
-  // 撤屏恢复默认表情，worker 串行处理；2026-10-17 起两者各为互斥业务，
-  // 占 qr_business_timeout_seconds（默认 20s）窗口）；relocate 注入本地
-  // relocate 指令（纯定位：point 航点上 set_pose 重定位，机器人不动，
-  // 等待验收期占业务互斥）；navigate 注入本地 navigate 指令（point 车型名
-  // 经点位映射表解析取 code 后导航，与 MQTT 下行同链路占业务互斥）
+  // 语料命中 -> 按动作分发（日志整理 2026-10-18：本分发不打「语料触发
+  // X」行——「语料命中」行已含 action/point/话术，注入后各业务行
+  //（点位解析/导航开始/停止导航/二维码显示等）自然衔接）：welcome 注入
+  // scene=welcome（与 MQTT 下发迎宾指令完全同链路：互斥窗口/变形/
+  // 二维码/播报/伴随动作全部复用）；show_qr / cancel_qr 注入本地纯屏幕
+  // 指令（默认二维码上屏常驻 3 分钟 / 撤屏恢复默认表情，worker 串行
+  // 处理；2026-10-17 起两者各为互斥业务，占 qr_business_timeout_seconds
+  //（默认 20s）窗口）；relocate 注入本地 relocate 指令（纯定位：point
+  // 航点上 set_pose 重定位，机器人不动，等待验收期占业务互斥）；
+  // navigate 注入本地 navigate 指令（point 车型名经点位映射表解析取
+  // code 后导航，与 MQTT 下行同链路占业务互斥）
   agent_monitor->on_phrase =
     [node](const std::string & action, const std::string & point, const std::string & text) {
     if (action == "welcome") {
-      RCLCPP_INFO(node->get_logger(), "语料触发迎宾（等价 scene=welcome）: 「%s」",
-        text.c_str());
       guide_pulse::CommandEvent event;
       event.type = "scene";
       event.scene = "welcome";
@@ -208,8 +240,6 @@ int main(int argc, char ** argv)
       return;
     }
     if (action == "show_qr") {
-      RCLCPP_INFO(node->get_logger(), "语料触发二维码显示（默认图常驻3分钟）: 「%s」",
-        text.c_str());
       guide_pulse::CommandEvent event;
       event.type = "show_qr";
       event.operation_id = guide_pulse::generate_uuid_v7();
@@ -219,7 +249,6 @@ int main(int argc, char ** argv)
       return;
     }
     if (action == "cancel_qr") {
-      RCLCPP_INFO(node->get_logger(), "语料触发取消二维码显示: 「%s」", text.c_str());
       // 注入本地 cancel_qr 指令（2026-10-17 现场需求：收到后取消二维码
       // 显示）：撤屏恢复默认表情，未显示 no-op；与显示同为互斥业务，
       // 占 20s 窗口（显示业务窗口内可抢占——取消必须生效）
@@ -232,8 +261,6 @@ int main(int argc, char ** argv)
       return;
     }
     if (action == "relocate") {
-      RCLCPP_INFO(node->get_logger(), "语料触发重定位（航点 %s）: 「%s」",
-        point.c_str(), text.c_str());
       guide_pulse::CommandEvent event;
       event.type = "relocate";
       event.point_name = point;
@@ -244,8 +271,6 @@ int main(int argc, char ** argv)
       return;
     }
     if (action == "navigate") {
-      RCLCPP_INFO(node->get_logger(), "语料触发导航（点位 %s）: 「%s」",
-        point.c_str(), text.c_str());
       // 注入等价本地 navigate 指令（与 MQTT 下行同链路）：point_name =
       // 车型名，handle_navigate 经点位映射表解析取 code 后发起导航；
       // 不携带讲解词（到达不播报，讲解由 agent 对话侧承担）
@@ -258,9 +283,19 @@ int main(int argc, char ** argv)
       node->inject_command(std::move(event));
       return;
     }
+    if (action == "welcome_prep") {
+      // 注入等价本地 welcome_prep 指令（2026-10-18 现场需求）：point_name
+      // 经点位映射表解析后导航去迎宾点；到达后变四足收摄像头、播就位语
+      guide_pulse::CommandEvent event;
+      event.type = "welcome_prep";
+      event.point_name = point;
+      event.operation_id = guide_pulse::generate_uuid_v7();
+      event.event_id = guide_pulse::generate_uuid_v7();
+      event.local = true;  // 本地注入：不发协议回执
+      node->inject_command(std::move(event));
+      return;
+    }
     if (action == "navigate_stop") {
-      RCLCPP_INFO(node->get_logger(), "语料触发停止导航（等价 navigate.stop）: 「%s」",
-        text.c_str());
       // 注入等价本地 navigate.stop（与 MQTT 下行同链路）：取消在途导航
       // 并释放导览业务占用，无导航 no-op，不影响其他播报
       guide_pulse::CommandEvent event;

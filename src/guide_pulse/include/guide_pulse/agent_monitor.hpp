@@ -85,7 +85,10 @@ public:
                                        //   与 show_qr 同为互斥业务占 20s 窗口）；
                                        // "relocate" -> 在 point 航点上重定位；
                                        // "navigate" -> point 经点位映射表解析取
-                                       //   code 后导航（2026-10-17 车型导览）
+                                       //   code 后导航（2026-10-17 车型导览）；
+                                       // "welcome_prep" -> 迎宾准备（2026-10-18
+                                       //   现场需求：导航去 point 迎宾点，到达
+                                       //   变四足收摄像头，播就位语）
     std::string point;                 // relocate 专用：触发后重定位的航点名
                                        //（t1_slam_nav_ws 航点文件点位名，如 A）；
                                        // 其他动作空。冷却按 action+point 独立计时
@@ -138,8 +141,10 @@ private:
   // 并做语料匹配
   void fetch_tts_text(const std::string & trace_id);
   // agent TTS 话术的语料匹配（含冷却），工作线程执行。trace_id = 话术
-  // 来源 TTS（navigate/relocate 延迟触发挂起时等其终态用）
-  void match_phrases(const std::string & text, const std::string & trace_id);
+  // 来源 TTS（navigate/relocate 延迟触发挂起时等其终态用）。
+  // 返回 true = 话术已被语料规则消化（命中，含冷却中/挂起），调用方
+  // 据此跳过 on_tts_text 打印（「agent 事件」行与「语料命中」行不双打）
+  bool match_phrases(const std::string & text, const std::string & trace_id);
   // TTS 终态（END/STOP/ERROR）落地（工作线程）：记录已结束 trace；
   // 挂起中的延迟语料 trace 匹配则触发
   void on_tts_finished(const std::string & trace_id);
@@ -165,8 +170,8 @@ private:
   // 线程访问，免锁 ----
   struct DeferredPhrase
   {
-    std::string action;               // "navigate" 或 "relocate"
-    std::string point;                // 目标点位名（车型名/航点名）
+    std::string action;               // "navigate" / "relocate" / "welcome_prep"
+    std::string point;                // 目标点位名（车型名/航点名/迎宾点名）
     std::string text;                 // 命中时的 agent 话术（日志/回调透传）
     std::string trace_id;             // 话术来源 TTS 的 trace（终态比对用）
     std::chrono::steady_clock::time_point deadline;  // 超时兜底到期时刻

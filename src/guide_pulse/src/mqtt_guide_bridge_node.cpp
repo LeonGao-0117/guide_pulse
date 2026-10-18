@@ -165,11 +165,11 @@ void MqttGuideBridgeNode::declare_and_load_params()
   // poll 间隔 ~250ms），模拟真机 ~1.5s 验收延迟，供集成测试打开「重定位
   // 进行中」的拒绝窗口；0 = 受理即验收通过
   declare_parameter<int>("mock_relocate_hold_polls", 0);
-  // 重定位等待导航模块验收的超时（2026-10-17 需求：业务终态 = waypoint_
-  // follower 的 set_pose.verified 验收结果，正常 ~1.5s 出结果，30s 兜底
-  // status 丢失/服务卡死；超时按 failed/localization_failed 收尾）
+  // 重定位等待导航模块验收的超时（2026-10-17 需求：业务终态 = 导航栈
+  // set_pose goal 的 result（验收完成才回，正常 ~1.5s，最多 ~3s），
+  // 30s 兜底 result 断流/服务卡死；超时按 failed/localization_failed 收尾）
   declare_parameter<int>("relocate_timeout_seconds", 30);
-  // 导航在途兜底超时：go_to_waypoints 受理后等待 ~/status 终态推送
+  // 导航在途兜底超时：navigate goal 受理后等待 result 终态
   //（SUCCEEDED/FAILED/CANCELLED）的最长时间。正常展厅导航几十秒内到；
   // 超时按 navigation_failed 收尾并释放导览业务——导航栈断流/卡死时
   // 等待期所有新业务被 failed/busy 拒绝，600s 过长会让现场感受为
@@ -185,6 +185,13 @@ void MqttGuideBridgeNode::declare_and_load_params()
   // service）；回执照发，播报属本地增强。空串 = 禁用对应提示
   declare_parameter<std::string>(
     "navigate_failed_text", "导航失败，请检查navigation service是否正常");
+  // 变形未确认双足即拒绝下发导航/重定位时的语音提示（2026-10-18 现场
+  // 需求：导航指令必须等双足形态确认后才发给 t1_slam_nav_ws；运控
+  // 不可用/变形被拒/动作未到位等场景现场要能听到，提示排查运控与
+  // 机器人姿态）；回执照发（failed/transform_failed），播报属本地
+  // 增强。空串 = 禁用播报
+  declare_parameter<std::string>(
+    "navigate_transform_failed_text", "变形未完成，暂时无法导航，请检查机器人姿态");
   declare_parameter<std::string>(
     "relocate_failed_text", "重定位失败，请检查navigation service是否正常");
   // 导览受理成功后的引导语（2026-10-17 现场需求）：确认 [导航] 收到
@@ -193,6 +200,16 @@ void MqttGuideBridgeNode::declare_and_load_params()
   // 点位名）。空串 = 禁用。MQTT 下行与语料触发共用
   declare_parameter<std::string>(
     "navigate_lead_text", "请跟我来，让我带您去看看{point}这款车");
+  // 导航出发播报语（2026-10-18 现场需求）：收到导航指令（无论语音还是
+  // MQTT）受理后先播这句再起身变形人形（先开口、立刻动）；迎宾准备去
+  // 迎宾点的导航不播（agent 已说「好嘞，马上前去迎宾点」，再说就重复，
+  // handle_welcome_prep 独立链路天然跳过）。空串 = 禁用
+  declare_parameter<std::string>("navigate_depart_text", "稍等，马上出发");
+  // 重定位出发播报语（2026-10-18 现场需求）：仅 MQTT 下行的 relocate 先
+  // 播这句再起身变形人形；语料触发不播（agent 已说「好的，这就在A点
+  // 开始重定位」）。空串 = 禁用
+  declare_parameter<std::string>(
+    "relocate_depart_text", "马上开始重定位，请稍后");
   declare_parameter<int>("tour_speak_interval_seconds", 2);
   // 点位映射表落盘文件（v0.25.0 P-039 point_map 全量替换 + 跨重启保留）。
   // 默认 /robot/persist/var/guide_pulse/（平台持久化数据约定位置，与其
@@ -225,6 +242,10 @@ void MqttGuideBridgeNode::declare_and_load_params()
   // 时序）。MQTT 下行与语料触发共用
   declare_parameter<std::string>(
     "welcome_lead_text", "元气满满，小T来迎接我的顾客了。");
+  // 迎宾准备就位播报语（2026-10-18 现场需求）：语料触发导航去迎宾点，
+  // 到达变四足（摄像头收平）后最后播报。空串 = 禁用
+  declare_parameter<std::string>(
+    "welcome_prep_done_text", "元气满满，做好准备迎接顾客");
   // 迎宾流程兜底超时：正常路径播报终态回流（TtsStatus）即释放业务占用
   //（worker 的 tts_early 分支），此参数仅在终态事件丢失（BEST_EFFORT）
   // 时兜底——到期退出迎宾占用，后续 navigate/tts 不再被 business_busy
@@ -268,6 +289,12 @@ void MqttGuideBridgeNode::declare_and_load_params()
   declare_parameter<std::vector<std::string>>(
     "agent_monitor.navigate_stop_phrases",
     std::vector<std::string>{});
+  // 迎宾准备语料（2026-10-18 现场需求）：agent 说「好嘞，马上前去迎宾点
+  // 需要先导航去Y点」类话术 -> 等 agent 说完 -> 先确保人形（导航前置）
+  // -> 导航去 point 迎宾点 -> 到达变四足收摄像头 -> 播就位语。每条格式
+  // 「点位名|语料」，点位名 = 点位映射表 name/code（如 Y）。空列表 = 关闭
+  declare_parameter<std::vector<std::string>>(
+    "agent_monitor.welcome_prep_phrases", std::vector<std::string>{});
   // 导览到达默认车型讲解词（2026-10-17 现场需求）：后端下发导览指令
   // 不带讲解词、或 agent 语料触发导航时，到达后按点位播对应车型的
   // 默认讲解词。每条格式「点位名|讲解词」，点位名 = 点位映射表 name
@@ -301,6 +328,8 @@ void MqttGuideBridgeNode::declare_and_load_params()
   declare_parameter<bool>("welcome_camera_servo", true);  // false 关闭
   declare_parameter<int>("welcome_camera_position", 90);  // 角度 0-90
   declare_parameter<int>("welcome_camera_speed", 500);    // 速度 100-1000
+  // 四足（迎宾准备模式收摄像头）时舵机角度：SDK 定义 0 度 = 四足形态位置
+  declare_parameter<int>("welcome_prep_camera_position", 0);
   declare_parameter<std::string>(
     "set_servo_service", "/aimdk_5Fmsgs/srv/SetServo");  // SDK 固定服务名
   // 变形音：要发变形动作前后台推厂家官方 WAV 的 PCM 到 HAL 播放话题
@@ -311,13 +340,20 @@ void MqttGuideBridgeNode::declare_and_load_params()
   // PulseAudio；固件 v2d0 起 /hal_audio 没了，本机推 PCM 无人消费）。
   // 空 = 厂家官方 transform4to2.wav（App 变形同款，约 1.8s）
   declare_parameter<std::string>("transform_sound_path", "");
+  // 人 -> 狗方向变形音 wav 路径（2026-10-18 迎宾准备四足变形）。
+  // 空 = 同目录 transform2to4.wav（按 4to2 命名推定，真机校准点；
+  // 文件不存在仅一条 WARN 不影响变形）
+  declare_parameter<std::string>("transform_down_sound_path", "");
 
   // ---- 播报伴随动作（TTS 受理成功时触发预设动作）----
   declare_parameter<bool>("motion_enabled", true);
-  // 预设动作轮换池（McPresetMotion 枚举值：1001=右手挥手，2003~2009
-  // 为说话动作族；多条时每次播报轮换一个）
+  // 预设动作轮换池（McPresetMotion 枚举值：1001=右手挥手，2003=双手
+  // 说话动作（幅度小，已弃用），2004~2009=T1 说话动作 1~6（幅度更大，
+  // 2026-10-18 现场需求：讲解动作加大改用此族）；多条时每次播报轮换
+  // 一个，现场看效果可删减或固定某一个
   declare_parameter<std::vector<int64_t>>(
-    "motion_preset_ids", std::vector<int64_t>{1001});
+    "motion_preset_ids",
+    std::vector<int64_t>{2004, 2005, 2006, 2007, 2008, 2009});
   declare_parameter<std::string>(
     "motion_service_name", "/aimdk_5Fmsgs/srv/SetMcPresetMotion");
   declare_parameter<int>("motion_request_timeout_seconds", 2);
@@ -395,8 +431,12 @@ void MqttGuideBridgeNode::declare_and_load_params()
   busy_hint_relocate_text_ = get_parameter("busy_hint_relocate_text").as_string();
   busy_hint_navigate_text_ = get_parameter("busy_hint_navigate_text").as_string();
   navigate_failed_text_ = get_parameter("navigate_failed_text").as_string();
+  navigate_transform_failed_text_ =
+    get_parameter("navigate_transform_failed_text").as_string();
   relocate_failed_text_ = get_parameter("relocate_failed_text").as_string();
   navigate_lead_text_ = get_parameter("navigate_lead_text").as_string();
+  navigate_depart_text_ = get_parameter("navigate_depart_text").as_string();
+  relocate_depart_text_ = get_parameter("relocate_depart_text").as_string();
   tour_speak_interval_seconds_ = std::max(1, static_cast<int>(
     get_parameter("tour_speak_interval_seconds").as_int()));
   point_map_file_ = get_parameter("point_map_file").as_string();
@@ -405,6 +445,7 @@ void MqttGuideBridgeNode::declare_and_load_params()
     get_parameter("point_map_unmatched_text").as_string();
   welcome_default_texts_ = get_parameter("welcome_default_texts").as_string_array();
   welcome_lead_text_ = get_parameter("welcome_lead_text").as_string();
+  welcome_prep_done_text_ = get_parameter("welcome_prep_done_text").as_string();
   // 默认车型讲解词：「点位名|讲解词」逐条解析；格式非法（缺 | 分隔）
   // 跳过并告警，不拖垮其余条目。
   // ⚠️ 必须先把参数值拷进局部变量再遍历：get_parameter 按值返回临时
@@ -666,10 +707,13 @@ bool MqttGuideBridgeNode::start()
   transform_cfg.source_name = mc_source_name_;
   transform_cfg.wait_timeout_seconds = std::max(5, static_cast<int>(
     get_parameter("transform_wait_timeout_seconds").as_int()));
-  // 摄像头舵机（变形完成后竖起摄像头，人脸检测可用）
+  // 摄像头舵机（变形完成后竖起摄像头，人脸检测可用；四足方向收平，
+  // 2026-10-18 迎宾准备模式：摄像头收进去）
   transform_cfg.camera_servo_enabled = get_parameter("welcome_camera_servo").as_bool();
   transform_cfg.camera_position = static_cast<int>(
     get_parameter("welcome_camera_position").as_int());
+  transform_cfg.camera_retract_position = static_cast<int>(
+    get_parameter("welcome_prep_camera_position").as_int());
   transform_cfg.camera_speed = static_cast<int>(
     get_parameter("welcome_camera_speed").as_int());
   transform_cfg.servo_service = get_parameter("set_servo_service").as_string();
@@ -677,6 +721,8 @@ bool MqttGuideBridgeNode::start()
   // 与麦克风静音/屏幕推送同源——密码为空时 McTransform 构造中自行禁用）
   transform_cfg.sound_enabled = get_parameter("welcome_transform_sound").as_bool();
   transform_cfg.sound_path = get_parameter("transform_sound_path").as_string();
+  transform_cfg.down_sound_path =
+    get_parameter("transform_down_sound_path").as_string();
   transform_cfg.ssh_target = get_parameter("display_remote_user").as_string() + "@" +
     get_parameter("display_remote_host").as_string();
   transform_cfg.ssh_pass = get_parameter("display_remote_pass").as_string();
@@ -730,16 +776,15 @@ bool MqttGuideBridgeNode::start()
   }
 
   // 导航执行器：mock（联调/测试）或 waypoint（真机，对接 t1_slam_nav_ws
-  // 的 waypoint_follower 航点巡航服务，docs/design.md §4）
+  // 的 /liwei_navigation/navigate action，docs/design.md §4）
   if (nav_executor_name_ == "waypoint") {
     // poll_timeout 传入 nav_timeout_seconds（可配置兜底，默认 600s）：
-    // 受理后 ~/status 终态推送断流时按超时收尾，导览业务不无限占用
+    // goal 受理后 result 断流时按超时收尾，导览业务不无限占用
     nav_ = std::make_unique<WaypointNavExecutor>(
-      shared_from_this(), "/waypoint_follower/go_to_waypoints",
-      "/waypoint_follower/status", "/waypoint_follower/cancel",
-      std::chrono::milliseconds(1000), std::chrono::seconds(nav_timeout_seconds_));
+      shared_from_this(), "/liwei_navigation/navigate",
+      "/liwei_navigation/query", std::chrono::seconds(nav_timeout_seconds_));
     RCLCPP_INFO(
-      get_logger(), "导航执行器: waypoint（/waypoint_follower 航点服务，"
+      get_logger(), "导航执行器: waypoint（/liwei_navigation/navigate action，"
       "point_name 直接映射航点名，兜底超时 %ds）", nav_timeout_seconds_);
   } else {
     if (nav_executor_name_ != "mock") {
@@ -1059,7 +1104,7 @@ void MqttGuideBridgeNode::inject_command(CommandEvent event)
 // 工作线程：解析 command 信封 -> 回执/过期/幂等过滤 -> tts/tts.stop/scene/
 // navigate/navigate.stop/relocate 分发；音频会话按 next_at 周期调度；导航到达事件经
 // TourRunner 单槽消费（在途导航期间以 250ms 上限等待，保证及时开播讲解）；
-// 重定位等待导航模块验收（在途以 250ms 上限轮询 set_pose.verified，
+// 重定位等待导航模块验收（在途以 250ms 上限轮询 set_pose goal 的 result，
 // relocate_timeout_seconds 超时兜底）
 // ---------------------------------------------------------------------------
 void MqttGuideBridgeNode::worker_loop()
@@ -1115,10 +1160,9 @@ void MqttGuideBridgeNode::worker_loop()
     if (injected.has_value()) {
       // 本地注入指令（语料触发）：operation_id 本地生成唯一，无幂等/
       // 过期面，跳过信封解析直接分发——与 MQTT 下行共用 handle_command
-      //（迎宾互斥窗口等策略在分发内统一生效）
-      RCLCPP_INFO(
-        get_logger(), "本地指令注入: type=%s operation_id=%s",
-        injected->type.c_str(), injected->operation_id.c_str());
+      //（迎宾互斥窗口等策略在分发内统一生效）。不打印注入行（语料
+      // 命中行已含 action/point/话术，后续业务行衔接，2026-10-18 现场
+      // 日志整理）
       handle_command(*injected);
       continue;
     }
@@ -1275,7 +1319,7 @@ void MqttGuideBridgeNode::worker_loop()
         screen_->cancel("超时3min");
       } else if (relocate_pending_) {
         // 重定位验收轮询（250ms 周期）：终态只认导航模块的验收结果
-        //（set_pose.verified）或超时（relocate_timeout_seconds，默认 30s）
+        //（set_pose goal 的 result）或超时（relocate_timeout_seconds，默认 30s）
         const auto verified = nav_->poll_set_pose_verified(relocate_waypoint_);
         if (verified.has_value()) {
           finish_relocate(*verified);
@@ -1294,7 +1338,8 @@ void MqttGuideBridgeNode::worker_loop()
         // 事件由 TourRunner seq 作废，不会到这）
         if (const auto accepted = tour_->poll_accepted()) {
           if (accepted->first && business_ == Business::kTour &&
-            tour_->navigating() && !navigate_lead_text_.empty())
+            tour_->navigating() && !navigate_lead_text_.empty() &&
+            !nav_welcome_prep_)  // 迎宾准备不播「请跟我来看车」引导语（Y 不是车型）
           {
             const auto text =
               replace_point_placeholder(navigate_lead_text_, nav_point_display_);
@@ -1318,37 +1363,75 @@ void MqttGuideBridgeNode::worker_loop()
           }
           nav_operation_id_.clear();
           if (arrival->ok) {
-            // 指令未携带讲解词（MQTT 下行不带 texts / 语料触发）->
-            // 按点位兜底默认车型讲解词（2026-10-17 现场需求）
-            if (arrival->texts.empty()) {
-              arrival->texts = match_nav_default_texts(tour_->current_point());
-              if (!arrival->texts.empty()) {
+            // ---- 迎宾准备到达（2026-10-18 现场需求）：变形四足作为迎宾
+            // 准备模式（摄像头舵机收平 0 度），变形完成后最后播报就位语
+            // 「元气满满，做好准备迎接顾客」。不走默认车型讲解词兜底
+            //（Y 不是车型点）；变形阻塞 worker 等待（与迎宾变形同模式，
+            // 上限 transform_wait_timeout_seconds），期间新指令排队 ----
+            if (nav_welcome_prep_) {
+              nav_welcome_prep_ = false;
+              const std::string prep_source =
+                "迎宾准备:" + tour_->current_point();
+              RCLCPP_INFO(
+                get_logger(), "迎宾准备到达: %s，开始变形四足（摄像头收起）: %s",
+                tour_->current_point().c_str(), prep_source.c_str());
+              transform_->ensure_quadruped(prep_source);
+              if (transform_->in_flight()) {
                 RCLCPP_INFO(
-                  get_logger(), "导航到达: %s，未携带讲解词，播默认讲解词（%zu 条）",
-                  tour_->current_point().c_str(), arrival->texts.size());
+                  get_logger(), "四足变形进行中，变形完成后播就位语: %s",
+                  prep_source.c_str());
               }
-            }
-            if (arrival->texts.empty()) {
-              RCLCPP_INFO(
-                get_logger(), "导航到达: %s（未携带讲解词且无默认词，不播报）",
-                tour_->current_point().c_str());
-              // 到达且无需讲解：导览业务到此结束，释放占用
-              business_ = Business::kNone;
-              business_busy_until_.reset();
+              transform_->wait_done();
+              // 变形结束（成败均已在变形线程记日志）-> 最后播就位语
+              //（短内容不静音：迎宾准备结束要能被唤醒迎接顾客；空串 =
+              // 禁用，到达即释放业务）
+              if (!welcome_prep_done_text_.empty()) {
+                const auto busy_until = estimate_busy_until(
+                  {welcome_prep_done_text_}, tour_speak_interval_seconds_);
+                start_session(
+                  {welcome_prep_done_text_}, TTS_MODE_SEQUENCE,
+                  tour_speak_interval_seconds_, /*loop_forever=*/false,
+                  prep_source,
+                  /*mute_mic=*/false);
+                // 保持导览业务，进入就位语播报窗口（终态回流即刻释放）
+                business_busy_until_ = busy_until;
+              } else {
+                business_ = Business::kNone;
+                business_busy_until_.reset();
+              }
             } else {
-              RCLCPP_INFO(
-                get_logger(), "导航到达: %s，开始汽车讲解（%zu 条）",
-                tour_->current_point().c_str(), arrival->texts.size());
-              // 讲解窗口先算（start_session 会 move 走 texts）
-              const auto busy_until =
-                estimate_busy_until(arrival->texts, tour_speak_interval_seconds_);
-              const std::string source = "讲解:" + tour_->current_point();
-              start_session(
-                std::move(arrival->texts), TTS_MODE_SEQUENCE,
-                tour_speak_interval_seconds_, /*loop_forever=*/false, source,
-                /*mute_mic=*/true);  // 导航讲解词：长内容，静音防打断
-              // 保持导览业务，进入讲解窗口期（窗口到期即释放）
-              business_busy_until_ = busy_until;
+              // 指令未携带讲解词（MQTT 下行不带 texts / 语料触发）->
+              // 按点位兜底默认车型讲解词（2026-10-17 现场需求）
+              if (arrival->texts.empty()) {
+                arrival->texts = match_nav_default_texts(tour_->current_point());
+                if (!arrival->texts.empty()) {
+                  RCLCPP_INFO(
+                    get_logger(), "导航到达: %s，未携带讲解词，播默认讲解词（%zu 条）",
+                    tour_->current_point().c_str(), arrival->texts.size());
+                }
+              }
+              if (arrival->texts.empty()) {
+                RCLCPP_INFO(
+                  get_logger(), "导航到达: %s（未携带讲解词且无默认词，不播报）",
+                  tour_->current_point().c_str());
+                // 到达且无需讲解：导览业务到此结束，释放占用
+                business_ = Business::kNone;
+                business_busy_until_.reset();
+              } else {
+                RCLCPP_INFO(
+                  get_logger(), "导航到达: %s，开始汽车讲解（%zu 条）",
+                  tour_->current_point().c_str(), arrival->texts.size());
+                // 讲解窗口先算（start_session 会 move 走 texts）
+                const auto busy_until =
+                  estimate_busy_until(arrival->texts, tour_speak_interval_seconds_);
+                const std::string source = "讲解:" + tour_->current_point();
+                start_session(
+                  std::move(arrival->texts), TTS_MODE_SEQUENCE,
+                  tour_speak_interval_seconds_, /*loop_forever=*/false, source,
+                  /*mute_mic=*/true);  // 导航讲解词：长内容，静音防打断
+                // 保持导览业务，进入讲解窗口期（窗口到期即释放）
+                business_busy_until_ = busy_until;
+              }
             }
           } else {
             RCLCPP_ERROR(
@@ -1356,7 +1439,8 @@ void MqttGuideBridgeNode::worker_loop()
               tour_->current_point().c_str(), arrival->detail.c_str(),
               nav_local_ ? "不发协议回执（语料触发，Server 不认识本地 id）"
                          : "已回执 navigate.result/failed:navigation_failed");
-            // 导航失败：导览业务结束，释放占用
+            // 导航失败：导览业务结束，释放占用（迎宾准备标志一并清理）
+            nav_welcome_prep_ = false;
             business_ = Business::kNone;
             business_busy_until_.reset();
             // 失败语音提示（2026-10-17 现场需求：导航栈异常现场要能听到，
@@ -1529,6 +1613,11 @@ void MqttGuideBridgeNode::handle_command(const CommandEvent & event)
     return;
   }
 
+  if (event.type == "welcome_prep") {
+    handle_welcome_prep(event);
+    return;
+  }
+
   if (event.type == "navigate") {
     handle_navigate(event);
     return;
@@ -1573,6 +1662,7 @@ void MqttGuideBridgeNode::handle_command(const CommandEvent & event)
       }
       nav_operation_id_.clear();
     }
+    nav_welcome_prep_ = false;  // 迎宾准备在途一并取消（不变形不播就位语）
     cancel_session();
     tour_->cancel();
     const auto result = tts_->stop();
@@ -1596,20 +1686,23 @@ void MqttGuideBridgeNode::handle_command(const CommandEvent & event)
     // cancel_session），无需处理语音/二维码
     if (tour_->navigating()) {
       if (!nav_operation_id_.empty()) {
-        if (!nav_local_) {  // 语料触发不发回执（Server 不认识本地 id）
-          send_action_result(
-            NAVIGATE_RESULT_TYPE, nav_operation_id_, ACTION_RESULT_FAILED,
-            RESULT_REASON_ABORTED);
-        }
+        // 被停止的 navigate 一律回 failed/aborted（v0.24.0 P-038）。
+        // 2026-10-18 现场需求：语料触发的导航（本地 operation_id）也发
+        // 回执——与 navigate.triggered 上报配套，后端对语音触发的导览
+        // 既有「开始」也有「被停止」终态可感知
+        send_action_result(
+          NAVIGATE_RESULT_TYPE, nav_operation_id_, ACTION_RESULT_FAILED,
+          RESULT_REASON_ABORTED);
         nav_operation_id_.clear();
       }
       tour_->cancel();  // 取消导航并清空到达槽（不触发回调）
+      nav_welcome_prep_ = false;  // 迎宾准备在途一并取消（不变形不播就位语）
       business_ = Business::kNone;  // 导览业务到此终止，释放占用
       business_busy_until_.reset();
       RCLCPP_INFO(
-        get_logger(), "停止导航: point=%s operation_id=%s（%s）",
+        get_logger(), "停止导航: point=%s operation_id=%s（已回执 failed/aborted%s）",
         tour_->current_point().c_str(), event.operation_id.c_str(),
-        nav_local_ ? "不发协议回执（语料触发的导航）" : "已回执 failed/aborted");
+        nav_local_ ? "，语料触发的导航" : "");
     } else {
       RCLCPP_INFO(
         get_logger(), "停止导航: 无导航在途 no-op operation_id=%s",
@@ -1701,12 +1794,12 @@ void MqttGuideBridgeNode::handle_cancel_qr(const CommandEvent & event)
 // 导航模块；播报提示 + 回执 failed:point_not_found，不发起 set_pose
 // 也不占用业务；语料触发解析命中即发 relocate.triggered 上报——
 // 2026-10-17 现场确认与 navigate 统一都回推，此后服务不可用/受理被拒
-// 不撤销上报）-> NavExecutor::set_pose 受理（真机经 waypoint_follower 的
-// go_to_waypoints(action=set_pose) **机器人不动**，只发一次 /initialpose
-// 重设定位）-> 置 kRelocate 等待态（占业务互斥，新业务被拒 + 语音提示
+// 不撤销上报）-> NavExecutor::set_pose 受理（真机发 /liwei_navigation/
+// navigate 的 set_pose goal，**机器人不动**，服务端发一次初始位姿并
+// 验收）-> 置 kRelocate 等待态（占业务互斥，新业务被拒 + 语音提示
 //「我正在重定位，请稍后」）-> worker 每 250ms 轮询验收
-//（poll_set_pose_verified：status_json 的 set_pose.verified，真机受理后
-// ~1.5s 出结果）-> 终态收尾见 finish_relocate（回执 + 释占 + 播报），
+//（poll_set_pose_verified：set_pose goal 的 result（验收完成才回），
+// 真机受理后 ~1.5s 出结果）-> 终态收尾见 finish_relocate（回执 + 释占 + 播报），
 // relocate_timeout_seconds（默认 30s）超时兜底。受理失败（航点名不在
 // 航点表/服务不可用/状态冲突被拒）当场回执 failed 不占业务
 // ---------------------------------------------------------------------------
@@ -1748,6 +1841,41 @@ void MqttGuideBridgeNode::handle_relocate(const CommandEvent & event)
   if (event.local) {
     send_nav_triggered(
       RELOCATE_TRIGGERED_TYPE, point_display_name(waypoint, event.point_name));
+  }
+
+  // ---- 重定位出发播报（2026-10-18 现场需求）：仅 MQTT 下行先播「马上
+  // 开始重定位，请稍后」；语料触发不播——agent 已说「好的，这就在A点
+  // 开始重定位」，再说就重复。先开口、立刻动（不等播完，与导航出发语
+  // 同哲学）；空串 = 禁用 ----
+  if (!event.local) {
+    speak_hint(relocate_depart_text_, "relocate_depart");
+  }
+  // ---- 重定位前置变形（2026-10-18 现场需求）：set_pose 有「机器人须
+  // 双足站立」的硬约束（t1_slam_nav_ws 文档），四足迎宾准备模式下必须
+  // 先站起来才能重定位。两个来源（MQTT/语料触发）都变形；已是人形零
+  // 动作立即通过；变形失败不阻断 set_pose（McTransform 内部已记日志）----
+  transform_->ensure_biped("重定位:" + event.operation_id);
+  if (transform_->in_flight()) {
+    RCLCPP_INFO(
+      get_logger(), "重定位前置变形进行中，变形完成后发起 set_pose: %s",
+      event.operation_id.c_str());
+  }
+  transform_->wait_done();
+  // 双足形态门禁（2026-10-18 现场需求）：set_pose 与 navigate 同走
+  // /liwei_navigation/navigate action，且 t1_slam_nav_ws 文档明确
+  // set_pose 有「机器人须双足站立」硬约束——未确认双足直接拒绝
+  //（回 failed/transform_failed），不带注定被导航模块拒的请求跑下去
+  if (!transform_->biped_confirmed()) {
+    RCLCPP_WARN(
+      get_logger(), "重定位被拒: 双足形态未确认（变形失败或运控不可用），"
+      "不下发 set_pose: %s", event.operation_id.c_str());
+    speak_hint(navigate_transform_failed_text_, "relocate_transform_failed");
+    if (!event.local) {
+      send_action_result(
+        RELOCATE_RESULT_TYPE, event.operation_id, ACTION_RESULT_FAILED,
+        RESULT_REASON_TRANSFORM_FAILED);
+    }
+    return;
   }
 
   // 同步受理（真机毫秒级，受理超时兜底 5s）。受理被拒当场终态：
@@ -2277,6 +2405,40 @@ void MqttGuideBridgeNode::handle_navigate(const CommandEvent & event)
   cancel_session();
   // 新业务到达 -> 迎宾二维码让位（前往展位，屏幕回默认表情）
   screen_->cancel("navigate");
+  // ---- 导航出发播报（2026-10-18 现场需求）：收到导航指令无论是语音
+  //（语料触发）还是 MQTT 消息，受理后先播「稍等，马上出发」再起身
+  // 变形（先开口、立刻动——与变形音的叠加观感同哲学，不等播完）。
+  // 空串 = 禁用；迎宾准备去迎宾点的导航不播（agent 已说「好嘞，马上
+  // 前去迎宾点」，再说就重复——独立 handle_welcome_prep 链路天然跳过）----
+  speak_hint(navigate_depart_text_, "navigate_depart");
+  // ---- 导航前置变形（2026-10-18 现场需求）：先变形成人形再发起导航
+  //——四足迎宾准备模式下有人叫导航，机器人要先站起来。已在人形零动作
+  // 立即通过（常见路径毫秒级）；变形失败不阻断导航（McTransform 内部
+  // 已记日志，与迎宾「变形失败照常播报」同哲学）。MQTT 下行与本地注入
+  // 都走本函数，一处覆盖两个来源 ----
+  transform_->ensure_biped("导航:" + event.operation_id);
+  if (transform_->in_flight()) {
+    RCLCPP_INFO(
+      get_logger(), "导航前置变形进行中，变形完成后发起导航: %s",
+      event.operation_id.c_str());
+  }
+  transform_->wait_done();  // worker 阻塞等待（与 handle_scene 迎宾变形同模式）
+  // 双足形态门禁（2026-10-18 现场需求）：变形流程未确认「已是双足且
+  // 运行中」则不得向 t1_slam_nav_ws 发 navigate goal——变形失败路径
+  //（运控不可用/查形态失败/动作被拒/未到位/无已知转移路径）一律
+  // 拒绝导航并回 failed/transform_failed，不带着未确认的姿态出发
+  if (!transform_->biped_confirmed()) {
+    RCLCPP_WARN(
+      get_logger(), "导航被拒: 双足形态未确认（变形失败或运控不可用），"
+      "不下发导航指令: %s", event.operation_id.c_str());
+    speak_hint(navigate_transform_failed_text_, "navigate_transform_failed");
+    if (!event.local) {  // 语料触发不发回执（Server 不认识本地 id）
+      send_action_result(
+        NAVIGATE_RESULT_TYPE, event.operation_id, ACTION_RESULT_FAILED,
+        RESULT_REASON_TRANSFORM_FAILED);
+    }
+    return;
+  }
   // 引导语显示名（{point} 替换用）：映射表反查 code 对应的车型名，
   // 查不到用原始点位名（表结构上 code 必来自表内，反查失败仅防御）
   nav_point_display_ = point_display_name(waypoint, event.point_name);
@@ -2300,6 +2462,77 @@ void MqttGuideBridgeNode::handle_navigate(const CommandEvent & event)
   if (event.local) {
     send_nav_triggered(NAVIGATE_TRIGGERED_TYPE, nav_point_display_);
   }
+}
+
+// ---------------------------------------------------------------------------
+// 迎宾准备模块（type=welcome_prep，2026-10-18 现场需求，仅本地注入：
+// AgentMonitor 命中 agent_monitor.welcome_prep_phrases 语料，如「好嘞，
+// 马上前去迎宾点 需要先导航去Y点」，等 agent 说完该句再触发）。
+// 流程：点位名经映射表解析（同 navigate 口径，未命中拒绝+语音提示）
+// -> 先确保人形（2026-10-18 导航前置：四足状态下要先站起来才能走）
+// -> 发起导航（占导览业务，不发协议回执；语音触发回推 navigate.
+// triggered）-> worker 到达分支接管：变四足收摄像头 + 播就位语
+// ---------------------------------------------------------------------------
+void MqttGuideBridgeNode::handle_welcome_prep(const CommandEvent & event)
+{
+  // 映射表为空 = 配置缺失：直接拒绝（与 handle_navigate 同口径）——
+  // 播报提示 + 不启动导航不占业务（配好表后重新触发即可）
+  if (point_map_->size() == 0U) {
+    RCLCPP_WARN(
+      get_logger(), "迎宾准备被拒绝: 点位映射表为空（未配置）");
+    speak_hint(point_map_missing_text_, "point_map_missing");
+    return;
+  }
+  // 点位解析（映射表唯一权威，与 handle_navigate 同口径）：未命中直接
+  // 拒绝——播报提示 + 不启动导航不占业务（语料触发不发协议回执）
+  std::string waypoint;
+  if (const auto code = point_map_->resolve(event.point_name)) {
+    waypoint = *code;
+    RCLCPP_INFO(
+      get_logger(), "迎宾准备点位解析: 「%s」-> 航点 %s（映射表命中）",
+      event.point_name.c_str(), waypoint.c_str());
+  } else {
+    RCLCPP_WARN(
+      get_logger(), "迎宾准备被拒绝: 「%s」未命中点位映射表（%zu 条）",
+      event.point_name.c_str(), point_map_->size());
+    speak_hint(
+      replace_point_placeholder(point_map_unmatched_text_, event.point_name),
+      "point_map_unmatched");
+    return;
+  }
+  cancel_session();
+  screen_->cancel("welcome_prep");
+  // 导航前置变形（2026-10-18 现场需求）：先变人形再导航（与 handle_
+  // navigate 同款；四足迎宾准备状态下被再次叫去迎宾点也要能走）
+  transform_->ensure_biped("迎宾准备:" + event.operation_id);
+  if (transform_->in_flight()) {
+    RCLCPP_INFO(
+      get_logger(), "迎宾准备导航前置变形进行中，变形完成后发起导航: %s",
+      event.operation_id.c_str());
+  }
+  transform_->wait_done();
+  // 双足形态门禁（与 handle_navigate 同款）：未确认双足不下发导航指令。
+  // 本地注入不发协议回执，拒绝语音照播（现场能听到）
+  if (!transform_->biped_confirmed()) {
+    RCLCPP_WARN(
+      get_logger(), "迎宾准备被拒: 双足形态未确认（变形失败或运控不可用），"
+      "不下发导航指令: %s", event.operation_id.c_str());
+    speak_hint(navigate_transform_failed_text_, "welcome_prep_transform_failed");
+    return;
+  }
+  nav_point_display_ = point_display_name(waypoint, event.point_name);
+  RCLCPP_INFO(
+    get_logger(),
+    "迎宾准备导航开始: point=%s operation_id=%s（到达后变四足收摄像头，再播就位语）",
+    waypoint.c_str(), event.operation_id.c_str());
+  nav_operation_id_ = event.operation_id;
+  nav_local_ = true;           // 本地注入：到达/失败不发协议回执
+  nav_welcome_prep_ = true;    // 到达分支据此走四足变形而非车型讲解
+  tour_->start(waypoint, {});  // 不带讲解词（到达只做变形+就位语）
+  business_ = Business::kTour;
+  business_busy_until_.reset();  // 导航在途：占用由 tour_->navigating() 表达
+  // 语音触发上报（与语料触发 navigate 同面）：App 侧可知机器人正去迎宾点
+  send_nav_triggered(NAVIGATE_TRIGGERED_TYPE, nav_point_display_);
 }
 
 // ---------------------------------------------------------------------------

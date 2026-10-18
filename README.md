@@ -23,7 +23,7 @@ APP 经 Server（RobotCar 协议 v0.25.0）下发参数到 Robot，Robot 本地�
 | --- | --- | --- | --- |
 | 迎宾 | `scene`（`scene="welcome"` + 可选 `texts`） | `scene.result`（v0.24.0） | 先播引导语 `welcome_lead_text`（默认「元气满满，小T来迎接我的顾客了」，2026-10-17 需求，空=禁用）→ **播完再变形**（直调运控 SetMcAction/GetMcAction，已是人形零动作；不依赖 t1_slam_nav_ws）→ 变形完成后才播迎宾词一轮（texts 缺省用 `welcome_default_texts`；二维码准备与引导语/变形并行，上屏在变形后 TTS 前） |
 | 导航 + 汽车讲解 | `navigate`（`point_name` + 可选 `texts`） | `navigate.result`（v0.24.0） | 导航到点位，到达后按序播讲解词一轮（到达回 `success`；失败/中止/忙碌回 `failed+reason`） |
-| 地图重定位 | `relocate`（`point_name` + 可选 `texts`，2026-10-17 接入） | `relocate.result` | **不可打断的互斥业务**：`point_name` 经映射表解析 -> `set_pose` 重设定位初值（机器人不动）-> 等 `waypoint_follower` 验收（`set_pose.verified`，真机 ~1.5s；`relocate_timeout_seconds` 默认 30s 超时兜底）-> 验收通过回 `success` 并播报（缺省「{点位名}点重定位成功」）；等待期新业务回 `failed/busy` 并播「我正在重定位，请稍后」（迎宾/播报/讲解中被拒不播——正在出声）；受理被拒当场回 `point_not_found`/`localization_failed`（兼语料触发本地注入，不回执） |
+| 地图重定位 | `relocate`（`point_name` + 可选 `texts`，2026-10-17 接入） | `relocate.result` | **不可打断的互斥业务**：`point_name` 经映射表解析 -> `set_pose` goal 重设定位初值（机器人不动）-> 等导航模块验收（goal result（验收完才回），真机 ~1.5s；`relocate_timeout_seconds` 默认 30s 超时兜底）-> 验收通过回 `success` 并播报（缺省「{点位名}点重定位成功」）；等待期新业务回 `failed/busy` 并播「我正在重定位，请稍后」（迎宾/播报/讲解中被拒不播——正在出声）；受理被拒当场回 `point_not_found`/`localization_failed`（兼语料触发本地注入，不回执） |
 | 播报 | `tts`（`texts`+`mode`+`interval_seconds`） | `tts.result` | 列表单轮播完自行结束（2026-10-14 变更，原为循环播到替换/停止） |
 | 停止 | `tts.stop` | 无 | 停一切播报并取消导航 |
 | 取消导航 | `navigate.stop`（v0.23.0） | 无 | 只取消当前导航（无导航 no-op，不影响讲解/播报） |
@@ -32,8 +32,8 @@ APP 经 Server（RobotCar 协议 v0.25.0）下发参数到 Robot，Robot 本地�
 本地策略：音频单会话（新播报替换旧会话）；导航单任务（新 navigate 替换旧导航）；
 tts/迎宾/讲解均单轮播完自行结束（2026-10-14 起 tts 不再循环）；迎宾词播报未完
 期间新 scene/navigate 直接拒绝（2026-10-15，无回执面本地丢弃）。SDK 无点位导航服务——`NavExecutor` 为真机对接点
-（默认 Mock；真机实现对接 `/opt/liwei/t1_slam_nav_ws` 的 `GoToWaypoints`
-航点服务，见 docs/design.md §4）。
+（默认 Mock；真机实现对接 `/opt/liwei/t1_slam_nav_ws` 的
+`/liwei_navigation/navigate` action，见 docs/design.md §4）。
 
 ## 2. 目录结构
 
@@ -123,9 +123,9 @@ busy 拒绝）、过期指令、幂等回执。详见 `docs/testing.md`。
 ## 5. 已知边界
 
 - 导航执行器二选一（参数 `nav_executor`）：`mock`（默认，联调/测试）或
-  `waypoint`（真机，对接 t1_slam_nav_ws `/waypoint_follower` 航点服务，
-  `point_name` 直接映射航点名，详见 `docs/design.md` §4）。真机启用
-  前置条件：t1_slam_nav_ws 航点巡航在该机上可用。
+  `waypoint`（真机，对接 t1_slam_nav_ws `/liwei_navigation/navigate`
+  action，`point_name` 直接映射航点名，详见 `docs/design.md` §4）。真机启用
+  前置条件：t1_slam_nav_ws 导航栈（liwei_navigation）在该机上可用。
 - 迎宾变形（2026-10-15）：迎宾时直调厂家运控（`SetMcAction`/
   `GetMcAction`，本体固件提供）确保人形——狗站立/行走态按 SDK 转移表
   逐步变形，已是人形零动作，趴姿默认一路扶起（`welcome_stand_from_down`
