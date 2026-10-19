@@ -219,10 +219,10 @@ void MqttGuideBridgeNode::declare_and_load_params()
   declare_parameter<std::string>(
     "relocate_depart_text", "马上开始重定位，请稍后");
   declare_parameter<int>("tour_speak_interval_seconds", 2);
-  // 点位映射表落盘文件（v0.25.0 P-039 point_map 全量替换 + 跨重启保留）。
-  // 默认 /robot/persist/var/guide_pulse/（平台持久化数据约定位置，与其
-  // 他模块的 var 数据同级）；PointMapStore 会自动建目录，文件不存在 =
-  // 空表合法（等 App 推表），重启不丢
+  // 点位映射表落盘文件（v0.25.0 P-039 point_map 全量替换 + 跨重启保留；
+  // v0.28.0 P-042 起含播放词一起落盘）。默认 /robot/persist/var/guide_pulse/
+  //（平台持久化数据分区 ext4，断电不丢）；PointMapStore 会自动建目录，
+  // 文件不存在 = 空表合法（等 App 推表），重启不丢
   declare_parameter<std::string>(
     "point_map_file", "/robot/persist/var/guide_pulse/point_map.json");
   // navigate 到达而映射表为空（App 未推表）时的本地提示话术：播报后
@@ -311,7 +311,9 @@ void MqttGuideBridgeNode::declare_and_load_params()
   // 默认讲解词。每条格式「点位名|讲解词」，点位名 = 点位映射表 name
   //（如「比亚迪 M9 DM-i」）或 code（如「A」）；匹配按归一化比对
   //（去空格+小写，现场 name 空格风格不一均能命中）。命中多条则依次
-  // 播报；点位未命中 = 到达不播报（维持旧行为）；空列表 = 功能关闭
+  // 播报；点位未命中 = 到达不播报（维持旧行为）；空列表 = 功能关闭。
+  // 优先级（v0.28.0 P-042 后）：指令自带 texts > 点位映射表条目 text
+  // > 此默认词——App 推表配了播放词即覆盖本地词，未配时本地兜底
   declare_parameter<std::vector<std::string>>(
     "navigate_default_texts", std::vector<std::string>{});
   // 按 trace_id 回查 TTS 话术原文（运控板日志，复用 display_remote_* SSH 配置）
@@ -1434,7 +1436,23 @@ void MqttGuideBridgeNode::worker_loop()
               }
             } else {
               // 指令未携带讲解词（MQTT 下行不带 texts / 语料触发）->
-              // 按点位兜底默认车型讲解词（2026-10-17 现场需求）
+              // 到达播报三级优先（本地策略，P-042 契约留给 Robot）：
+              //   1) 指令自带 texts（上方分支，最具体，逐次内容优先）
+              //   2) 点位映射表条目 text（v0.28.0 P-042：App 推表配置的
+              //      播放词——现场在 App 改表即生效，无需改 yaml 重启）
+              //   3) 本地 navigate_default_texts 默认车型讲解词
+              //      （2026-10-17 现场需求，App 未配 text 时的兜底）
+              if (arrival->texts.empty()) {
+                if (const auto point_text =
+                  point_map_->text_for_code(tour_->current_point()))
+                {
+                  arrival->texts = {*point_text};
+                  RCLCPP_INFO(
+                    get_logger(),
+                    "导航到达: %s，未携带讲解词，播点位映射表播放词（%zu 字节）",
+                    tour_->current_point().c_str(), point_text->size());
+                }
+              }
               if (arrival->texts.empty()) {
                 arrival->texts = match_nav_default_texts(tour_->current_point());
                 if (!arrival->texts.empty()) {
@@ -1833,9 +1851,9 @@ void MqttGuideBridgeNode::handle_cancel_qr(const CommandEvent & event)
 //（2026-10-17 现场需求，与 navigate 对齐：未命中即拒绝——映射表是
 // 唯一权威，未命中=表与现场不同步，透传航点名只会把错误下发给
 // 导航模块；播报提示 + 回执 failed:point_not_found，不发起 set_pose
-// 也不占用业务；语料触发解析命中即发 relocate.triggered 上报——
-// 2026-10-17 现场确认与 navigate 统一都回推，此后服务不可用/受理被拒
-// 不撤销上报）-> NavExecutor::set_pose 受理（真机发 /liwei_navigation/
+// 也不占用业务；语料触发的 relocate.triggered 上报自 2026-10-19 现场
+// 需求起改为**验收通过后**才发（finish_relocate；2026-10-17 旧行为
+// 是解析命中即发，已废弃——只有重定位成功才发消息给后端））-> NavExecutor::set_pose 受理（真机发 /liwei_navigation/
 // navigate 的 set_pose goal，**机器人不动**，服务端发一次初始位姿并
 // 验收）-> 置 kRelocate 等待态（占业务互斥，新业务被拒 + 语音提示
 //「我正在重定位，请稍后」）-> worker 每 250ms 轮询验收
@@ -1875,14 +1893,11 @@ void MqttGuideBridgeNode::handle_relocate(const CommandEvent & event)
     return;
   }
 
-  // v0.26.0（P-040）语音触发上报：点位解析命中即上报（2026-10-17 现场
-  // 确认与 navigate 统一都回推——上报点 = 语音触发成立、进入执行流程；
-  // 此后服务不可用/受理被拒属执行故障，不撤销上报。语料触发无 result
-  // 回执，App 拿到的是「语音触发了去该点」的事实，不跟踪后续执行）
-  if (event.local) {
-    send_nav_triggered(
-      RELOCATE_TRIGGERED_TYPE, point_display_name(waypoint, event.point_name));
-  }
+  // 语音触发上报（v0.26.0 P-040）：**不在受理时发**——2026-10-19 现场
+  // 需求改为重定位**验收通过后**才发 relocate.triggered（见
+  // finish_relocate；此前 2026-10-17 行为是点位解析命中即发）——只有
+  // 重定位成功才发消息给后端，此后的变形被拒/受理被拒/验收失败/超时
+  // 均不上报（App 不感知失败的语音重定位）
 
   // ---- 重定位出发播报（2026-10-18 现场需求）：仅 MQTT 下行先播「马上
   // 开始重定位，请稍后」；语料触发不播——agent 已说「好的，这就在A点
@@ -1952,6 +1967,10 @@ void MqttGuideBridgeNode::handle_relocate(const CommandEvent & event)
     source, waypoint.c_str(), event.operation_id.c_str(), outcome.detail.c_str());
   relocate_pending_ = true;
   relocate_operation_id_ = event.operation_id;
+  // 显示名（映射表 name，反查失败用原始 point_name）：终态验收通过后
+  // 语料触发的 relocate.triggered 上报用（2026-10-19 需求），受理时定格
+  //（等待期 point_map 可能被 App 重推，终态反查会漂移）
+  relocate_display_name_ = point_display_name(waypoint, event.point_name);
   relocate_waypoint_ = std::move(waypoint);
   relocate_point_name_ = event.point_name;
   relocate_texts_ = event.texts;
@@ -1982,10 +2001,16 @@ void MqttGuideBridgeNode::finish_relocate(bool verified)
     RCLCPP_INFO(
       get_logger(), "%s重定位验收通过: 航点「%s」operation_id=%s，%s",
       source, relocate_waypoint_.c_str(), relocate_operation_id_.c_str(),
-      relocate_local_ ? "不发协议回执（语料触发）" : "回执 success");
+      relocate_local_ ? "语料触发：发 relocate.triggered 上报（成功后才发，2026-10-19 需求）"
+                      : "回执 success");
     if (!relocate_local_) {
       send_action_result(
         RELOCATE_RESULT_TYPE, relocate_operation_id_, ACTION_RESULT_SUCCESS);
+    } else {
+      // 2026-10-19 现场需求：语料触发的重定位只有验收通过才发消息给
+      // 后端（relocate.triggered，P-040 事件形状不变，仅发布时机从
+      // 受理时挪到终态成功；App 拿到即「语音重定位已成功」的事实）
+      send_nav_triggered(RELOCATE_TRIGGERED_TYPE, relocate_display_name_);
     }
     // 播报在业务释放之后（协议语义：重定位成功即 success，texts 播报
     // 与否属本地细节不影响结果；播报期间新业务可替换会话——音频单会话）
@@ -2003,8 +2028,9 @@ void MqttGuideBridgeNode::finish_relocate(bool verified)
     RCLCPP_WARN(
       get_logger(), "%s重定位未通过: 航点「%s」operation_id=%s，%s",
       source, relocate_waypoint_.c_str(), relocate_operation_id_.c_str(),
-      relocate_local_ ? "不发协议回执（语料触发，Server 不认识本地 id）"
-                      : "回执 failed/localization_failed");
+      relocate_local_
+        ? "语料触发：不发协议回执、不发 relocate.triggered 上报（成功才发，2026-10-19 需求）"
+        : "回执 failed/localization_failed");
     if (!relocate_local_) {
       send_action_result(
         RELOCATE_RESULT_TYPE, relocate_operation_id_, ACTION_RESULT_FAILED,
@@ -2052,8 +2078,10 @@ void MqttGuideBridgeNode::speak_busy_hint()
 }
 
 // ---------------------------------------------------------------------------
-// 点位映射表（type=point_map，v0.25.0 P-039）：用 points 全量替换本地
-// 映射（不做增量合并；App 是唯一权威来源），每次下发都整表覆盖旧表。
+// 点位映射表（type=point_map，v0.25.0 P-039；v0.28.0 P-042 条目含可选
+// 播放文本 text）：用 points 全量替换本地映射（不做增量合并；App 是
+// 唯一权威来源），每次下发都整表覆盖旧表（点位映射 + 播放词一起落盘
+// 持久化分区，断电不丢、重启自动加载）。
 // 纯数据同步：不受业务互斥拦截（见 handle_command 放行说明），也不占用
 // 业务；在 worker 线程串行处理，替换瞬间完成（毫秒级文件写），不与在途
 // 播报/导航产生交叉。幂等由 worker 通用通道保证：同一 operation_id 重发
@@ -2065,13 +2093,22 @@ void MqttGuideBridgeNode::speak_busy_hint()
 // ---------------------------------------------------------------------------
 void MqttGuideBridgeNode::handle_point_map(const CommandEvent & event)
 {
+  // 播放词（P-042）条数单列：现场排查「App 是否已配播放词」一眼可辨
+  std::size_t text_count = 0;
+  for (const auto & entry : event.points) {
+    if (entry.text.has_value()) {
+      ++text_count;
+    }
+  }
   RCLCPP_INFO(
-    get_logger(), "点位映射表同步: %zu 条 operation_id=%s（全量替换旧表 %zu 条）",
-    event.points.size(), event.operation_id.c_str(), point_map_->size());
+    get_logger(), "点位映射表同步: %zu 条（含播放词 %zu 条）operation_id=%s"
+    "（全量替换旧表 %zu 条）",
+    event.points.size(), text_count, event.operation_id.c_str(), point_map_->size());
   if (point_map_->replace(event.points)) {
     for (const auto & entry : event.points) {
       RCLCPP_INFO(
-        get_logger(), "  映射: %s -> %s", entry.code.c_str(), entry.name.c_str());
+        get_logger(), "  映射: %s -> %s%s", entry.code.c_str(), entry.name.c_str(),
+        entry.text.has_value() ? "（含播放词）" : "");
     }
     send_action_result(POINT_MAP_RESULT_TYPE, event.operation_id, ACTION_RESULT_SUCCESS);
     // 同步成功后的本地语音提示（现场可感知，2026-10-17 需求）：附加
@@ -2383,30 +2420,44 @@ void MqttGuideBridgeNode::speak_hint(const std::string & text, const char * trac
 // 180° 转身（QUADRUPED_TO_BIPED_ROTATE），AMCL 定位被带偏；服务端用
 // 最新停留点（最近一次导航结束实际停的位置）重设初值拉回。本身就是
 // 人形（零动作路径）不发送。失败/被拒（无停留点/导航栈未起/正在变形
-// 等）只记日志不阻断业务——补偿性重定位，尽力而为
+// 等）只记日志不阻断业务——补偿性重定位，尽力而为。
+// force（2026-10-19 现场需求，真机验证修正）：true = 未变形也**强制**
+// 发 set_pose——语料触发的导航上报必须建立在真实重定位成功之上
+//（首版实现把「已是人形跳过」视为成功，真机验证机器人本来就在人形
+// 下、未做任何重定位也发了 navigate.triggered，被现场打回；强制做一
+// 次最新停留点 set_pose，失败即不上报）。
+// 返回值：true = 重定位成功（含 force=false 且未变形的跳过路径——
+// MQTT 下行无上报面，维持补偿性语义）；false = 尝试了但失败/被拒——
+// 语料触发的 navigate.triggered 上报据此把关（只有重定位成功才发消息
+// 给后端）
 // ---------------------------------------------------------------------------
-void MqttGuideBridgeNode::relocate_after_transform(const std::string & source)
+bool MqttGuideBridgeNode::relocate_after_transform(const std::string & source, bool force)
 {
-  if (!transform_->biped_transformed()) {
+  if (!transform_->biped_transformed() && !force) {
     RCLCPP_INFO(
       get_logger(), "变形后重定位跳过: 本次未发生形态切换（已是人形）（%s）",
       source.c_str());
-    return;
+    return true;  // 无形态切换 = 定位未被带偏，无需重定位，视为成功
   }
   RCLCPP_INFO(
     get_logger(),
-    "变形后重定位: 发送 set_pose（最新停留点）到 t1_slam_nav_ws，"
-    "等验收结果（通常零点几秒）（%s）", source.c_str());
+    "%s: 发送 set_pose（最新停留点）到 t1_slam_nav_ws，等验收结果"
+    "（通常零点几秒）（%s）",
+    transform_->biped_transformed() ? "变形后重定位" : "强制重定位（未变形，语料触发上报前置）",
+    source.c_str());
   const auto outcome = nav_->set_pose_latest();
   if (outcome.ok) {
     RCLCPP_INFO(
-      get_logger(), "变形后重定位完成: %s（%s）",
+      get_logger(), "%s完成: %s（%s）",
+      transform_->biped_transformed() ? "变形后重定位" : "强制重定位",
       outcome.detail.c_str(), source.c_str());
-  } else {
-    RCLCPP_WARN(
-      get_logger(), "变形后重定位失败(不影响后续流程): %s（%s）",
-      outcome.detail.c_str(), source.c_str());
+    return true;
   }
+  RCLCPP_WARN(
+    get_logger(), "%s失败(不影响后续流程): %s（%s）",
+    transform_->biped_transformed() ? "变形后重定位" : "强制重定位",
+    outcome.detail.c_str(), source.c_str());
+  return false;
 }
 
 std::string MqttGuideBridgeNode::point_display_name(
@@ -2564,8 +2615,13 @@ void MqttGuideBridgeNode::handle_navigate(const CommandEvent & event)
   // 变形后重定位（2026-10-18 现场需求）：前置变形真的变了形（180°
   // 转身把 AMCL 带偏）-> 先发 set_pose（最新停留点）等终态再发导航
   // goal——set_pose 在途时发 go 会被「任务在跑」拒，必须等它做完；
-  // 已是人形零动作路径跳过。失败不阻断导航（记日志继续出发）
-  relocate_after_transform("导航:" + event.operation_id);
+  // 已是人形零动作路径跳过。失败不阻断导航（记日志继续出发），但
+  // 2026-10-19 现场需求起成败交由调用方把关语料触发的上报。
+  // 语料触发（local）强制重定位（force）：已是人形也真做一次 set_pose
+  //——首版把「跳过」当成功，真机在人形下未做任何重定位也发了
+  // navigate.triggered，被现场打回；只有真实重定位成功才发消息给后端
+  const bool relocate_ok =
+    relocate_after_transform("导航:" + event.operation_id, /*force=*/event.local);
   // 引导语显示名（{point} 替换用）：映射表反查 code 对应的车型名，
   // 查不到用原始点位名（表结构上 code 必来自表内，反查失败仅防御）
   nav_point_display_ = point_display_name(waypoint, event.point_name);
@@ -2581,13 +2637,21 @@ void MqttGuideBridgeNode::handle_navigate(const CommandEvent & event)
   tour_->start(waypoint, event.texts);
   business_ = Business::kTour;
   business_busy_until_.reset();  // 导航在途：占用由 tour_->navigating() 表达
-  // v0.26.0（P-040）语音触发上报：语料触发的导航点位解析命中、进入
-  // 执行流程，发布恰好一条 navigate.triggered 回推 App（point_name 取
-  // 映射表显示名；此后服务不可用等执行故障不撤销上报——2026-10-17
-  // 现场确认与 relocate 统一都回推；App 下发的 navigate 不产生本上报
-  // ——App 已知自己触发了什么）
+  // v0.26.0（P-040）语音触发上报：语料触发的导航进入执行流程后回推
+  // navigate.triggered 给 App（point_name 取映射表显示名；App 下发的
+  // navigate 不产生本上报——App 已知自己触发了什么）。2026-10-19 现场
+  // 需求：**只有前置重定位真实成功才发**（未变形也强制做了 set_pose
+  // 最新停留点；失败=不上报——定位未验证/未拉回的导航不该让 App 感知；
+  // 导航本身照常出发）
   if (event.local) {
-    send_nav_triggered(NAVIGATE_TRIGGERED_TYPE, nav_point_display_);
+    if (relocate_ok) {
+      send_nav_triggered(NAVIGATE_TRIGGERED_TYPE, nav_point_display_);
+    } else {
+      RCLCPP_WARN(
+        get_logger(),
+        "前置重定位失败，不发 navigate.triggered 上报（只有重定位成功"
+        "才发，2026-10-19 需求）: point=%s", nav_point_display_.c_str());
+    }
   }
 }
 
@@ -2648,8 +2712,11 @@ void MqttGuideBridgeNode::handle_welcome_prep(const CommandEvent & event)
     return;
   }
   // 变形后重定位（与 handle_navigate 同款，2026-10-18 现场需求）：
-  // 变了形先 set_pose（最新停留点）再发导航 goal；已是人形跳过
-  relocate_after_transform("迎宾准备:" + event.operation_id);
+  // 变了形先 set_pose（最新停留点）再发导航 goal；已是人形跳过。
+  // 成败同样把关语音触发上报（2026-10-19 需求，与 handle_navigate 同
+  // 口径）：本入口恒为语料触发，未变形也强制重定位，成功才上报
+  const bool relocate_ok =
+    relocate_after_transform("迎宾准备:" + event.operation_id, /*force=*/true);
   nav_point_display_ = point_display_name(waypoint, event.point_name);
   RCLCPP_INFO(
     get_logger(),
@@ -2662,7 +2729,15 @@ void MqttGuideBridgeNode::handle_welcome_prep(const CommandEvent & event)
   business_ = Business::kTour;
   business_busy_until_.reset();  // 导航在途：占用由 tour_->navigating() 表达
   // 语音触发上报（与语料触发 navigate 同面）：App 侧可知机器人正去迎宾点
-  send_nav_triggered(NAVIGATE_TRIGGERED_TYPE, nav_point_display_);
+  //（2026-10-19 需求：只有变形后重定位成功才发，与 handle_navigate 同口径）
+  if (relocate_ok) {
+    send_nav_triggered(NAVIGATE_TRIGGERED_TYPE, nav_point_display_);
+  } else {
+    RCLCPP_WARN(
+      get_logger(),
+      "前置重定位失败，不发 navigate.triggered 上报（迎宾准备，只有"
+      "重定位成功才发，2026-10-19 需求）: point=%s", nav_point_display_.c_str());
+  }
 }
 
 // ---------------------------------------------------------------------------

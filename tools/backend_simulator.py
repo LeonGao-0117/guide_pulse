@@ -153,10 +153,12 @@ def main():
 
     p_pointmap = sub.add_parser(
         "point-map", help="下发点位映射表全量同步（type=point_map，v0.25.0，"
-                          "回 point_map.result）")
+                          "回 point_map.result；条目可选播放词 text 为 v0.28.0 P-042）")
     p_pointmap.add_argument(
-        "entries", nargs="+", metavar="CODE=NAME",
-        help='映射条目（1..256 条，全量替换机器人本地表），如 "A=比亚迪ATTO 1"')
+        "entries", nargs="+", metavar="CODE=NAME[=TEXT]",
+        help='映射条目（1..256 条，全量替换机器人本地表），如 "A=比亚迪ATTO 1"；'
+             '第三段可选为该点位播放词（1..2048 标量），如 '
+             '"A=比亚迪ATTO 1=这是比亚迪ATTO 1的展车了"（NAME/TEXT 不得含 =）')
     p_pointmap.add_argument("--expires", type=int, default=120, help="指令有效期秒（默认 120）")
     p_pointmap.add_argument("--wait-result", type=float, default=3.0,
                             help="发布后等待 point_map.result 回执的秒数（默认 3，0 不等待）")
@@ -272,15 +274,28 @@ def main():
         event = build_event("relocate", payload, expires=args.expires)
         desc = f"重定位 point={args.point} 播报词={len(args.texts)}条（0=本地默认）"
     elif args.command == "point-map":
+        # 条目 CODE=NAME 或 CODE=NAME=TEXT（P-042 可选播放词；按 = 拆三段，
+        # NAME/TEXT 含 = 会歧义，直接报错）
         points = []
         for entry in args.entries:
-            code, sep, name = entry.partition("=")
-            if not sep or not code or not name:
-                parser.error(f'映射条目格式应为 CODE=NAME: "{entry}"')
-            points.append({"code": code, "name": name})
+            parts = entry.split("=")
+            if len(parts) == 2:
+                code, name = parts
+                point = {"code": code, "name": name}
+            elif len(parts) == 3:
+                code, name, text = parts
+                if not text:
+                    parser.error(f'播放词不可为空串（省略即不配）: "{entry}"')
+                point = {"code": code, "name": name, "text": text}
+            else:
+                parser.error(f'映射条目格式应为 CODE=NAME[=TEXT]: "{entry}"')
+            if not code or not name:
+                parser.error(f'映射条目格式应为 CODE=NAME[=TEXT]: "{entry}"')
+            points.append(point)
         payload = {"operation_id": operation_id, "points": points}
         event = build_event("point_map", payload, expires=args.expires)
-        desc = f"点位映射表同步 {len(points)} 条（全量替换）"
+        text_count = sum(1 for p in points if "text" in p)
+        desc = f"点位映射表同步 {len(points)} 条（全量替换，含播放词 {text_count} 条）"
     elif args.command == "play":
         event = build_event("tts", {
             "operation_id": operation_id,

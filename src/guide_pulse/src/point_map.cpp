@@ -34,13 +34,26 @@ std::size_t utf8_scalar_count(const std::string & value)
   return count;
 }
 
-// 单条目结构校验（加载路径复用契约限制；解析路径已在协议层校验）
-bool valid_entry(const std::string & code, const std::string & name)
+// 单条目结构校验（加载路径复用契约限制；解析路径已在协议层校验）。
+// text（P-042）可选：存在时须为 string 且 1..2048 Unicode 标量
+bool valid_entry(
+  const std::string & code, const std::string & name,
+  const std::optional<std::string> & text)
 {
   const auto code_scalars = utf8_scalar_count(code);
   const auto name_scalars = utf8_scalar_count(name);
-  return code_scalars >= 1U && code_scalars <= POINT_CODE_MAX_SCALARS &&
-         name_scalars >= 1U && name_scalars <= POINT_NAME_MAX_SCALARS;
+  if (!(code_scalars >= 1U && code_scalars <= POINT_CODE_MAX_SCALARS &&
+    name_scalars >= 1U && name_scalars <= POINT_NAME_MAX_SCALARS))
+  {
+    return false;
+  }
+  if (text.has_value()) {
+    const auto text_scalars = utf8_scalar_count(*text);
+    if (text_scalars < 1U || text_scalars > POINT_TEXT_MAX_SCALARS) {
+      return false;  // 空串/超长：文件被动过的防御，整表作废
+    }
+  }
+  return true;
 }
 
 }  // namespace
@@ -65,7 +78,13 @@ bool PointMapStore::replace(const std::vector<PointMapEntry> & points)
     doc["spec_version"] = "1.0";
     json items = json::array();
     for (const auto & entry : points) {
-      items.push_back({{"code", entry.code}, {"name", entry.name}});
+      // text（P-042）仅有值时写入（omitempty 语义）：无 text 的条目
+      // 序列化与旧格式逐字节一致，旧版本文件/工具无缝兼容
+      json item = {{"code", entry.code}, {"name", entry.name}};
+      if (entry.text.has_value()) {
+        item["text"] = *entry.text;
+      }
+      items.push_back(std::move(item));
     }
     doc["points"] = std::move(items);
 
@@ -121,15 +140,26 @@ bool PointMapStore::load()
   std::vector<PointMapEntry> loaded;
   std::set<std::string> seen_codes;
   for (const auto & item : doc["points"]) {
-    if (!item.is_object() || !item.contains("code") || !item["code"].is_string() ||
+    if (!item.is_object() || (item.size() != 2U && item.size() != 3U) ||
+      !item.contains("code") || !item["code"].is_string() ||
       !item.contains("name") || !item["name"].is_string())
     {
       return false;  // 结构不符：整表作废（防御文件被改动）
     }
+    // text 可选（P-042）：第 3 字段必须是 text 且为 string（空串/超长
+    // 经 valid_entry 拒，非 string 此处拒），未知字段拒
+    if (item.size() == 3U && (!item.contains("text") || !item["text"].is_string())) {
+      return false;
+    }
     PointMapEntry entry;
     entry.code = item["code"].get<std::string>();
     entry.name = item["name"].get<std::string>();
-    if (!valid_entry(entry.code, entry.name) || !seen_codes.insert(entry.code).second) {
+    if (item.contains("text")) {
+      entry.text = item["text"].get<std::string>();
+    }
+    if (!valid_entry(entry.code, entry.name, entry.text) ||
+      !seen_codes.insert(entry.code).second)
+    {
       return false;
     }
     loaded.push_back(std::move(entry));
@@ -160,6 +190,17 @@ std::optional<std::string> PointMapStore::resolve(const std::string & point_name
     [&point_name](const PointMapEntry & entry) {return entry.name == point_name;});
   if (by_name != points_.end()) {
     return by_name->code;
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> PointMapStore::text_for_code(const std::string & code) const
+{
+  const auto hit = std::find_if(
+    points_.begin(), points_.end(),
+    [&code](const PointMapEntry & entry) {return entry.code == code;});
+  if (hit != points_.end()) {
+    return hit->text;
   }
   return std::nullopt;
 }

@@ -27,7 +27,7 @@ APP 经 Server（RobotCar 协议 v0.25.0）下发参数到 Robot，Robot 本地�
 | 播报 | `tts`（`texts`+`mode`+`interval_seconds`） | `tts.result` | 列表单轮播完自行结束（2026-10-14 变更，原为循环播到替换/停止） |
 | 停止 | `tts.stop` | 无 | 停一切播报并取消导航 |
 | 取消导航 | `navigate.stop`（v0.23.0） | 无 | 只取消当前导航（无导航 no-op，不影响讲解/播报） |
-| 点位映射表同步 | `point_map`（v0.25.0 P-039） | `point_map.result` | App 唯一权威：`points`（1..256 条 `{code,name}`）**全量替换**本地映射并落盘（`point_map_file`，重启自动加载）；纯数据同步**不受业务互斥拦截**；落盘失败回 `failed/point_map_failed`。此后 `navigate`/`relocate` 的 `point_name` 经映射表 `name->code` 解析（如「比亚迪ATTO 1」→航点 `A`），未命中原样透传 |
+| 点位映射表同步 | `point_map`（v0.25.0 P-039 + v0.28.0 P-042 播放词） | `point_map.result` | App 唯一权威：`points`（1..256 条 `{code,name,text?}`）**全量替换**本地映射并落盘（`point_map_file` 默认持久化分区 `/robot/persist/var/guide_pulse/point_map.json`，**断电不丢**、重启自动加载）；`text`（可选 1..2048 标量）为该点位播放词——到达播报优先级：指令 `texts` > 点位表 `text` > 本地 `navigate_default_texts` 兜底；纯数据同步**不受业务互斥拦截**；落盘失败回 `failed/point_map_failed`。此后 `navigate`/`relocate` 的 `point_name` 经映射表 `name->code` 解析（如「比亚迪ætəʊ 1」→航点 `A`），未命中原样透传 |
 
 本地策略：音频单会话（新播报替换旧会话）；导航单任务（新 navigate 替换旧导航）；
 tts/迎宾/讲解均单轮播完自行结束（2026-10-14 起 tts 不再循环）；迎宾词播报未完

@@ -1,11 +1,13 @@
 // ============================================================================
-// 点位映射表本地存储单测（v0.25.0 P-039）：全量替换语义、原子落盘、
-// 跨实例加载（重启恢复）、name->code 解析、损坏文件防御、纯内存模式。
+// 点位映射表本地存储单测（v0.25.0 P-039；v0.28.0 P-042 播放词 text）：
+// 全量替换语义、原子落盘、跨实例加载（重启恢复）、name->code 解析、
+// 播放词随表持久化与查询、损坏文件防御、纯内存模式。
 // 无 ROS 依赖。
 // ============================================================================
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <vector>
@@ -214,6 +216,109 @@ TEST_F(PointMapStoreTest, PersistedFileIsCompleteJson)
   ASSERT_EQ(third.size(), 1U);
   EXPECT_EQ(third.resolve("东门路口"), std::optional<std::string>("P001"));
   EXPECT_FALSE(third.resolve("比亚迪ATTO 1").has_value());
+}
+
+// ---------------------------------------------------------------------------
+// 播放文本 text（v0.28.0 P-042）：落盘/加载/查询与点位映射同生命周期
+// ---------------------------------------------------------------------------
+
+// text 随表落盘并跨实例恢复（断电持久的行为内核：写文件 + 重读）；
+// 无 text 条目往返后仍为 nullopt
+TEST_F(PointMapStoreTest, TextPersistsAndReloadsAcrossRestart)
+{
+  const auto path = dir_ / "map.json";
+  {
+    PointMapStore store(path.string());
+    ASSERT_TRUE(store.load());
+    std::vector<PointMapEntry> points = {
+      {"A", "比亚迪ætəʊ 1", std::optional<std::string>("这就是比亚迪ætəʊ 1的展车了")},
+      {"B", "比亚迪ætəʊ 2"},  // 未配播放词
+    };
+    ASSERT_TRUE(store.replace(points));
+  }
+  PointMapStore reloaded(path.string());
+  ASSERT_TRUE(reloaded.load());
+  ASSERT_EQ(reloaded.size(), 2U);
+  EXPECT_EQ(
+    reloaded.text_for_code("A"),
+    std::optional<std::string>("这就是比亚迪ætəʊ 1的展车了"));
+  EXPECT_FALSE(reloaded.text_for_code("B").has_value());
+  // code 未命中 / name 不参与 text 查询
+  EXPECT_FALSE(reloaded.text_for_code("比亚迪ætəʊ 1").has_value());
+  EXPECT_FALSE(reloaded.text_for_code("Z").has_value());
+}
+
+// text_for_code：内存态（未重载）同样可查；全量替换后旧 text 一并失效
+TEST_F(PointMapStoreTest, TextForCodeReplacedOnFullSwap)
+{
+  PointMapStore store((dir_ / "map.json").string());
+  ASSERT_TRUE(store.load());
+  const std::vector<PointMapEntry> first = {
+    {"A", "展位A", std::optional<std::string>("A 的播放词")}};
+  ASSERT_TRUE(store.replace(first));
+  EXPECT_EQ(store.text_for_code("A"), std::optional<std::string>("A 的播放词"));
+  // 整表替换后 A 的 text 消失（全量替换语义，不做合并）
+  const std::vector<PointMapEntry> second = {{"A", "展位A"}};
+  ASSERT_TRUE(store.replace(second));
+  EXPECT_FALSE(store.text_for_code("A").has_value());
+}
+
+// 落盘文件格式：无 text 条目不写 text 键（omitempty，旧格式/旧工具兼容）
+TEST_F(PointMapStoreTest, OmittedTextNotWrittenToFile)
+{
+  const auto path = dir_ / "map.json";
+  PointMapStore store(path.string());
+  ASSERT_TRUE(store.load());
+  const std::vector<PointMapEntry> points = {
+    {"A", "展位A", std::optional<std::string>("有词")},
+    {"B", "展位B"}};
+  ASSERT_TRUE(store.replace(points));
+  std::ifstream in(path, std::ios::binary);
+  std::string content((std::istreambuf_iterator<char>(in)),
+    std::istreambuf_iterator<char>());
+  // A 条目落了 text 键，B 条目没有（按条目出现顺序粗验：首个 text 键
+  // 出现在 A 之后；B 条目无独立 text 键）
+  EXPECT_NE(content.find("\"text\": \"有词\""), std::string::npos);
+  const auto b_pos = content.find("\"展位B\"");
+  ASSERT_NE(b_pos, std::string::npos);
+  EXPECT_EQ(content.find("\"text\"", b_pos), std::string::npos);
+}
+
+// 加载防御：text 空串 / 非 string / 超 2048 标量 / 条目未知第 3 字段
+// ——整表作废（load=false，空表启动，保留文件等 App 重推覆盖）
+TEST_F(PointMapStoreTest, LoadRejectsInvalidTextFields)
+{
+  const auto path = dir_ / "map.json";
+  const std::vector<std::string> bad_docs = {
+    "{\"spec_version\":\"1.0\",\"points\":[{\"code\":\"A\",\"name\":\"x\",\"text\":\"\"}]}",
+    "{\"spec_version\":\"1.0\",\"points\":[{\"code\":\"A\",\"name\":\"x\",\"text\":123}]}",
+    "{\"spec_version\":\"1.0\",\"points\":[{\"code\":\"A\",\"name\":\"x\",\"text\":\"" +
+      std::string(2049, 'a') + "\"}]}",
+    "{\"spec_version\":\"1.0\",\"points\":[{\"code\":\"A\",\"name\":\"x\",\"extra\":1}]}",
+  };
+  for (const auto & doc : bad_docs) {
+    {std::ofstream out(path, std::ios::trunc); out << doc;}
+    PointMapStore store(path.string());
+    EXPECT_FALSE(store.load()) << doc;
+    EXPECT_EQ(store.size(), 0U) << doc;
+  }
+}
+
+// 加载兼容：恰 2048 标量 text 与混合（部分条目带 text）均合法
+TEST_F(PointMapStoreTest, LoadAcceptsBoundaryText)
+{
+  const auto path = dir_ / "map.json";
+  {
+    std::ofstream out(path, std::ios::trunc);
+    out << "{\"spec_version\":\"1.0\",\"points\":[{\"code\":\"A\",\"name\":\"x\",\"text\":\""
+        << std::string(2048, 'a') << "\"},{\"code\":\"B\",\"name\":\"y\"}]}";
+  }
+  PointMapStore store(path.string());
+  ASSERT_TRUE(store.load());
+  ASSERT_EQ(store.size(), 2U);
+  ASSERT_TRUE(store.text_for_code("A").has_value());
+  EXPECT_EQ(store.text_for_code("A")->size(), 2048U);
+  EXPECT_FALSE(store.text_for_code("B").has_value());
 }
 
 }  // namespace

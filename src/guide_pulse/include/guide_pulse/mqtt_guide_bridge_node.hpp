@@ -95,11 +95,12 @@ private:
   void handle_cancel_qr(const CommandEvent & event);    // 语料触发取消二维码显示入口（本地注入，占业务互斥 20s）
   void handle_relocate(const CommandEvent & event);     // 地图重定位入口（MQTT 下行 + 本地注入）：set_pose 受理 -> 等导航模块验收（worker 轮询）-> 终态回执+播报
   // 重定位终态收尾（worker 线程）：回执 relocate.result（验收通过=success /
-  // 验收失败或 30s 超时=failed:localization_failed）-> 释放业务占用 ->
-  // 成功时播报（texts 优先，缺省「{point_name}点 重定位 成功」，重定位
-  // 前后空格分段防 TTS 连读）；失败播
-  // relocate_failed_text 提示（2026-10-17 现场需求）。业务在回执发出后
-  // 才结束
+  // 验收失败或 30s 超时=failed:localization_failed；语料触发不回执，改为
+  // 验收通过时发 relocate.triggered 上报——2026-10-19 需求：只有重定位
+  // 成功才发消息给后端）-> 释放业务占用 -> 成功时播报（texts 优先，缺省
+  // 「{point_name}点 重定位 成功」，重定位前后空格分段防 TTS 连读）；
+  // 失败播 relocate_failed_text 提示（2026-10-17 现场需求）。业务在回执
+  // 发出后才结束
   void finish_relocate(bool verified);
   // 业务互斥拒绝时的语音提示（worker 线程）："我正在{业务}，请稍后"。
   // 仅非语音业务进行中播（重定位/导航在途——机器人没在说话，需要口头
@@ -150,12 +151,12 @@ private:
     const std::string & outcome, const std::string & reason = "");
   // v0.25.0（P-039）point_map.result 同走 send_action_result（共用回执
   // 缓存与幂等通道，无需独立函数）
-  // v0.26.0（P-040）语音触发上报：TTS 话术命中语料自主触发导航/重定位
-  // 且点位解析命中、进入执行流程时发布恰好一条 navigate.triggered /
+  // v0.26.0（P-040）语音触发上报：发布恰好一条 navigate.triggered /
   // relocate.triggered（payload {point_name, trigger:voice}，无
-  // operation_id）。2026-10-17 现场确认 navigate/relocate 统一都回推：
-  // 此后服务不可用/受理被拒属执行故障，不撤销上报（语料触发无 result
-  // 回执，App 不跟踪后续执行）。一次性事件不进 receipt_cache_
+  // operation_id）。2026-10-19 现场需求：**只有重定位成功才发**——
+  // navigate/relocate 语料触发后，前置重定位（变形后 set_pose / set_pose
+  // 验收）成功才调用本函数；重定位失败/被拒/超时不上报（App 不感知
+  // 失败的语音触发）。一次性事件不进 receipt_cache_
   //（无指令重发场景，publish 失败与回执同策略仅告警）
   void send_nav_triggered(const std::string & triggered_type, const std::string & point_name);
   // 回执发布公共段：查缓存 -> 构造 -> 缓存（含淘汰）-> 发布（worker 线程）
@@ -168,14 +169,21 @@ private:
   // 变形**实际发生且成功**（McTransform::biped_transformed）时，同步发
   // 不带航点的 {command: set_pose} 到 t1_slam_nav_ws——变形动作自带约
   // 180° 转身把 AMCL 定位带偏，服务端用最新停留点（最近一次导航结束
-  // 实际停的位置）重设初值拉回；本身就是人形（零动作路径）不发。
+  // 实际停的位置）重设初值拉回；本身就是人形（零动作路径）不发送。
   // 失败/被拒（无停留点/导航栈未起等）只记日志不阻断业务——补偿性
-  // 重定位，尽力而为。调用点：handle_navigate / handle_welcome_prep
-  //（双足门禁通过后、发导航 goal 前——set_pose 在途时发 go 会被
-  // 「任务在跑」拒，必须等它终态）、handle_scene（变形 wait_done 后、
-  // 二维码上屏前）。handle_relocate 不调：它自己的 set_pose 带航点，
-  // 初值即重设，无二次修正面
-  void relocate_after_transform(const std::string & source);
+  // 重定位，尽力而为。force=true（2026-10-19 现场需求）：未变形也强制
+  // 发 set_pose——语料触发的导航上报必须建立在真实重定位成功之上
+  //（首版把「已是人形跳过」当成功，真机验证未做重定位也发了上报，
+  // 被现场打回）。返回 true = 成功（含 force=false 未变形的跳过路径），
+  // false = 尝试了但失败——语料触发的 navigate.triggered 上报据此把关
+  //（只有重定位成功才发消息给后端）。调用点：handle_navigate
+  //（force=event.local）/ handle_welcome_prep（force=true，恒语料触发）
+  //（均在双足门禁通过后、发导航 goal 前——set_pose 在途时发 go 会被
+  // 「任务在跑」拒，必须等它终态）、handle_scene（force=false，变形
+  // wait_done 后、二维码上屏前，返回值不用——迎宾无 triggered 上报面）。
+  // handle_relocate 不调：它自己的 set_pose 带航点，初值即重设，无二次
+  // 修正面
+  bool relocate_after_transform(const std::string & source, bool force = false);
   // 航点 code -> 映射表显示名（App 界面展示的人话名，如 A ->
   // 比亚迪ATTO 1）；反查失败返回 fallback（表结构上 code 必来自表内，
   // 仅防御）。navigate 引导语 {point} 替换与 P-040 语音触发上报共用
@@ -440,6 +448,10 @@ private:
   std::string relocate_operation_id_;  // 在途重定位的 operation_id（回执用）
   std::string relocate_waypoint_;      // 解析后的航点名（验收轮询匹配用）
   std::string relocate_point_name_;    // 原始 point_name（默认播报文案用）
+  std::string relocate_display_name_;  // 映射表显示名（受理时定格；语料触发
+                                       // 验收通过后的 relocate.triggered 上报用，
+                                       // 2026-10-19 需求——等待期 point_map 可能
+                                       // 被 App 重推，终态反查会漂移）
   std::vector<std::string> relocate_texts_;  // 指令携带的随动播报（空=播默认）
   bool relocate_local_{false};         // 本地注入（语料触发）：不发协议回执
   std::chrono::steady_clock::time_point relocate_deadline_;

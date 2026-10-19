@@ -556,6 +556,69 @@ TEST(PointMapEventTest, ParsesSinglePoint)
   EXPECT_EQ(event->points[0].code, "P001");
 }
 
+// v0.28.0（P-042）条目可选播放文本 text：带 text 条目解析出原值，
+// 不带 text 条目保持 nullopt（省略 = 该点位无播放文本，两态共存合法）
+TEST(PointMapEventTest, ParsesOptionalTextEntries)
+{
+  const auto payload = build_command_json(
+    "point_map",
+    R"({"operation_id":")" + std::string(kOperationId) +
+    R"(","points":[{"code":"A","name":"比亚迪ætəʊ 1","text":"这就是比亚迪ætəʊ 1的展车了"},)"
+    R"({"code":"B","name":"比亚迪ætəʊ 2"}]})");
+  std::string error;
+  const auto event = guide_pulse::parse_command_event(payload, "robot-001", error);
+  ASSERT_TRUE(event.has_value()) << error;
+  ASSERT_EQ(event->points.size(), 2U);
+  EXPECT_EQ(
+    event->points[0].text,
+    std::optional<std::string>("这就是比亚迪ætəʊ 1的展车了"));
+  EXPECT_FALSE(event->points[1].text.has_value());
+}
+
+// v0.28.0（P-042）text 非法反例：空串（minLength 1，省略与空串不等价）、
+// 非字符串、超 2048 Unicode 标量——均按 invalid_request 拒并填回执通道
+TEST(PointMapEventTest, RejectsInvalidTextEntries)
+{
+  const std::string too_long(2049, 'a');
+  const std::vector<std::string> bad_bodies = {
+    R"({"operation_id":")" + std::string(kOperationId) +
+    R"(","points":[{"code":"A","name":"x","text":""}]})",                // 空串
+    R"({"operation_id":")" + std::string(kOperationId) +
+    R"(","points":[{"code":"A","name":"x","text":123}]})",               // 非字符串
+    R"({"operation_id":")" + std::string(kOperationId) +
+    R"(","points":[{"code":"A","name":"x","text":null}]})",              // JSON null（非省略）
+    R"({"operation_id":")" + std::string(kOperationId) +
+    R"(","points":[{"code":"A","name":"x","text":")" + too_long + R"("}]})",  // 超 2048 标量
+  };
+  for (const auto & body : bad_bodies) {
+    std::string error;
+    std::string invalid_op;
+    std::string invalid_type;
+    EXPECT_FALSE(guide_pulse::parse_command_event(
+      build_command_json("point_map", body), "robot-001", error, &invalid_op,
+      &invalid_type)) << body;
+    EXPECT_NE(error.find("text"), std::string::npos) << body;
+    EXPECT_EQ(invalid_op, kOperationId) << body;
+    EXPECT_EQ(invalid_type, "point_map") << body;
+  }
+}
+
+// 恰 2048 Unicode 标量的 text 合法（边界值；中文按码点计非字节）
+TEST(PointMapEventTest, AcceptsTextAtScalarBoundary)
+{
+  const std::string text_2048(2048, 'a');
+  const auto payload = build_command_json(
+    "point_map",
+    R"({"operation_id":")" + std::string(kOperationId) +
+    R"(","points":[{"code":"A","name":"x","text":")" + text_2048 + R"("}]})");
+  std::string error;
+  const auto event = guide_pulse::parse_command_event(payload, "robot-001", error);
+  ASSERT_TRUE(event.has_value()) << error;
+  ASSERT_EQ(event->points.size(), 1U);
+  ASSERT_TRUE(event->points[0].text.has_value());
+  EXPECT_EQ(event->points[0].text->size(), 2048U);
+}
+
 TEST(PointMapEventTest, RejectsInvalidPointMapPayloads)
 {
   // 结构反例：缺 points / 空 points / 条目多字段 / 缺 name / 非法类型

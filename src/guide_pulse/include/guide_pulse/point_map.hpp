@@ -1,11 +1,12 @@
 // ============================================================================
-// 点位映射表本地存储（v0.25.0 P-039 point_map 指令的 Robot 侧落地）。
+// 点位映射表本地存储（v0.25.0 P-039 point_map 指令的 Robot 侧落地；
+// v0.28.0 P-042 条目含可选播放文本 text）。
 //
 // 契约要点：App 是映射表的唯一权威来源，point_map.points 全量下发，
 // Robot 整表替换（不做增量合并）；Server 不保存映射表状态；映射如何
 // 持久化（内存/落盘、是否跨重启保留）归 Robot 本地实现——本实现选择
-// 落盘 JSON 文件（临时文件 + rename 原子替换），重启后自动加载，App
-// 无需重推。
+// 落盘 JSON 文件（临时文件 + rename 原子替换）到持久化分区，重启后
+// 自动加载，App 无需重推；断电不丢（点位映射 + 播放词一起落盘）。
 //
 // 查询方向：navigate 指令携带的 point_name -> code（本地航点名，如
 // 「A」）-> NavExecutor 执行。2026-10-17 联调确认 App 下发的就是
@@ -49,6 +50,11 @@ public:
   // 未命中再按 name 匹配（兜底兼容人话名）；空表/两级均未命中返回
   // nullopt，调用方自行兜底
   std::optional<std::string> resolve(const std::string & point_name) const;
+
+  // code -> 该点位播放文本（v0.28.0 P-042）：条目未配置 text 或 code
+  // 未命中返回 nullopt。供 navigate 到达播报（指令未带 texts 时的
+  // 优先级来源，见 mqtt_guide_bridge_node 到达分支）
+  std::optional<std::string> text_for_code(const std::string & code) const;
 
   // 当前表内容（日志/测试用）
   const std::vector<PointMapEntry> & points() const {return points_;}

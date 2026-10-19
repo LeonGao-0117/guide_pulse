@@ -10,7 +10,8 @@
 // + v0.24.0 navigate/scene 一次性结果回执 P-038 + v0.25.0 point_map
 // 点位映射表同步 P-039 + v0.21.0 relocate 地图重定位（2026-10-17 接入
 // MQTT 下行处理，含 relocate.result 回执） + v0.26.0 语音触发导航/
-// 重定位上报 navigate.triggered/relocate.triggered P-040）。
+// 重定位上报 navigate.triggered/relocate.triggered P-040）+ v0.28.0
+// point_map 条目新增可选播放文本 text P-042（2026-10-19 接入）。
 // ============================================================================
 #pragma once
 
@@ -23,7 +24,8 @@ namespace guide_pulse
 {
 
 // ---------------------------------------------------------------------------
-// 点位映射表条目（v0.25.0 P-039 point_map 载荷元素）
+// 点位映射表条目（v0.25.0 P-039 point_map 载荷元素；v0.28.0 P-042 条目
+// 新增可选播放文本 text）
 // ---------------------------------------------------------------------------
 struct PointMapEntry
 {
@@ -31,6 +33,13 @@ struct PointMapEntry
                      // Robot 侧映射到本地航点名，如 A/B/C）
   std::string name;  // 点位名称：1..64 个 Unicode 标量（规则同 point_name，
                      // App 界面展示的人话名，如「比亚迪ATTO 1」）
+  // 该点位播放文本（v0.28.0 P-042 可选）：1..2048 个 Unicode 标量
+  //（规则同 tts.texts 单条）；缺省 = 该点位无播放文本。何时播放（本工程
+  // 策略：navigate 到达且指令未带 texts 时）、与 navigate/relocate/scene
+  // 自带 texts 及本地 navigate_default_texts 的优先级归 Robot 本地策略
+  //（见 mqtt_guide_bridge_node 到达播报分支）。注意「省略」与「空串」
+  // 不等价：非空校验在解析层（minLength 1），此处只存合法值
+  std::optional<std::string> text;
 };
 
 // ---------------------------------------------------------------------------
@@ -57,11 +66,13 @@ inline constexpr const char * SCENE_WELCOME = "welcome";
 
 // ---------------------------------------------------------------------------
 // 语音触发上报（v0.26.0 P-040）：TTS 话术命中 agent_monitor.*_phrases
-// 语料（语音自主触发）并受理开始执行导航/重定位时，发布恰好一条
-// navigate.triggered / relocate.triggered（仅上行，payload {point_name,
-// trigger}，无 operation_id——协议首个不由 App 指令驱动的上行事件，
-// App 下发的指令不产生本上报，本地拒绝触发也不发布）。Server 按
-// event_id 去重后推 App（WebSocket robot.navigation.triggered）
+// 语料（语音自主触发）且**前置重定位成功后**（2026-10-19 现场需求：
+// 只有重定位成功才发消息给后端；原 v0.26.0 为受理开始执行时）发布
+// 恰好一条 navigate.triggered / relocate.triggered（仅上行，payload
+// {point_name, trigger}，无 operation_id——协议首个不由 App 指令驱动
+// 的上行事件，App 下发的指令不产生本上报，本地拒绝触发也不发布，
+// 重定位失败/超时亦不发布）。Server 按 event_id 去重后推 App
+//（WebSocket robot.navigation.triggered）
 // ---------------------------------------------------------------------------
 inline constexpr const char * NAVIGATE_TRIGGERED_TYPE = "navigate.triggered";
 inline constexpr const char * RELOCATE_TRIGGERED_TYPE = "relocate.triggered";
@@ -119,6 +130,7 @@ inline constexpr std::size_t TTS_TEXT_MAX_BYTES = 2048;  // 每条 1..2048 UTF-8
 inline constexpr std::size_t POINT_NAME_MAX_SCALARS = 64;  // point_name 1..64 Unicode 标量
 inline constexpr std::size_t POINT_CODE_MAX_SCALARS = 32;  // point_map.code 1..32 Unicode 标量
 inline constexpr std::size_t POINT_MAP_POINTS_MAX = 256;   // point_map.points 1..256 条
+inline constexpr std::size_t POINT_TEXT_MAX_SCALARS = 2048;  // point_map.text 1..2048 Unicode 标量（P-042）
 
 // ---------------------------------------------------------------------------
 // 下行设备指令（契约：后端发布到 {prefix}/{robot_id}/down/commands，

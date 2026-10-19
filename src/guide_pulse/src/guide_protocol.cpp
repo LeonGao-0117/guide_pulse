@@ -385,10 +385,13 @@ std::optional<CommandEvent> parse_command_event(
     }
   } else if (event.type == "point_map") {
     // v0.25.0（P-039）点位映射表载荷：严格 2 字段 operation_id/points；
-    // points 1..256 条 {code, name}（严格 2 字段，additionalProperties=false），
+    // points 1..256 条 {code, name, text?}（v0.28.0 P-042 条目新增可选
+    // text，最多 3 字段，additionalProperties=false），
     // code 1..32 Unicode 标量表内唯一（语义校验，Schema 无法表达——
     // Server 已校验，此处是纵深防御，重复按 invalid_request 拒）、
-    // name 1..64 Unicode 标量（规则同 point_name）。语义是全量替换：
+    // name 1..64 Unicode 标量（规则同 point_name）、text 可选 1..2048
+    // Unicode 标量（规则同 tts.texts 单条；非 nil 空串拒绝，与 JSON
+    // Schema minLength 1 对齐）。语义是全量替换：
     // App 是唯一权威来源，Robot 整表替换本地映射
     if (!body.contains("points") || !body["points"].is_array()) {
       fill_invalid_receipt_id();
@@ -409,12 +412,14 @@ std::optional<CommandEvent> parse_command_event(
     event.points.reserve(points.size());
     std::set<std::string> seen_codes;  // code 表内唯一（语义纵深防御）
     for (const auto & item : points) {
-      if (!item.is_object() || item.size() != 2U || !item.contains("code") ||
-        !item["code"].is_string() || !item.contains("name") ||
-        !item["name"].is_string())
+      // 条目 {code, name} 必填 + text（P-042）可选：字段数 2 或 3，
+      // 3 字段时必须是 text 且为 string（未知字段仍拒）
+      if (!item.is_object() || (item.size() != 2U && item.size() != 3U) ||
+        !item.contains("code") || !item["code"].is_string() ||
+        !item.contains("name") || !item["name"].is_string())
       {
         fill_invalid_receipt_id();
-        error = "points items must be {code(string), name(string)}";
+        error = "points items must be {code(string), name(string), text(string)?}";
         return std::nullopt;
       }
       PointMapEntry entry;
@@ -437,6 +442,22 @@ std::optional<CommandEvent> parse_command_event(
         fill_invalid_receipt_id();
         error = "points code must be unique within the map (contract)";
         return std::nullopt;
+      }
+      // text 可选（P-042）：字段存在（第 3 字段）时必须是 string 且
+      // 1..2048 Unicode 标量——空串/超长/非字符串均按 invalid_request 拒
+      if (item.size() == 3U) {
+        if (!item.contains("text") || !item["text"].is_string()) {
+          fill_invalid_receipt_id();
+          error = "points text must be a string when present (contract)";
+          return std::nullopt;
+        }
+        entry.text = item["text"].get<std::string>();
+        const auto text_scalars = utf8_scalar_count(*entry.text);
+        if (text_scalars < 1U || text_scalars > POINT_TEXT_MAX_SCALARS) {
+          fill_invalid_receipt_id();
+          error = "points text length must be within 1..2048 unicode scalars (contract)";
+          return std::nullopt;
+        }
       }
       event.points.push_back(std::move(entry));
     }
