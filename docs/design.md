@@ -13,7 +13,7 @@
 | --- | --- | --- | --- |
 | 迎宾 | `scene`：`scene="welcome"` + 可选 `texts` | `scene.result`（v0.24.0） | 播迎宾词一轮（`texts` 缺省用本地默认词）；流程主体完成（变形结束+二维码上屏+会话已立）回 `success`，忙碌回 `failed/busy` |
 | 导航 + 汽车讲解 | `navigate`：`point_name` 必填 + 可选 `texts` | `navigate.result`（v0.24.0） | 本地导航到点位，到达回 `success`（讲解词播报与否不影响结果）后按序播讲解词一轮；失败回 `failed/navigation_failed`；被 `navigate.stop`/`tts.stop` 中止回 `failed/aborted`；忙碌回 `failed/busy` |
-| 地图重定位 | `relocate`：`point_name` 必填 + 可选 `texts`（v0.21.0，2026-10-17 接入） | `relocate.result` | **不可打断的互斥业务**：`point_name` 经点位映射表解析 -> `set_pose` goal 重设定位初值（机器人不动）-> 等待导航模块验收（worker 250ms 轮询 goal 的 result（服务端验收完才回），真机受理后 ~1.5s 出结果）-> 验收通过回 `success` 并播报（`texts` 缺省播「{point_name}点重定位成功」），验收失败/`relocate_timeout_seconds`（默认 30s）超时回 `failed/localization_failed`；受理被拒当场回 `failed/point_not_found`（航点名不在航点表，query 服务 available 结构化判定）或 `failed/localization_failed`（其余归并）。等待期占业务互斥：新业务回 `failed/busy` 并播「我正在重定位，请稍后」（迎宾/播报/讲解中正在出声，被拒时不播提示）；`tts.stop` 不中止等待（初值已发，终态由导航模块给出） |
+| 地图重定位 | `relocate`：`point_name` 必填 + 可选 `texts`（v0.21.0，2026-10-17 接入） | `relocate.result` | **不可打断的互斥业务**：`point_name` 经点位映射表解析 -> `set_pose` goal 重设定位初值（机器人不动）-> 等待导航模块验收（worker 250ms 轮询 goal 的 result（服务端验收完才回），真机受理后 ~1.5s 出结果）-> 验收通过回 `success` 并播报（`texts` 缺省播「{point_name}点 重定位 成功」，重定位前后空格分段防 TTS 连读），验收失败/`relocate_timeout_seconds`（默认 30s）超时回 `failed/localization_failed`；受理被拒当场回 `failed/point_not_found`（航点名不在航点表，query 服务 available 结构化判定）或 `failed/localization_failed`（其余归并）。等待期占业务互斥：新业务回 `failed/busy` 并播「我正在重定位，请稍后」（迎宾/播报/讲解中正在出声，被拒时不播提示）；`tts.stop` 不中止等待（初值已发，终态由导航模块给出） |
 | 独立播报 | `tts`：`texts`+`mode`+`interval_seconds` | `tts.result` | 列表单轮播完自行结束（2026-10-14 变更，原为沿用 tts_demo 列表循环播报） |
 | 停止 | `tts.stop` | 无 | 停止一切播报并取消进行中的导航（本地策略，被取消的导航回 `failed/aborted`） |
 | 停止导航 | `navigate.stop` | 无 | 只取消在途导航（被取消的导航回 `failed/aborted`；无导航 no-op） |
@@ -289,7 +289,7 @@
   250ms 轮询验收（goal 的 result（服务端验收完才回，通常零点几秒），
   真机 ~1.5s 出结果；`relocate_timeout_seconds` 默认 30s 超时兜底），
   验收通过才播报
-  （缺省「{point_name}点重定位成功」）。本地注入不发协议回执（Server
+  （缺省「{point_name}点 重定位 成功」，重定位前后空格分段防 TTS 连读）。本地注入不发协议回执（Server
   不认识其 operation_id）。与 MQTT 下行 relocate 同受业务互斥约束
   （见下条）。冷却按「action+航点名」独立计时（五点互不挤占）；mock
   执行器 `mock_relocate_hold_polls` 模拟验收延迟（联调/集成测试用）。

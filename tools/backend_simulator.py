@@ -22,7 +22,7 @@
   python3 backend_simulator.py navigate 充电桩            # 只导航，到达不播报
 
   # 地图重定位（机器人已被摆到点位上；回 relocate.result，缺省播
-  # 「{点位名}点重定位成功」）
+  # 「{点位名}点 重定位 成功」）
   python3 backend_simulator.py relocate A
 
   # 点位映射表全量同步（v0.25.0，navigate/relocate 的 point_name 经表
@@ -146,7 +146,7 @@ def main():
     p_relocate.add_argument("point", help="点位名（重定位到该航点，机器人不动）")
     p_relocate.add_argument("--text", dest="texts", action="append", default=[],
                             help="重定位成功后的播报词（可重复多条；缺省播"
-                                 "「{点位名}点重定位成功」）")
+                                 "「{点位名}点 重定位 成功」）")
     p_relocate.add_argument("--expires", type=int, default=60, help="指令有效期秒（默认 60）")
     p_relocate.add_argument("--wait-result", type=float, default=3.0,
                             help="发布后等待 relocate.result 回执的秒数（默认 3，0 不等待）")

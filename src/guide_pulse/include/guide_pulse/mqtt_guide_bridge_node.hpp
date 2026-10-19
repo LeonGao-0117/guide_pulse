@@ -96,7 +96,8 @@ private:
   void handle_relocate(const CommandEvent & event);     // 地图重定位入口（MQTT 下行 + 本地注入）：set_pose 受理 -> 等导航模块验收（worker 轮询）-> 终态回执+播报
   // 重定位终态收尾（worker 线程）：回执 relocate.result（验收通过=success /
   // 验收失败或 30s 超时=failed:localization_failed）-> 释放业务占用 ->
-  // 成功时播报（texts 优先，缺省「{point_name}点重定位成功」）；失败播
+  // 成功时播报（texts 优先，缺省「{point_name}点 重定位 成功」，重定位
+  // 前后空格分段防 TTS 连读）；失败播
   // relocate_failed_text 提示（2026-10-17 现场需求）。业务在回执发出后
   // 才结束
   void finish_relocate(bool verified);
@@ -163,6 +164,18 @@ private:
   // 播报一条业务拒绝提示（worker 线程）：不强抢进行中的其他播报、
   // 失败仅告警不影响回执；text 空则跳过（配置禁用）。回执由调用方负责
   void speak_hint(const std::string & text, const char * trace_id);
+  // 变形后重定位（worker 线程，2026-10-18 现场需求）：导航/迎宾前置
+  // 变形**实际发生且成功**（McTransform::biped_transformed）时，同步发
+  // 不带航点的 {command: set_pose} 到 t1_slam_nav_ws——变形动作自带约
+  // 180° 转身把 AMCL 定位带偏，服务端用最新停留点（最近一次导航结束
+  // 实际停的位置）重设初值拉回；本身就是人形（零动作路径）不发。
+  // 失败/被拒（无停留点/导航栈未起等）只记日志不阻断业务——补偿性
+  // 重定位，尽力而为。调用点：handle_navigate / handle_welcome_prep
+  //（双足门禁通过后、发导航 goal 前——set_pose 在途时发 go 会被
+  // 「任务在跑」拒，必须等它终态）、handle_scene（变形 wait_done 后、
+  // 二维码上屏前）。handle_relocate 不调：它自己的 set_pose 带航点，
+  // 初值即重设，无二次修正面
+  void relocate_after_transform(const std::string & source);
   // 航点 code -> 映射表显示名（App 界面展示的人话名，如 A ->
   // 比亚迪ATTO 1）；反查失败返回 fallback（表结构上 code 必来自表内，
   // 仅防御）。navigate 引导语 {point} 替换与 P-040 语音触发上报共用
@@ -285,6 +298,9 @@ private:
   std::string busy_hint_relocate_text_; // 互斥拒绝提示（重定位中，空=不播）
   std::string busy_hint_navigate_text_; // 互斥拒绝提示（导航在途，空=不播）
   std::string navigate_failed_text_;    // 导航失败提示（回执后播，空=不播）
+  std::string navigate_waypoint_missing_text_;
+                                       // 导航被拒（航点表无该点位）提示
+                                       //（回执后播，空=不播；2026-10-19）
   std::string navigate_transform_failed_text_;  // 变形未确认双足拒绝下发的
                                        // 提示（navigate/relocate 共用，空=不播）
   std::string relocate_failed_text_;    // 重定位失败提示（回执后播，空=不播）
@@ -317,6 +333,9 @@ private:
   // 迎宾准备就位播报语：语料触发导航去迎宾点，到达变四足（摄像头收平）
   // 后最后播报（如「元气满满，做好准备迎接顾客」）。空串 = 禁用
   std::string welcome_prep_done_text_;
+  // 迎宾准备到达后延迟变形秒数（2026-10-18 测试需求）：到达 Y 点收到
+  // 导航 result 后不立即变形，等这么多秒再变四足。0 = 原行为（到达即变形）
+  int welcome_prep_transform_delay_seconds_{0};
   // 当前在途导航是否迎宾准备（本地注入）：是则到达后变四足 + 播就位语，
   // 不做默认车型讲解词兜底、不播 navigate 引导语；仅 worker 线程访问
   bool nav_welcome_prep_{false};

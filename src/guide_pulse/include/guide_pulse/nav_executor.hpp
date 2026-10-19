@@ -84,6 +84,21 @@ public:
   {
     return true;
   }
+
+  // 变形后重定位（2026-10-18 现场需求）：发**不带航点**的 set_pose——
+  // 服务端用最新停留点（最近一次导航结束实际停的位置）重设定位初值。
+  // 背景：变形动作（狗->人 QUADRUPED_TO_BIPED_ROTATE 等）自带约 180°
+  // 转身，把 AMCL 定位带偏；导航/迎宾前置变形实际发生且成功后调用本
+  // 方法把定位拉回。同步阻塞至终态（受理被拒毫秒级返回；正常验收
+  // 零点几秒、最多 ~10s，实现内部自带上限）。失败/被拒不重试，由
+  // 调用方决定后续（桥接层只记日志不阻断业务——补偿性重定位）。
+  // 默认实现：当前执行器不支持（返回失败）
+  virtual NavOutcome set_pose_latest()
+  {
+    NavOutcome outcome;
+    outcome.detail = "导航执行器不支持变形后重定位（set_pose 最新停留点）";
+    return outcome;
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -185,6 +200,15 @@ public:
       return std::nullopt;
     }
     return true;
+  }
+
+  // Mock 变形后重定位：直接成功（联调/集成测试无真机变形面，不卡流程）
+  NavOutcome set_pose_latest() override
+  {
+    NavOutcome outcome;
+    outcome.ok = true;
+    outcome.detail = "Mock变形后重定位（最新停留点）受理即成功";
+    return outcome;
   }
 
 private:

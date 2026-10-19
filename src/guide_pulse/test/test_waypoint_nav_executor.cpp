@@ -338,6 +338,32 @@ TEST_F(WaypointNavExecutorTest, SetPoseAcceptedIsTerminal)
   EXPECT_TRUE(*verified);
 }
 
+// 变形后重定位（2026-10-18 现场需求）：不带航点的 set_pose——goal 的
+// waypoints 留空（NavigateAction.md §3：服务端用最新停留点），同步等
+// 到验收终态
+TEST_F(WaypointNavExecutorTest, SetPoseLatestSendsEmptyWaypoints)
+{
+  const auto outcome = executor_nav_->set_pose_latest();
+  EXPECT_TRUE(outcome.ok);
+  EXPECT_NE(outcome.detail.find("验收通过"), std::string::npos);
+  // goal 字段：command=set_pose + 航点留空（= 最新停留点）+ 保持人形
+  EXPECT_EQ(server_->last_command_, "set_pose");
+  EXPECT_TRUE(server_->last_waypoints_.empty());
+  EXPECT_FALSE(server_->last_return_to_quadruped_);
+}
+
+// 变形后重定位被拒（无停留点记录/导航在途/正在变形等）：失败 + 服务端
+// message 透传；point_not_found 不置位（无航点名可判）
+TEST_F(WaypointNavExecutorTest, SetPoseLatestRejectedMapsToFailure)
+{
+  server_->set_auto_result("REJECTED", "没有停留点记录（先走完一趟导航）");
+  const auto outcome = executor_nav_->set_pose_latest();
+  EXPECT_FALSE(outcome.ok);
+  EXPECT_NE(outcome.detail.find("set_pose 被拒"), std::string::npos);
+  EXPECT_NE(outcome.detail.find("停留点"), std::string::npos);  // message 透传
+  EXPECT_FALSE(outcome.point_not_found);
+}
+
 // 重定位被拒（导航在途/非站立人形/定位未起）：失败 + 服务端 message 透传；
 // 点名在 available 清单中 = 非 point_not_found（状态冲突类拒因）
 TEST_F(WaypointNavExecutorTest, SetPoseRejectedMapsToFailure)

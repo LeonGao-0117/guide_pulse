@@ -16,7 +16,7 @@ namespace
 
 constexpr const char * kToBiped = "QUADRUPED_TO_BIPED_ROTATE";
 constexpr const char * kBipedTarget = "BIPED_LOCOMOTION_WBC";
-constexpr const char * kToQuadruped = "BIPED_TO_QUADRUPED";
+constexpr const char * kToQuadruped = "BIPED_TO_QUADRUPED_ROTATE";
 constexpr const char * kQuadrupedTarget = "QUADRUPED_LOCOMOTION_DEFAULT";
 
 // 趴姿集合的每个动作都在路径表里有起点（否则趴姿查表会走到「未知路径」

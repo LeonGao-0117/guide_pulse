@@ -49,7 +49,7 @@ backend_simulator → mosquitto(:1884) → guide_bridge → mock_tts_service(SDK
 7. **过期指令**：`--expires` 已过期的 navigate → 被丢弃且不导航；
 8. **地图重定位**（2026-10-17 接入，终态=导航模块验收）：下发 `relocate A`
    -> 受理 -> 等待验收（`mock_relocate_hold_polls` 模拟 ~2s 窗口）->
-   Mock TTS 收到「A点重定位成功」-> backend_simulator 收到
+   Mock TTS 收到「A点 重定位 成功」-> backend_simulator 收到
    `relocate.result(success)`；等待窗口内新 `navigate` 被互斥拒绝
    （`failed/busy`）且播报「我正在重定位，请稍后」；导航在途下发
    `relocate` 同样被拒（`failed/busy`）并播「我正在导航，请稍后」。

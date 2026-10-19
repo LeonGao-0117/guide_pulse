@@ -361,6 +361,13 @@ void AgentMonitor::check_deferred_deadline()
 // TtsStatus.text 恒为空（原厂转发时丢弃），话术只在运控板 agent.log：
 //   本地 TTS： 'TTSManager received request item_id=<trace> ... text=话术 domain='
 //   云端流式： item_id 匹配的 active_chat.response.text.done JSON 行的 "text"
+//   云端音频直推（2026-10-19 现场发现：腾势D9 介绍无 text.done、非本地
+//     合成，两条旧路径均落空）：response.audio.delta 音频流直推 TTSManager
+//     （item_id 带 _0_ 前缀、无 _S 后缀），文本在
+//     'TTSManager dispatching status item_id=<trace> ... text="话术" domain="xxx"'
+//     行。注意该行超长时 logger 会折行：主行带时间戳、~ 结尾，余下内容
+//     在无时间戳续行（2026-10-19 现场：M9 固定语位于长话术尾部全在续行，
+//     单行 grep 永远拿不到完整话术）——回查须 -A3 带续行拼接后提取
 // ---------------------------------------------------------------------------
 namespace
 {
@@ -381,12 +388,13 @@ bool safe_trace_id(const std::string & trace_id)
   return true;
 }
 
-// 执行合并回查命令：一次 SSH 同时跑本地/云端两条 grep（=1=/=2= 标记
-// 分段），返回各自首个非空输出行（空串 = 未查到/失败）
+// 执行合并回查命令：一次 SSH 同时跑本地/云端/音频直推三条 grep（=1=/=2=
+// /=3= 标记分段），返回各自首个非空输出行（空串 = 未查到/失败）
 struct FetchLines
 {
-  std::string local_line;  // 路径1输出：形如 "text=话术 domain="
-  std::string cloud_line;  // 路径2输出：纯话术文本
+  std::string local_line;   // 路径1输出：形如 "text=话术 domain="
+  std::string cloud_line;   // 路径2输出：纯话术文本
+  std::string stream_line;  // 路径3输出：形如 "text=\"话术\" domain=\"omnissdk\""
 };
 
 FetchLines ssh_fetch_lines(const std::string & cmd)
@@ -403,11 +411,14 @@ FetchLines ssh_fetch_lines(const std::string & cmd)
     line.erase(line.find_last_not_of(" \r\n\t") + 1);
     if (line == "=1=") {section = 1; continue;}
     if (line == "=2=") {section = 2; continue;}
+    if (line == "=3=") {section = 3; continue;}
     if (line.empty()) {continue;}
     if (section == 1 && out.local_line.empty()) {
       out.local_line = line;
     } else if (section == 2 && out.cloud_line.empty()) {
       out.cloud_line = line;
+    } else if (section == 3 && out.stream_line.empty()) {
+      out.stream_line = line;
     }
   }
   pclose(p);
@@ -463,20 +474,35 @@ void AgentMonitor::fetch_tts_text(const std::string & trace_id)
   if (!safe_trace_id(trace_id) || config_.ssh_password.find('\'') != std::string::npos) {
     return;  // trace/密码含非法字符：静默跳过回查（防御，不打印）
   }
-  // 一次 SSH 同时跑两条路径（省第二次连接 1~2s）。远程命令直白书写后
+  // 一次 SSH 同时跑三条路径（省第二次连接 1~2s）。远程命令直白书写后
   // base64 编码、单引号传递解码执行——两侧 shell 均零转义。
-  // 两条 grep 直接打全文件：日志含高频音频流（空闲 ~0.6MB/min），任何
-  // 尾部窗口都可能把话术行挤出；全量 ~100MB 单模式 grep ~0.5s 可接受
+  // 各条 grep 打当前档+最新滚动档（$F，ls -t 取前二；2026-10-19 现场
+  // 亲历 agent.log 100MB 滚动把几分钟前的话术行滚进旧档）：日志含高频
+  // 音频流（空闲 ~0.6MB/min），任何尾部窗口都可能把话术行挤出；全量
+  // ~100MB 单模式 grep ~0.5s 可接受
   //   =1= 本地 TTS：'received request item_id=<trace> ' 行 -> text=话术 domain=
   //   =2= 云端流式：trace 匹配的 text.done JSON 行 -> "text":"话术"
+  //   =3= 云端音频直推：'dispatching status item_id=<trace> ' 行 ->
+  //       text="话术" domain="xxx"。该行超长会折行（主行 ~ 结尾、余下在
+  //       无时间戳续行），-A3 带续行、剔 -- 分隔、tr 把换行与折行符 ~
+  //       压成空格拼成整条记录，再按 text="[^"]*" domain="[^"]*" 逐段
+  //       提取（拼接话术里的多余空格过归一化自然消解）；剔除 text=""
+  //       空段后取最后一条（状态流转发多次，末尾终态行文本最全）。
+  //       多文件 grep 用 -h 抑制文件名前缀（=1=/=2= 同）
   const std::string remote =
+    "F=$(ls -t /robot/persist/log/agent/agent.log* | head -2); "
     "echo =1=; "
-    "grep -am1 'received request item_id=" + trace_id + " ' "
-    "/robot/persist/log/agent/agent.log | grep -ao 'text=.* domain='; "
+    "grep -ahm1 'received request item_id=" + trace_id + " ' $F"
+    " | grep -ao 'text=.* domain='; "
     "echo =2=; "
-    "grep -a '" + trace_id + "' /robot/persist/log/agent/agent.log"
+    "grep -ah '" + trace_id + "' $F"
     " | grep -a text.done | head -1"
-    " | grep -o '\"text\":\"[^\"]*\"' | cut -d'\"' -f4";
+    " | grep -o '\"text\":\"[^\"]*\"' | cut -d'\"' -f4; "
+    "echo =3=; "
+    "grep -ah -A3 'dispatching status item_id=" + trace_id + " ' $F"
+    " | grep -av '^--' | tr '\\n~' '  '"
+    " | grep -ao 'text=\"[^\"]*\" domain=\"[^\"]*\"'"
+    " | grep -av '^text=\"\"' | tail -1";
   const std::string cmd =
     "SSHPASS='" + config_.ssh_password + "' sshpass -e ssh "
     "-o StrictHostKeyChecking=accept-new -o ConnectTimeout=3 " + config_.ssh_target +
@@ -521,6 +547,30 @@ void AgentMonitor::fetch_tts_text(const std::string & trace_id)
         emit([cb, trace_id, text] { if (cb) cb(trace_id, text); });
       }
       return;
+    }
+    // 路径 3：云端音频直推——输出形如 text="话术" domain="omnissdk"
+    //（折行拼接后话术中可能夹折行空格，归一化匹配自然消解；引号内
+    // 用 [^"]* 防跨段贪婪，domain 与 self_domain 比对过滤自产播报）
+    if (!out.stream_line.empty()) {
+      const auto a = out.stream_line.find("text=\"");
+      const auto b = out.stream_line.rfind("\" domain=\"");
+      if (a != std::string::npos && b != std::string::npos && b > a) {
+        std::string text = out.stream_line.substr(a + 6, b - a - 6);
+        std::string domain = out.stream_line.substr(b + 10);
+        if (!domain.empty() && domain.back() == '"') {
+          domain.pop_back();  // 去尾部引号
+        }
+        if (!text.empty()) {
+          if (!domain.empty() && domain == config_.self_domain) {
+            return;  // 自产播报：不打不匹配
+          }
+          if (!match_phrases(text, trace_id)) {
+            auto cb = on_tts_text;
+            emit([cb, trace_id, text] { if (cb) cb(trace_id, text); });
+          }
+          return;
+        }
+      }
     }
     if (attempt == 0) {
       std::this_thread::sleep_for(std::chrono::milliseconds(600));

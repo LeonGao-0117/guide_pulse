@@ -7,8 +7,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
 #include <map>
 #include <set>
 #include <utility>
@@ -185,6 +187,12 @@ void MqttGuideBridgeNode::declare_and_load_params()
   // service）；回执照发，播报属本地增强。空串 = 禁用对应提示
   declare_parameter<std::string>(
     "navigate_failed_text", "导航失败，请检查navigation service是否正常");
+  // 导航 goal 被拒（航点表无该点位）时的语音提示（2026-10-19 现场需求：
+  // t1_slam_nav_ws 拒绝「路线里没有叫 X 的航点」属点位未配置而非导航栈
+  // 异常，播报要指引配置点位而不是排查服务；回执照发，播报属本地增强。
+  // 空串 = 禁用播报
+  declare_parameter<std::string>(
+    "navigate_waypoint_missing_text", "还未设置该点位信息哦，请设置相应点位后再次尝试");
   // 变形未确认双足即拒绝下发导航/重定位时的语音提示（2026-10-18 现场
   // 需求：导航指令必须等双足形态确认后才发给 t1_slam_nav_ws；运控
   // 不可用/变形被拒/动作未到位等场景现场要能听到，提示排查运控与
@@ -246,6 +254,9 @@ void MqttGuideBridgeNode::declare_and_load_params()
   // 到达变四足（摄像头收平）后最后播报。空串 = 禁用
   declare_parameter<std::string>(
     "welcome_prep_done_text", "元气满满，做好准备迎接顾客");
+  // 迎宾准备到达后延迟变形秒数（2026-10-18 测试需求）：到达 Y 点收到
+  // 导航 result 后不立即变形，等这么多秒再变四足。0 = 原行为（到达即变形）
+  declare_parameter<int>("welcome_prep_transform_delay_seconds", 0);
   // 迎宾流程兜底超时：正常路径播报终态回流（TtsStatus）即释放业务占用
   //（worker 的 tts_early 分支），此参数仅在终态事件丢失（BEST_EFFORT）
   // 时兜底——到期退出迎宾占用，后续 navigate/tts 不再被 business_busy
@@ -431,6 +442,8 @@ void MqttGuideBridgeNode::declare_and_load_params()
   busy_hint_relocate_text_ = get_parameter("busy_hint_relocate_text").as_string();
   busy_hint_navigate_text_ = get_parameter("busy_hint_navigate_text").as_string();
   navigate_failed_text_ = get_parameter("navigate_failed_text").as_string();
+  navigate_waypoint_missing_text_ =
+    get_parameter("navigate_waypoint_missing_text").as_string();
   navigate_transform_failed_text_ =
     get_parameter("navigate_transform_failed_text").as_string();
   relocate_failed_text_ = get_parameter("relocate_failed_text").as_string();
@@ -446,6 +459,9 @@ void MqttGuideBridgeNode::declare_and_load_params()
   welcome_default_texts_ = get_parameter("welcome_default_texts").as_string_array();
   welcome_lead_text_ = get_parameter("welcome_lead_text").as_string();
   welcome_prep_done_text_ = get_parameter("welcome_prep_done_text").as_string();
+  // 负值按 0 处理（原行为：到达即变形）
+  welcome_prep_transform_delay_seconds_ = std::max(0, static_cast<int>(
+    get_parameter("welcome_prep_transform_delay_seconds").as_int()));
   // 默认车型讲解词：「点位名|讲解词」逐条解析；格式非法（缺 | 分隔）
   // 跳过并告警，不拖垮其余条目。
   // ⚠️ 必须先把参数值拷进局部变量再遍历：get_parameter 按值返回临时
@@ -1372,6 +1388,23 @@ void MqttGuideBridgeNode::worker_loop()
               nav_welcome_prep_ = false;
               const std::string prep_source =
                 "迎宾准备:" + tour_->current_point();
+              // ---- 到达后延迟变形（2026-10-18 测试需求）：收到导航 result
+              // 不立即变形，等 welcome_prep_transform_delay_seconds 秒再变
+              // 四足。分片等待：rclcpp 关停时数百毫秒内退出不卡 worker 收尾；
+              // 等待期间新指令排队（与下方变形阻塞 worker 同模式）----
+              if (welcome_prep_transform_delay_seconds_ > 0) {
+                RCLCPP_INFO(
+                  get_logger(), "迎宾准备到达: %s，等 %ds 后再变形四足: %s",
+                  tour_->current_point().c_str(),
+                  welcome_prep_transform_delay_seconds_, prep_source.c_str());
+                const auto delay_deadline = std::chrono::steady_clock::now() +
+                  std::chrono::seconds(welcome_prep_transform_delay_seconds_);
+                while (rclcpp::ok() &&
+                  std::chrono::steady_clock::now() < delay_deadline)
+                {
+                  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+              }
               RCLCPP_INFO(
                 get_logger(), "迎宾准备到达: %s，开始变形四足（摄像头收起）: %s",
                 tour_->current_point().c_str(), prep_source.c_str());
@@ -1444,8 +1477,16 @@ void MqttGuideBridgeNode::worker_loop()
             business_ = Business::kNone;
             business_busy_until_.reset();
             // 失败语音提示（2026-10-17 现场需求：导航栈异常现场要能听到，
-            // 提示排查 navigation service；业务已释放不强抢，空串=禁用）
-            speak_hint(navigate_failed_text_, "navigate_failed");
+            // 提示排查 navigation service；业务已释放不强抢，空串=禁用）。
+            // 2026-10-19 现场需求：goal 被拒（detail 以「导航任务被拒」开头，
+            // 典型=语料配的点位不在航点表里，如 F 而路线只有 Y/J/A/E/H/K）
+            // 属点位未配置而非导航栈故障，播「还未设置该点位信息」指引
+            // 配置，与栈故障提示区分开
+            const bool waypoint_missing =
+              arrival->detail.rfind("导航任务被拒", 0) == 0;
+            speak_hint(
+              waypoint_missing ? navigate_waypoint_missing_text_ : navigate_failed_text_,
+              waypoint_missing ? "navigate_waypoint_missing" : "navigate_failed");
           }
         }
       }
@@ -1925,7 +1966,8 @@ void MqttGuideBridgeNode::handle_relocate(const CommandEvent & event)
 // 重定位终态收尾（worker 线程，验证结果来自 poll_set_pose_verified 或
 // 超时）：回执 relocate.result（验收通过=success；验收失败/超时=
 // failed:localization_failed）-> 释放业务占用（业务在回执发出后才结束）
-// -> 成功时播报（texts 优先，缺省「{point_name}点重定位成功」，单轮；
+// -> 成功时播报（texts 优先，缺省「{point_name}点 重定位 成功」（重定位
+// 前后空格分段，TTS 连读易错），单轮；
 // 走播报会话，不静音麦克风（2026-10-17：仅迎宾/导航讲解需要 mute），
 // 唤醒抑制照常，替换当前会话）；失败播 relocate_failed_text 提示
 //（2026-10-17 现场需求：提示排查 navigation service）
@@ -1948,7 +1990,10 @@ void MqttGuideBridgeNode::finish_relocate(bool verified)
     // 播报在业务释放之后（协议语义：重定位成功即 success，texts 播报
     // 与否属本地细节不影响结果；播报期间新业务可替换会话——音频单会话）
     std::vector<std::string> texts = relocate_texts_.empty()
-      ? std::vector<std::string>{relocate_point_name_ + "点重定位成功"}
+      // 「重定位」前后留空格（2026-10-18 现场需求）：连写（如「A点重定位
+      // 成功」）TTS 会把「点重定位」连读、发音异常，空格分段保证按
+      // 「X点 / 重定位 / 成功」断句；texts 自带语料原样播，不做处理
+      ? std::vector<std::string>{relocate_point_name_ + "点 重定位 成功"}
       : relocate_texts_;
     start_session(
       std::move(texts), TTS_MODE_SEQUENCE, tour_speak_interval_seconds_,
@@ -2069,27 +2114,46 @@ void MqttGuideBridgeNode::handle_scene(const CommandEvent & event)
 
   auto texts = make_welcome_texts(event.texts, welcome_default_texts_);
   // ---- 二维码阶段 1「准备」（缓存比对/下载 + 转码 + 推送，耗时大头
-  // ~3.5s）：与引导语播报、变形并行重叠，总时长 = max(引导语+变形, 准备
-  // +变形)；上屏（阶段 2）留到变形完成后、TTS 开播前——变形动画/变形
-  // 结束恢复的表情会顶掉变形前上屏的内容（PlayEmotion 单通道，新请求
-  // 即打断），且迎宾词提及「扫描我屏幕上显示的二维码」，TTS 开播时
-  // 屏幕必须已是二维码（2026-10-16 需求：二维码显示在开始迎宾 TTS
-  // 播报之前）。缺失/失败只影响显示，不阻断播报 ----
-  bool qr_ready = false;  // 二维码内容已推送就绪（待变形完成后上屏）
+  // ~3.5-5s）：std::async 后台线程执行，与引导语播报/变形/重定位并行
+  // 重叠，总时长 = max(引导语+变形+重定位, 准备)；worker 在上屏（阶段
+  // 2）前 get() 收割，届时通常早已完成。上屏（阶段 2）留到变形完成后、
+  // TTS 开播前——变形动画/变形结束恢复的表情会顶掉变形前上屏的内容
+  //（PlayEmotion 单通道，新请求即打断），且迎宾词提及「扫描我屏幕上
+  // 显示的二维码」，TTS 开播时屏幕必须已是二维码（2026-10-16 需求：
+  // 二维码显示在开始迎宾 TTS 播报之前）。缺失/失败只影响显示，不阻断
+  // 播报 ----
+  // 线程安全：fetch 每次 curl 句柄独立、prepare 全程 subprocess，均无
+  // 共享可变状态；screen_ 其余方法（play_prepared/cancel）仍只在 worker
+  // 线程调用——worker 阻塞在本函数期间无人并发触碰 screen_，后台线程
+  // 写入的 prepared_ 状态经 future.get() 建立 happens-before 后才被
+  // worker 消费；robot_id_/password_ 先在 worker 上拷贝再按值捕获，
+  // 避免与连接线程的凭据轮换（apply_credential）竞争
+  bool qr_ready = false;      // 二维码内容已推送就绪（待变形完成后上屏）
+  std::future<bool> qr_task;  // 无效 = 无需准备（未携带哈希且未配置默认图）
   if (event.qr_sha256.empty()) {
     // 未携带二维码哈希（含语料触发的本地注入）：显示默认二维码图片
     //（随包安装 config/QRCode.png）；未配置/文件缺失则不显示
     if (!default_qr_path_.empty()) {
       RCLCPP_INFO(
-        get_logger(), "迎宾开始: operation_id=%s 迎宾词=%zu 条 二维码=默认图片",
+        get_logger(), "迎宾开始: operation_id=%s 迎宾词=%zu 条 二维码=默认图片(后台准备)",
         event.operation_id.c_str(), texts.size());
-      const auto prep = screen_->prepare(default_qr_path_, "default-qr");
-      qr_ready = prep.ok;
-      if (!qr_ready) {
-        RCLCPP_WARN(
-          get_logger(), "默认二维码准备失败(本次不显示,不影响播报): %s",
-          prep.detail.c_str());
-      }
+      qr_task = std::async(
+        std::launch::async, [this] {
+          const auto t0 = std::chrono::steady_clock::now();
+          const auto prep = screen_->prepare(default_qr_path_, "default-qr");
+          if (!prep.ok) {
+            RCLCPP_WARN(
+              get_logger(), "默认二维码准备失败(本次不显示,不影响播报): %s",
+              prep.detail.c_str());
+            return false;
+          }
+          const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+          RCLCPP_INFO(
+            get_logger(), "默认二维码准备完成(后台并行): 耗时 %lldms",
+            static_cast<long long>(ms));
+          return true;
+        });
     } else {
       RCLCPP_INFO(
         get_logger(), "迎宾开始: operation_id=%s 迎宾词=%zu 条 二维码=无（未携带 qr_sha256）",
@@ -2097,32 +2161,45 @@ void MqttGuideBridgeNode::handle_scene(const CommandEvent & event)
       screen_->cancel("scene未携带二维码");
     }
   } else {
-    auto image_path = qr_cache_->cached_path(event.qr_sha256);
-    const bool cache_hit = image_path.has_value();
-    if (!cache_hit) {
-      const auto fetch = qr_cache_->fetch(robot_id_, password_, event.qr_sha256);
-      if (fetch.ok) {
-        image_path = fetch.image_path;
-      } else {
-        RCLCPP_WARN(
-          get_logger(),
-          "迎宾二维码下载失败(本次不显示,不影响播报): hash=%.12s… %s",
-          event.qr_sha256.c_str(), fetch.detail.c_str());
-      }
-    }
-    if (image_path.has_value()) {
-      RCLCPP_INFO(
-        get_logger(), "迎宾开始: operation_id=%s 迎宾词=%zu 条 二维码=%s(hash=%.12s…)",
-        event.operation_id.c_str(), texts.size(),
-        cache_hit ? "缓存命中" : "已下载", event.qr_sha256.c_str());
-      const auto prep = screen_->prepare(*image_path, event.qr_sha256);
-      qr_ready = prep.ok;
-      if (!qr_ready) {
-        RCLCPP_WARN(
-          get_logger(), "迎宾二维码准备失败(本次不显示,不影响播报): hash=%.12s… %s",
-          event.qr_sha256.c_str(), prep.detail.c_str());
-      }
-    }
+    RCLCPP_INFO(
+      get_logger(), "迎宾开始: operation_id=%s 迎宾词=%zu 条 二维码=后台下载+准备(hash=%.12s…)",
+      event.operation_id.c_str(), texts.size(), event.qr_sha256.c_str());
+    // 凭据在 worker 上拷贝后按值捕获（见上「线程安全」）
+    const std::string robot_id = robot_id_;
+    const std::string password = password_;
+    const std::string qr_sha256 = event.qr_sha256;
+    qr_task = std::async(
+      std::launch::async, [this, robot_id, password, qr_sha256] {
+        const auto t0 = std::chrono::steady_clock::now();
+        auto image_path = qr_cache_->cached_path(qr_sha256);
+        const bool cache_hit = image_path.has_value();
+        if (!cache_hit) {
+          const auto fetch = qr_cache_->fetch(robot_id, password, qr_sha256);
+          if (fetch.ok) {
+            image_path = fetch.image_path;
+          } else {
+            RCLCPP_WARN(
+              get_logger(),
+              "迎宾二维码下载失败(本次不显示,不影响播报): hash=%.12s… %s",
+              qr_sha256.c_str(), fetch.detail.c_str());
+            return false;
+          }
+        }
+        const auto prep = screen_->prepare(*image_path, qr_sha256);
+        if (!prep.ok) {
+          RCLCPP_WARN(
+            get_logger(), "迎宾二维码准备失败(本次不显示,不影响播报): hash=%.12s… %s",
+            qr_sha256.c_str(), prep.detail.c_str());
+          return false;
+        }
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - t0).count();
+        RCLCPP_INFO(
+          get_logger(), "迎宾二维码准备完成(后台并行): %s hash=%.12s… 耗时 %lldms",
+          cache_hit ? "缓存命中" : "已下载", qr_sha256.c_str(),
+          static_cast<long long>(ms));
+        return true;
+      });
   }
   // ---- 迎宾引导语（2026-10-17 现场需求）：先播 TTS 引导语（默认
   //「元气满满，小T来迎接我的顾客了」），播完再变形——先出声招呼、
@@ -2160,8 +2237,8 @@ void MqttGuideBridgeNode::handle_scene(const CommandEvent & event)
   // wait_done 必然在有限时间返回：变形线程内部每层等待都有上限（单次服务
   // 调用 3s / 动作到位总时限 / 等稳定 10s），运控不可达时更是立即放弃并
   // 照常播报。等待期间新指令在下行队列排队（worker 串行，处理完迎宾才
-  // 轮到它们）；二维码的下载/转码/推送（实测 ~3.5s）与引导语播报、变形
-  // 并行重叠（准备在两者之前已发起），上屏只等变形。worker 与本函数
+  // 轮到它们）；二维码的下载/转码/推送（实测 ~3.5s）已在后台线程与
+  // 引导语播报、变形、重定位并行重叠，上屏只等变形。worker 与本函数
   // 同线程调用 transform_，无并发；shutdown 先 join worker 再回收变形线程
   if (transform_->in_flight()) {
     RCLCPP_INFO(
@@ -2174,7 +2251,19 @@ void MqttGuideBridgeNode::handle_scene(const CommandEvent & event)
       get_logger(), "迎宾变形流程结束，开始迎宾播报: 迎宾:%s",
       event.operation_id.c_str());
   }
+  // 变形后重定位（2026-10-18 现场需求）：迎宾变形真的变了形（180°
+  // 转身把 AMCL 带偏）-> 发 set_pose（最新停留点）把定位拉回，再做
+  // 二维码上屏与迎宾播报——机器人虽不走，但定位认知修正后下次导航
+  // 才不会跑偏；已是人形零动作路径跳过；失败不阻断迎宾（补偿性）
+  relocate_after_transform("迎宾:" + event.operation_id);
 
+  // ---- 收割后台二维码准备（阶段 1）结果：引导语+变形+重定位窗口
+  //（实测 >10s）覆盖准备耗时（~3.5s），此处通常零等待；准备各环节
+  // 均有超时上限（curl 5s / ffmpeg / scp ConnectTimeout 5s），get()
+  // 必然有限返回，不会挂死流程 ----
+  if (qr_task.valid()) {
+    qr_ready = qr_task.get();
+  }
   // ---- 二维码阶段 2「上屏」：变形动画/结束表情已过去不会被顶掉，
   // 在 TTS 开播之前完成显示（2026-10-16 需求）。二维码常驻显示
   //（display_show_timeout_seconds 超时/新业务取消由 ScreenDisplay 与
@@ -2284,6 +2373,39 @@ void MqttGuideBridgeNode::speak_hint(const std::string & text, const char * trac
     RCLCPP_WARN(
       get_logger(), "语音提示失败（不影响回执）: %s: %s",
       command.text.c_str(), speak.detail.c_str());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 变形后重定位（worker 线程，2026-10-18 现场需求）：导航/迎宾前置变形
+// 实际发生且成功（biped_transformed——发了变形动作并落位）时，同步发
+// 不带航点的 {command: set_pose} 到 t1_slam_nav_ws——变形动作自带约
+// 180° 转身（QUADRUPED_TO_BIPED_ROTATE），AMCL 定位被带偏；服务端用
+// 最新停留点（最近一次导航结束实际停的位置）重设初值拉回。本身就是
+// 人形（零动作路径）不发送。失败/被拒（无停留点/导航栈未起/正在变形
+// 等）只记日志不阻断业务——补偿性重定位，尽力而为
+// ---------------------------------------------------------------------------
+void MqttGuideBridgeNode::relocate_after_transform(const std::string & source)
+{
+  if (!transform_->biped_transformed()) {
+    RCLCPP_INFO(
+      get_logger(), "变形后重定位跳过: 本次未发生形态切换（已是人形）（%s）",
+      source.c_str());
+    return;
+  }
+  RCLCPP_INFO(
+    get_logger(),
+    "变形后重定位: 发送 set_pose（最新停留点）到 t1_slam_nav_ws，"
+    "等验收结果（通常零点几秒）（%s）", source.c_str());
+  const auto outcome = nav_->set_pose_latest();
+  if (outcome.ok) {
+    RCLCPP_INFO(
+      get_logger(), "变形后重定位完成: %s（%s）",
+      outcome.detail.c_str(), source.c_str());
+  } else {
+    RCLCPP_WARN(
+      get_logger(), "变形后重定位失败(不影响后续流程): %s（%s）",
+      outcome.detail.c_str(), source.c_str());
   }
 }
 
@@ -2439,6 +2561,11 @@ void MqttGuideBridgeNode::handle_navigate(const CommandEvent & event)
     }
     return;
   }
+  // 变形后重定位（2026-10-18 现场需求）：前置变形真的变了形（180°
+  // 转身把 AMCL 带偏）-> 先发 set_pose（最新停留点）等终态再发导航
+  // goal——set_pose 在途时发 go 会被「任务在跑」拒，必须等它做完；
+  // 已是人形零动作路径跳过。失败不阻断导航（记日志继续出发）
+  relocate_after_transform("导航:" + event.operation_id);
   // 引导语显示名（{point} 替换用）：映射表反查 code 对应的车型名，
   // 查不到用原始点位名（表结构上 code 必来自表内，反查失败仅防御）
   nav_point_display_ = point_display_name(waypoint, event.point_name);
@@ -2520,6 +2647,9 @@ void MqttGuideBridgeNode::handle_welcome_prep(const CommandEvent & event)
     speak_hint(navigate_transform_failed_text_, "welcome_prep_transform_failed");
     return;
   }
+  // 变形后重定位（与 handle_navigate 同款，2026-10-18 现场需求）：
+  // 变了形先 set_pose（最新停留点）再发导航 goal；已是人形跳过
+  relocate_after_transform("迎宾准备:" + event.operation_id);
   nav_point_display_ = point_display_name(waypoint, event.point_name);
   RCLCPP_INFO(
     get_logger(),
@@ -2708,8 +2838,9 @@ TtsClient::Result MqttGuideBridgeNode::play_current()
 
   const auto result = tts_->play(command);
   if (result.ok) {
-    // 语音受理成功即触发伴随动作（动作与语音并行；失败只记日志）
-    trigger_speech_motion();
+    if (session_source_.rfind("重定位:", 0) != 0) {
+      trigger_speech_motion();
+    }
     const bool more = session_->advance();
     if (!more) {
       // 单轮模式一轮播完（受理完最后一条，语音仍在播）：会话结束，续期

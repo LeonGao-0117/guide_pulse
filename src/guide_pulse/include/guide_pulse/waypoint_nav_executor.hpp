@@ -193,6 +193,34 @@ public:
     return verified;
   }
 
+  // 变形后重定位（接口语义见 NavExecutor::set_pose_latest，2026-10-18
+  // 现场需求）：发**不带航点**的 set_pose goal——服务端用最新停留点
+  //（最近一次导航结束实际停的位置）重设定位初值，把变形转身带偏的
+  // AMCL 定位拉回。同步等 result 至终态：REJECTED 毫秒级；正常验收
+  // 零点几秒、定位确认上限 10s（NavigateAction.md），兜底 12s。独立
+  // future 等待，不占 set_pose/poll_set_pose_verified 的 relocate 轮询槽
+  //（写到的 set_pose_cached_ 会被下一次 set_pose() 开头 reset，串行
+  // worker 下无交错）
+  NavOutcome set_pose_latest() override
+  {
+    NavOutcome outcome;
+    outcome.detail = "set_pose（最新停留点）";
+    auto goal_handle = send_goal(Navigate::Goal::COMMAND_SET_POSE, "");
+    if (!goal_handle) {
+      outcome.detail = goal_error_;  // 服务不可用/受理超时/action 层拒绝
+      RCLCPP_WARN(
+        node_->get_logger(), "[变形后重定位] 请求未成功: %s", outcome.detail.c_str());
+      return outcome;
+    }
+    auto result_future = action_client_->async_get_result(goal_handle);
+    if (result_future.wait_for(std::chrono::seconds(12)) != std::future_status::ready) {
+      outcome.detail = "set_pose 结果等待超时（12s；验收通常零点几秒，上限 10s）";
+      RCLCPP_WARN(node_->get_logger(), "[变形后重定位] %s", outcome.detail.c_str());
+      return outcome;
+    }
+    return finish_set_pose(result_future.get().result, "");
+  }
+
 private:
   using Navigate = liwei_nav_msgs::action::Navigate;
   using GoalHandle = rclcpp_action::ClientGoalHandle<Navigate>;
@@ -211,7 +239,12 @@ private:
     }
     Navigate::Goal goal;
     goal.command = command;
-    goal.waypoints = {point_name};
+    // point_name 为空 = set_pose 留空航点（用最新停留点，NavigateAction.md
+    // §3「重定位到最近一次导航结束时停的位置」）；go 恒非空调用，空
+    // 列表 go 会被服务端拒——不额外防御
+    if (!point_name.empty()) {
+      goal.waypoints = {point_name};
+    }
     goal.return_to_quadruped = false;  // 讲解机器人保持人形（set_pose 硬约束）
     auto goal_future = action_client_->async_send_goal(goal);
     if (goal_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {

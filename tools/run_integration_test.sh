@@ -400,7 +400,7 @@ log "用例 5b 通过：navigate.stop 取消在途导航（讲解不播），无
 # ---------------------------------------------------------------------------
 # 7c. 用例 5c：地图重定位（relocate，2026-10-17 接入：终态=导航模块验收）
 #     下发 relocate A -> 受理 -> 等待验收（mock hold 8 次 poll ≈ 2s）->
-#     回 relocate.result success -> 播报「A点重定位成功」
+#     回 relocate.result success -> 播报「A点 重定位 成功」
 # ---------------------------------------------------------------------------
 $SIM relocate A --wait-result 8 > "${WORK_DIR}/sim5c.log" 2>&1
 wait_log "MQTT 下行重定位已受理: 航点「A」" "${WORK_DIR}/bridge.log" 5 \
@@ -408,13 +408,13 @@ wait_log "MQTT 下行重定位已受理: 航点「A」" "${WORK_DIR}/bridge.log"
 wait_log "等待导航模块验收" "${WORK_DIR}/bridge.log" 5 || fail "未见等待验收日志"
 wait_log "MQTT 下行重定位验收通过" "${WORK_DIR}/bridge.log" 8 \
   || fail "Mock 验收轮询未在 hold 窗口后给出结果"
-wait_log "text='A点重定位成功'" "${WORK_DIR}/mock_tts.log" 10 \
-  || fail "验收通过后未播报默认话术「A点重定位成功」"
+wait_log "text='A点 重定位 成功'" "${WORK_DIR}/mock_tts.log" 10 \
+  || fail "验收通过后未播报默认话术「A点 重定位 成功」"
 wait_log "type=relocate.result" "${WORK_DIR}/sim5c.log" 5 \
   || { cat "${WORK_DIR}/sim5c.log" || true; fail "后端未收到 relocate.result 回执"; }
 grep -q "outcome=success" "${WORK_DIR}/sim5c.log" || fail "relocate 回执不是 success"
 $SIM stop > /dev/null 2>&1 || true
-log "用例 5c 通过：relocate 受理 -> 等验收 -> 回 success -> 播报「A点重定位成功」"
+log "用例 5c 通过：relocate 受理 -> 等验收 -> 回 success -> 播报「A点 重定位 成功」"
 
 # 7d. 用例 5d：重定位等待期新业务被拒（不可打断业务）+ 语音提示
 #     「我正在重定位，请稍后」；重定位本体不受影响照常终态。

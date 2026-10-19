@@ -12,9 +12,14 @@
 //   PlayEmotion 服务由运控板 (默认 10.1.1.100) 实际执行，file_paths 必须
 //   是运控板可访问的绝对路径；本组件部署在大脑板，故先 scp 推送再播放。
 //
-// 线程模型：全由桥接节点 worker 线程调用（与 TtsClient 一致：服务客户端
-// 挂独立回调组，worker 线程 future.wait_for 等回执，不参与节点 spin）。
-// 超时不设 ROS timer：deadline_ 由桥接 worker_loop 纳入定时唤醒统一调度。
+// 线程模型：play_prepared/cancel/active/deadline 由桥接节点 worker 线程
+// 调用（与 TtsClient 一致：服务客户端挂独立回调组，worker 线程
+// future.wait_for 等回执，不参与节点 spin）。prepare 例外：迎宾流程
+//（handle_scene）把它放到阶段 1 后台线程与引导语/变形并行——全程
+// subprocess（ffmpeg/scp）不触碰 ROS 客户端，其写入的 prepared_/
+// prepared_content_id_ 由 worker 经 future.get() 收割后消费（跨线程
+// happens-before 由 future 建立）。超时不设 ROS timer：deadline_ 由
+// 桥接 worker_loop 纳入定时唤醒统一调度。
 // ============================================================================
 #pragma once
 
@@ -109,8 +114,9 @@ private:
   Config config_;
   bool showing_{false};                              // 仅 worker 线程访问
   std::chrono::steady_clock::time_point deadline_;   // 仅 worker 线程访问
-  bool prepared_{false};          // prepare 成功待上屏（仅 worker 线程访问）
+  bool prepared_{false};          // 待上屏标记（迎宾后台准备线程写，worker 读）
   std::string prepared_content_id_;  // 就绪内容的寻址文件名（QRCode_{id}.mp4）
+                                   // 同上：经 future.get() 收割后消费
   rclcpp::Client<aimdk_msgs::srv::PlayEmotion>::SharedPtr client_;
   rclcpp::CallbackGroup::SharedPtr callback_group_;
 };

@@ -118,6 +118,16 @@ public:
   //  ensure_quadruped 发起同样清零——变四足成功也不是人形
   bool biped_confirmed() const {return biped_ok_.load();}
 
+  // 最近一次人形确保流程是否**实际发生了形态切换**（走了发变形动作
+  // 的路径且成功落位，成功点②）。对照 biped_confirmed 的「已是人形」
+  // 零动作路径（成功点①）不置位——2026-10-18 现场需求：变形动作自带
+  // 约 180° 转身会把 AMCL 定位带偏，导航/迎宾前置变形**真的变了形**才
+  // 需要向 t1_slam_nav_ws 发 {command: set_pose}（用最新停留点重定位
+  // 拉回）；本来就是人形则不发。语义：ensure_biped/ensure_quadruped
+  // 发起即清零，仅变形线程在成功点②写；四足方向恒不置位（set_pose
+  // 要求人形，四足无重定位面）
+  bool biped_transformed() const {return biped_switched_.load();}
+
   // 等待变形流程结束（join）。返回 true = 本次确有线程被收尾。
   // 必然在有限时间返回：内部每层等待都有上限，运控不可达时立即放弃
   bool wait_done();
@@ -163,6 +173,10 @@ private:
   std::atomic_bool biped_ok_{false};             // 最近一次人形确保的结果
                                                  //（见 biped_confirmed；发起清零、
                                                  //  成功点置位，仅变形线程写）
+  std::atomic_bool biped_switched_{false};       // 最近一次人形确保是否实际
+                                                 // 发生了变形（见 biped_transformed；
+                                                 //  发起清零、成功点②置位，仅
+                                                 //  变形线程写）
   std::thread chime_thread_;                     // 变形音播放线程（至多一个）
   std::atomic_bool chime_in_flight_{false};      // 播放未结束（收尾判定）
 };

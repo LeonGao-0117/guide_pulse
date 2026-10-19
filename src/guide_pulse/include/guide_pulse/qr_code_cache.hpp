@@ -65,7 +65,9 @@ public:
 
   // 下载 + 校验 + 落缓存（未命中时调用；命中请直接用 cached_path 免下载）。
   // robot_id/password：当次 enroll 的 MQTT 凭据（Basic username=robot_id）。
-  // 线程模型：由桥接 worker 线程独占调用（与 RobotEnroller 同为阻塞 HTTP）。
+  // 线程模型：阻塞 HTTP；迎宾流程中由阶段 1 后台准备线程调用（其余
+  // 调用方为 worker 线程）。无共享可变状态（curl 句柄每次调用独立），
+  // 跨线程调用安全；调用方须先在 worker 上拷贝凭据再传入。
   FetchResult fetch(
     const std::string & robot_id, const std::string & password,
     const std::string & qr_sha256);

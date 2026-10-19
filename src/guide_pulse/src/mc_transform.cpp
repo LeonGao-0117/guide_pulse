@@ -26,8 +26,10 @@ constexpr const char * kMcToBipedAction = "QUADRUPED_TO_BIPED_ROTATE";
 // 四足基础运动态（人 -> 狗变形完成后的自动落位，SDK 状态图 B2Q -.-> QBASE）
 constexpr const char * kMcQuadrupedTarget = "QUADRUPED_LOCOMOTION_DEFAULT";
 
-// 人 -> 狗变形动作（普通变形，不带旋转：迎宾准备无朝向要求）
-constexpr const char * kMcToQuadrupedAction = "BIPED_TO_QUADRUPED";
+// 人 -> 狗变形动作（旋转变形：2026-10-18 现场需求，原地转约 180° 再落
+// 四足；与狗->人方向 kMcToBipedAction 的 _ROTATE 成对，t1_slam_nav_ws
+// 速度桥同款。SDK 转移表确认 WBC 出边合法、落位同为 QBASE）
+constexpr const char * kMcToQuadrupedAction = "BIPED_TO_QUADRUPED_ROTATE";
 
 // 四足站立 / 四足行走态（站定没有出边直达变形，要先进行走态）
 constexpr const char * kMcStandTarget = "QUADRUPED_STAND_DEFAULT";
@@ -218,7 +220,8 @@ void McTransform::ensure_biped(const std::string & source)
     transform_thread_.join();
   }
   transform_in_flight_.store(true);
-  biped_ok_.store(false);  // 发起即清零：结果以本流程为准（成功点置位）
+  biped_ok_.store(false);        // 发起即清零：结果以本流程为准（成功点置位）
+  biped_switched_.store(false);  // 是否实际变形以本流程为准（成功点②置位）
   transform_thread_ = std::thread([this, source]() {run_ensure_form(source, true);});
 }
 
@@ -236,7 +239,8 @@ void McTransform::ensure_quadruped(const std::string & source)
     transform_thread_.join();
   }
   transform_in_flight_.store(true);
-  biped_ok_.store(false);  // 去四足方向：成功也不是人形，导航门禁不放行
+  biped_ok_.store(false);        // 去四足方向：成功也不是人形，导航门禁不放行
+  biped_switched_.store(false);  // 四足方向恒不置位（set_pose 要求人形）
   transform_thread_ = std::thread([this, source]() {run_ensure_form(source, false);});
 }
 
@@ -589,7 +593,10 @@ void McTransform::run_ensure_form(const std::string & source, bool to_biped)
     node_->get_logger(), "%s完成: 已切到 %s 且运行中（%s）",
     log_prefix, target, source.c_str());
   if (to_biped) {
-    biped_ok_.store(true);  // 成功点②：变形走完且目标态运行中（门禁放行依据）
+    biped_ok_.store(true);        // 成功点②：变形走完且目标态运行中（门禁放行依据）
+    biped_switched_.store(true);  // 实际发生了形态切换（对照成功点①的零动作
+                                  // 路径）：变形后重定位（set_pose 最新停留点）
+                                  // 的判定依据——转身 180° 把定位带偏了
   }
   // 变形完成：摄像头舵机归位（人形竖起/四足收平；失败不阻断播报）
   const std::string why_camera = set_camera(camera_position);

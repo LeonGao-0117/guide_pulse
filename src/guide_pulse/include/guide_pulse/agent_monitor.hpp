@@ -136,9 +136,10 @@ private:
   void on_tts_msg(const aimdk_msgs::msg::TtsStatus::SharedPtr msg);
   void on_asr_msg(const aimdk_msgs::msg::AsrResult::SharedPtr msg);
   // 按 trace_id 回查运控板日志取 TTS 话术原文（工作线程执行，串行免锁）。
-  // 覆盖两种 TTS 路径：本地 TTS（received request item_id=<trace> 行）
-  // 与云端流式（item_id 匹配的 text.done JSON 行）；查到后触发 on_tts_text
-  // 并做语料匹配
+  // 覆盖三种 TTS 日志来源：本地 TTS（received request item_id=<trace> 行）、
+  // 云端流式（item_id 匹配的 text.done JSON 行）与云端音频直推
+  //（dispatching status 行的 text="话术"，超长折行需 -A3 拼接提取）；
+  // 查到后触发 on_tts_text 并做语料匹配
   void fetch_tts_text(const std::string & trace_id);
   // agent TTS 话术的语料匹配（含冷却），工作线程执行。trace_id = 话术
   // 来源 TTS（navigate/relocate 延迟触发挂起时等其终态用）。
