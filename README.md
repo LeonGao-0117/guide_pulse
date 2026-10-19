@@ -21,13 +21,13 @@ APP 经 Server（RobotCar 协议 v0.25.0）下发参数到 Robot，Robot 本地�
 
 | 展厅功能 | 协议指令 | 回执 | Robot 本地行为 |
 | --- | --- | --- | --- |
-| 迎宾 | `scene`（`scene="welcome"` + 可选 `texts`） | `scene.result`（v0.24.0） | 先播引导语 `welcome_lead_text`（默认「元气满满，小T来迎接我的顾客了」，2026-10-17 需求，空=禁用）→ **播完再变形**（直调运控 SetMcAction/GetMcAction，已是人形零动作；不依赖 t1_slam_nav_ws）→ 变形完成后才播迎宾词一轮（texts 缺省用 `welcome_default_texts`；二维码准备与引导语/变形并行，上屏在变形后 TTS 前） |
+| 迎宾 | `scene`（`scene="welcome"` + 可选 `texts`） | `scene.result`（v0.24.0） | 先播引导语 `welcome_lead_text`（默认「元气满满，小T来迎接我的顾客了」，2026-10-17 需求，空=禁用）→ **播完再变形**（直调运控 SetMcAction/GetMcAction，已是人形零动作；不依赖 t1_slam_nav_ws）→ 变形完成后才播迎宾词一轮（texts 缺省取映射表迎宾点 `welcome_point_code`（默认 Y）条目的 text——2026-10-19 起强制映射表权威，`welcome_default_texts` 已移除，未配不播词；二维码准备与引导语/变形并行，上屏在变形后 TTS 前） |
 | 导航 + 汽车讲解 | `navigate`（`point_name` + 可选 `texts`） | `navigate.result`（v0.24.0） | 导航到点位，到达后按序播讲解词一轮（到达回 `success`；失败/中止/忙碌回 `failed+reason`） |
 | 地图重定位 | `relocate`（`point_name` + 可选 `texts`，2026-10-17 接入） | `relocate.result` | **不可打断的互斥业务**：`point_name` 经映射表解析 -> `set_pose` goal 重设定位初值（机器人不动）-> 等导航模块验收（goal result（验收完才回），真机 ~1.5s；`relocate_timeout_seconds` 默认 30s 超时兜底）-> 验收通过回 `success` 并播报（缺省「{点位名}点 重定位 成功」，重定位前后空格分段防 TTS 连读）；等待期新业务回 `failed/busy` 并播「我正在重定位，请稍后」（迎宾/播报/讲解中被拒不播——正在出声）；受理被拒当场回 `point_not_found`/`localization_failed`（兼语料触发本地注入，不回执） |
 | 播报 | `tts`（`texts`+`mode`+`interval_seconds`） | `tts.result` | 列表单轮播完自行结束（2026-10-14 变更，原为循环播到替换/停止） |
 | 停止 | `tts.stop` | 无 | 停一切播报并取消导航 |
 | 取消导航 | `navigate.stop`（v0.23.0） | 无 | 只取消当前导航（无导航 no-op，不影响讲解/播报） |
-| 点位映射表同步 | `point_map`（v0.25.0 P-039 + v0.28.0 P-042 播放词） | `point_map.result` | App 唯一权威：`points`（1..256 条 `{code,name,text?}`）**全量替换**本地映射并落盘（`point_map_file` 默认持久化分区 `/robot/persist/var/guide_pulse/point_map.json`，**断电不丢**、重启自动加载）；`text`（可选 1..2048 标量）为该点位播放词——到达播报优先级：指令 `texts` > 点位表 `text` > 本地 `navigate_default_texts` 兜底；纯数据同步**不受业务互斥拦截**；落盘失败回 `failed/point_map_failed`。此后 `navigate`/`relocate` 的 `point_name` 经映射表 `name->code` 解析（如「比亚迪ætəʊ 1」→航点 `A`），未命中原样透传 |
+| 点位映射表同步 | `point_map`（v0.25.0 P-039 + v0.28.0 P-042 播放词） | `point_map.result` | App 唯一权威：`points`（1..256 条 `{code,name,text?}`）**全量替换**本地映射并落盘（`point_map_file` 默认持久化分区 `/robot/persist/var/guide_pulse/point_map.json`，**断电不丢**、重启自动加载）；`text`（可选 1..2048 标量）为该点位播放词——**播放词唯一来源**（2026-10-19 现场需求：本地 `navigate_default_texts` 已移除，强制映射表权威）：到达/迎宾播报优先级 = 指令 `texts` > 点位表 `text`，未配则不播；纯数据同步**不受业务互斥拦截**；落盘失败回 `failed/point_map_failed`。此后 `navigate`/`relocate` 的 `point_name` 经映射表 `name->code` 解析（如「比亚迪ætəʊ 1」→航点 `A`），未命中原样透传 |
 
 本地策略：音频单会话（新播报替换旧会话）；导航单任务（新 navigate 替换旧导航）；
 tts/迎宾/讲解均单轮播完自行结束（2026-10-14 起 tts 不再循环）；迎宾词播报未完
@@ -48,7 +48,6 @@ guide_pulse/
 │       │   ├── robot_enroll.hpp       # enroll 注册面客户端（沿用 tts_demo）
 │       │   ├── tts_client.hpp         # SDK PlayTts 封装 + 最高权重抢占停止
 │       │   ├── playlist.hpp           # 播报状态机（单轮/循环，纯逻辑）
-│       │   ├── welcome.hpp            # 迎宾模块（纯函数）
 │       │   ├── tour.hpp               # 讲解模块状态机（导航→到达→讲解）
 │       │   ├── nav_executor.hpp       # 导航执行器接口 + Mock（真机对接点）
 │       │   └── mqtt_guide_bridge_node.hpp

@@ -116,6 +116,39 @@ TEST_F(PointMapStoreTest, ResolveNameToCode)
   EXPECT_FALSE(store.resolve("").has_value());
 }
 
+// 名称关键词 -> code 子串匹配（2026-10-19 现场需求：welcome_prep 语料
+// 点位部分写「迎宾」，映射表 name 如「迎宾点」-> code Y）：首个 name
+// 含关键词的条目命中；空关键词/未命中返回 nullopt
+TEST_F(PointMapStoreTest, ResolveByNameKeyword)
+{
+  PointMapStore store((dir_ / "map.json").string());
+  ASSERT_TRUE(store.load());
+
+  // 空表：未命中
+  EXPECT_FALSE(store.resolve_by_name_keyword("迎宾").has_value());
+
+  ASSERT_TRUE(store.replace(sample_points()));
+  // 表内无 name 含「迎宾」的条目：未命中
+  EXPECT_FALSE(store.resolve_by_name_keyword("迎宾").has_value());
+  // name 子串命中（含空格差异自然消解：name「比亚迪 M9 DM-i」）
+  EXPECT_EQ(store.resolve_by_name_keyword("M9"), std::optional<std::string>("B"));
+  EXPECT_EQ(store.resolve_by_name_keyword("腾势 D9"), std::optional<std::string>("D"));
+  // 多条命中取先到者（与 App 展示顺序一致）
+  EXPECT_EQ(store.resolve_by_name_keyword("腾势"), std::optional<std::string>("C"));
+  // 空关键词不匹配（防空串全命中）
+  EXPECT_FALSE(store.resolve_by_name_keyword("").has_value());
+  // 大小写敏感（与 resolve 精确匹配同口径）
+  EXPECT_FALSE(store.resolve_by_name_keyword("m9").has_value());
+
+  // 迎宾点场景：name「迎宾点」-> code Y（换 code 只需 App 改表）
+  const std::vector<PointMapEntry> with_welcome = {
+    {"A", "比亚迪ATTO 1"}, {"Y", "迎宾点"}};
+  ASSERT_TRUE(store.replace(with_welcome));
+  EXPECT_EQ(store.resolve_by_name_keyword("迎宾"), std::optional<std::string>("Y"));
+  // 精确解析优先不受影响：resolve("Y") 一级命中 code
+  EXPECT_EQ(store.resolve("Y"), std::optional<std::string>("Y"));
+}
+
 // 落盘失败：replace 返回 false 且内存不应用本次表（未生效语义）。
 // 构造法：父路径是普通文件 -> create_directories/ofstream 均失败
 //（root 运行也有效，权限法对 root 无效）

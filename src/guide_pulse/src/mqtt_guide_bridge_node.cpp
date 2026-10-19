@@ -208,6 +208,14 @@ void MqttGuideBridgeNode::declare_and_load_params()
   // 点位名）。空串 = 禁用。MQTT 下行与语料触发共用
   declare_parameter<std::string>(
     "navigate_lead_text", "请跟我来，让我带您去看看{point}这款车");
+  // 导航目标为迎宾点时的引导语（2026-10-19 现场需求）：App 下发
+  // navigate 去迎宾点（如 point_name=Y），普通引导语「请跟我来…去看看
+  // 迎宾点这款车」语义不通（迎宾点不是车型），改播这句（与
+  // welcome_prep 触发语料同款「好嘞，马上前去迎宾点」）。判定：code
+  // 命中 welcome_point_code 或点位显示名含「迎宾」。空串 = 回退普通
+  // 引导语
+  declare_parameter<std::string>(
+    "navigate_lead_welcome_text", "好嘞，马上前去迎宾点");
   // 导航出发播报语（2026-10-18 现场需求）：收到导航指令（无论语音还是
   // MQTT）受理后先播这句再起身变形人形（先开口、立刻动）；迎宾准备去
   // 迎宾点的导航不播（agent 已说「好嘞，马上前去迎宾点」，再说就重复，
@@ -237,13 +245,12 @@ void MqttGuideBridgeNode::declare_and_load_params()
   // 空串 = 禁用播报（回执照发）
   declare_parameter<std::string>(
     "point_map_unmatched_text", "未找到点位{point}，请重新配置映射表");
-  // scene 未带 texts 时的本地默认迎宾词（与 yaml welcome_default_texts
-  // 保持一致；语料触发的迎宾不带 texts，走此默认词）
-  declare_parameter<std::vector<std::string>>(
-    "welcome_default_texts",
-    std::vector<std::string>{
-      "您好！欢迎来到比亚迪品牌体验中心。我是机器人导览员小T，我可以带您参观展厅、介绍车型，也可以根据您的用车需求，帮您找到想了解的车。",
-      "另外您也可以扫描我屏幕上显示的二维码，留下您的联系方式，方便我们给您提供更好的服务。"});
+  // 迎宾点 code（2026-10-19 现场需求：迎宾词强制以映射表下发为准）：
+  // scene 未带 texts 时取映射表该 code 条目的 text 作迎宾词（如 Y=
+  // 迎宾点 条目的播放词）；表未配 text 则本次迎宾不播词（引导语/
+  // 变形/二维码/回执照常）。空串 = 禁用映射表迎宾词。本地默认迎宾词
+  //（welcome_default_texts）已移除
+  declare_parameter<std::string>("welcome_point_code", "Y");
   // 迎宾引导语（2026-10-17 现场需求：先出声招呼、再起身变形的迎宾节奏）：
   // scene=welcome 到达后先播引导语，播完（TtsStatus 终态回流/字数估算
   // 兜底）再变形，变形完成播迎宾词。空串 = 禁用（直接进变形，回退原
@@ -291,9 +298,20 @@ void MqttGuideBridgeNode::declare_and_load_params()
   // 名「好的，您是想了解下腾势 B5这款车吗，请稍等」-> 查点位映射表
   // 下发导航）。每条格式「点位名|语料」，点位名 = 点位映射表 name/
   // code（如「腾势 B5」，handle_navigate 经映射表两级解析取 code）。
-  // 空列表 = 关闭。main.cpp 解析注入 AgentMonitor 规则
+  // 空列表 = 关闭。main.cpp 解析注入 AgentMonitor 规则。
+  // 2026-10-19 现场需求：导航语料默认由点位映射表动态生成（见下方
+  // navigate_phrase_template，点位设置下发即更新，无需在此静态罗列），
+  // 本参数仅作表未下发时的静态兜底/联调手写触发用
   declare_parameter<std::vector<std::string>>("agent_monitor.navigate_phrases",
     std::vector<std::string>{});
+  // 导航语料动态生成模板（2026-10-19 现场需求）：每次点位设置
+  //（point_map）下发后，除迎宾点（welcome_point_code）外，每个点位按
+  // 本模板生成匹配语料，{point} 替换映射表 name（显示名，如「比亚迪
+  // ætəʊ 1」-> 语料「要去看比亚迪ætəʊ 1，没问题」）。语料随表走：
+  // App 改点位即生效，无需改 yaml 重启；匹配经归一化忽略空格/标点/
+  // 大小写差异。空串 = 关闭动态生成（回退 navigate_phrases 静态配置）
+  declare_parameter<std::string>(
+    "agent_monitor.navigate_phrase_template", "要去看{point}，没问题");
   // 命中任一语料 -> 停止导航（等价本地注入 navigate.stop，2026-10-17
   // 现场需求：agent 说「这就停止展厅讲解」-> 取消在途导航，无导航
   // no-op，不发协议回执）。空列表 = 关闭
@@ -306,16 +324,6 @@ void MqttGuideBridgeNode::declare_and_load_params()
   // 「点位名|语料」，点位名 = 点位映射表 name/code（如 Y）。空列表 = 关闭
   declare_parameter<std::vector<std::string>>(
     "agent_monitor.welcome_prep_phrases", std::vector<std::string>{});
-  // 导览到达默认车型讲解词（2026-10-17 现场需求）：后端下发导览指令
-  // 不带讲解词、或 agent 语料触发导航时，到达后按点位播对应车型的
-  // 默认讲解词。每条格式「点位名|讲解词」，点位名 = 点位映射表 name
-  //（如「比亚迪 M9 DM-i」）或 code（如「A」）；匹配按归一化比对
-  //（去空格+小写，现场 name 空格风格不一均能命中）。命中多条则依次
-  // 播报；点位未命中 = 到达不播报（维持旧行为）；空列表 = 功能关闭。
-  // 优先级（v0.28.0 P-042 后）：指令自带 texts > 点位映射表条目 text
-  // > 此默认词——App 推表配了播放词即覆盖本地词，未配时本地兜底
-  declare_parameter<std::vector<std::string>>(
-    "navigate_default_texts", std::vector<std::string>{});
   // 按 trace_id 回查 TTS 话术原文（运控板日志，复用 display_remote_* SSH 配置）
   declare_parameter<bool>("agent_monitor.fetch_tts_text", true);
 
@@ -450,6 +458,8 @@ void MqttGuideBridgeNode::declare_and_load_params()
     get_parameter("navigate_transform_failed_text").as_string();
   relocate_failed_text_ = get_parameter("relocate_failed_text").as_string();
   navigate_lead_text_ = get_parameter("navigate_lead_text").as_string();
+  navigate_lead_welcome_text_ =
+    get_parameter("navigate_lead_welcome_text").as_string();
   navigate_depart_text_ = get_parameter("navigate_depart_text").as_string();
   relocate_depart_text_ = get_parameter("relocate_depart_text").as_string();
   tour_speak_interval_seconds_ = std::max(1, static_cast<int>(
@@ -458,44 +468,14 @@ void MqttGuideBridgeNode::declare_and_load_params()
   point_map_missing_text_ = get_parameter("point_map_missing_text").as_string();
   point_map_unmatched_text_ =
     get_parameter("point_map_unmatched_text").as_string();
-  welcome_default_texts_ = get_parameter("welcome_default_texts").as_string_array();
+  welcome_point_code_ = get_parameter("welcome_point_code").as_string();
   welcome_lead_text_ = get_parameter("welcome_lead_text").as_string();
   welcome_prep_done_text_ = get_parameter("welcome_prep_done_text").as_string();
   // 负值按 0 处理（原行为：到达即变形）
   welcome_prep_transform_delay_seconds_ = std::max(0, static_cast<int>(
     get_parameter("welcome_prep_transform_delay_seconds").as_int()));
-  // 默认车型讲解词：「点位名|讲解词」逐条解析；格式非法（缺 | 分隔）
-  // 跳过并告警，不拖垮其余条目。
-  // ⚠️ 必须先把参数值拷进局部变量再遍历：get_parameter 按值返回临时
-  // Parameter，直接 range-for 其 .as_string_array() 会拿到指向临时
-  // 内部的悬空引用（临时在循环开始前已析构）——真机段错误教训
-  //（2026-10-17 exit code -11）
-  nav_default_texts_.clear();
-  const auto nav_default_items =
-    get_parameter("navigate_default_texts").as_string_array();
-  for (const auto & item : nav_default_items) {
-    const auto sep = item.find('|');
-    if (sep == std::string::npos || sep == 0U || sep + 1U == item.size()) {
-      RCLCPP_WARN(
-        get_logger(),
-        "navigate_default_texts 条目格式非法（应为「点位名|讲解词」），已跳过: %.60s",
-        item.c_str());
-      continue;
-    }
-    nav_default_texts_.emplace_back(
-      item.substr(0, sep), item.substr(sep + 1));
-  }
-  if (!nav_default_texts_.empty()) {
-    RCLCPP_INFO(
-      get_logger(), "导览默认讲解词已加载: %zu 条（指令未带讲解词时到达按点位播报）",
-      nav_default_texts_.size());
-  }
   welcome_flow_timeout_seconds_ = std::max(1, static_cast<int>(
     get_parameter("welcome_flow_timeout_seconds").as_int()));
-  if (welcome_default_texts_.empty()) {
-    RCLCPP_WARN(
-      get_logger(), "welcome_default_texts 为空，迎宾将使用内置兜底词");
-  }
 
   // robot_id/凭据来自 enroll 响应，构造时未知；主题在 apply_credential 后生成
   boot_id_ = generate_uuid_v7();
@@ -827,6 +807,12 @@ bool MqttGuideBridgeNode::start()
     RCLCPP_WARN(
       get_logger(), "点位映射表文件损坏，按空表启动（等 App 重推覆盖）: %s",
       point_map_file_.c_str());
+  }
+  // 表生效通知（加载成功含空表、损坏按空表均通知）：main.cpp 依此为
+  // AgentMonitor 重建动态导航语料规则——持久化表跨重启保留，启动即
+  // 生成语料，无需等 App 重推（回调未设置 no-op，联调用）
+  if (on_point_map_updated) {
+    on_point_map_updated(point_map_->points());
   }
 
   running_.store(true);
@@ -1359,10 +1345,25 @@ void MqttGuideBridgeNode::worker_loop()
             tour_->navigating() && !navigate_lead_text_.empty() &&
             !nav_welcome_prep_)  // 迎宾准备不播「请跟我来看车」引导语（Y 不是车型）
           {
-            const auto text =
-              replace_point_placeholder(navigate_lead_text_, nav_point_display_);
+            // 目标是迎宾点（2026-10-19 现场需求：App 下发 navigate 去
+            // 迎宾点，普通引导语「请跟我来…去看看迎宾点这款车」语义不通
+            //——迎宾点不是车型）：改播迎宾引导语（与 welcome_prep 语料
+            // 同款「好嘞，马上前去迎宾点」）。判定 = code 命中
+            // welcome_point_code 或显示名含「迎宾」关键词（与点位解析的
+            // 关键词机制同思路，不绑定单一 code）；未配置迎宾引导语回退
+            // 普通引导语
+            const bool to_welcome =
+              (!welcome_point_code_.empty() &&
+              tour_->current_point() == welcome_point_code_) ||
+              nav_point_display_.find("迎宾") != std::string::npos;
+            const std::string text =
+              (to_welcome && !navigate_lead_welcome_text_.empty())
+              ? navigate_lead_welcome_text_
+              : replace_point_placeholder(navigate_lead_text_, nav_point_display_);
             RCLCPP_INFO(
-              get_logger(), "导航受理成功，播引导语: %s", text.c_str());
+              get_logger(), "导航受理成功，播引导语: %s%s", text.c_str(),
+              to_welcome && !navigate_lead_welcome_text_.empty()
+              ? "（迎宾点）" : "");
             speak_hint(text, "navigate_lead");
           }
         }
@@ -1436,12 +1437,12 @@ void MqttGuideBridgeNode::worker_loop()
               }
             } else {
               // 指令未携带讲解词（MQTT 下行不带 texts / 语料触发）->
-              // 到达播报三级优先（本地策略，P-042 契约留给 Robot）：
+              // 到达播报强制映射表权威（2026-10-19 现场需求，本地默认
+              // 讲解词 navigate_default_texts 已移除）：
               //   1) 指令自带 texts（上方分支，最具体，逐次内容优先）
               //   2) 点位映射表条目 text（v0.28.0 P-042：App 推表配置的
-              //      播放词——现场在 App 改表即生效，无需改 yaml 重启）
-              //   3) 本地 navigate_default_texts 默认车型讲解词
-              //      （2026-10-17 现场需求，App 未配 text 时的兜底）
+              //      播放词——现场在 App 改表即生效）
+              //   3) 未配置 = 到达不播报（下方既有分支，释放占用）
               if (arrival->texts.empty()) {
                 if (const auto point_text =
                   point_map_->text_for_code(tour_->current_point()))
@@ -1451,14 +1452,6 @@ void MqttGuideBridgeNode::worker_loop()
                     get_logger(),
                     "导航到达: %s，未携带讲解词，播点位映射表播放词（%zu 字节）",
                     tour_->current_point().c_str(), point_text->size());
-                }
-              }
-              if (arrival->texts.empty()) {
-                arrival->texts = match_nav_default_texts(tour_->current_point());
-                if (!arrival->texts.empty()) {
-                  RCLCPP_INFO(
-                    get_logger(), "导航到达: %s，未携带讲解词，播默认讲解词（%zu 条）",
-                    tour_->current_point().c_str(), arrival->texts.size());
                 }
               }
               if (arrival->texts.empty()) {
@@ -2111,6 +2104,12 @@ void MqttGuideBridgeNode::handle_point_map(const CommandEvent & event)
         entry.text.has_value() ? "（含播放词）" : "");
     }
     send_action_result(POINT_MAP_RESULT_TYPE, event.operation_id, ACTION_RESULT_SUCCESS);
+    // 表生效通知（2026-10-19 现场需求）：main.cpp 依此为 AgentMonitor
+    // 重建动态导航语料规则（除迎宾点外每点位按模板生成，语料随表走）。
+    // 仅替换成功路径通知（落盘失败旧表保留，规则不动）
+    if (on_point_map_updated) {
+      on_point_map_updated(event.points);
+    }
     // 同步成功后的本地语音提示（现场可感知，2026-10-17 需求）：附加
     // 动作，失败只记日志——回执 success 已发，协议语义不受影响。
     // is_interrupted=false：同优先级排队不强抢进行中的业务播报
@@ -2142,14 +2141,36 @@ void MqttGuideBridgeNode::handle_point_map(const CommandEvent & event)
 }
 
 // ---------------------------------------------------------------------------
-// 迎宾模块（scene=welcome）：确定迎宾词（指令 texts 优先，缺省本地默认）
-// -> 开一轮播报。不打断导航；单轮播完自行结束
+// 迎宾模块（scene=welcome）：确定迎宾词（强制映射表权威，2026-10-19
+// 现场需求——指令 texts 优先，缺省取映射表迎宾点 [welcome_point_code]
+// 条目的 text，本地默认迎宾词已移除；两者皆空 = 不播迎宾词，引导语/
+// 变形/重定位/二维码/回执照常）-> 开一轮播报。不打断导航；单轮播完
+// 自行结束
 // ---------------------------------------------------------------------------
 void MqttGuideBridgeNode::handle_scene(const CommandEvent & event)
 {
   // 协议层已保证 scene=welcome（可扩展枚举唯一值），未知值在解析层丢弃
 
-  auto texts = make_welcome_texts(event.texts, welcome_default_texts_);
+  // 迎宾词两级：1) 指令自带 texts（v0.20.0，App 指定）；2) 映射表
+  // 迎宾点（welcome_point_code，默认 Y）条目 text。皆空 = 不播迎宾词
+  //（2026-10-19：本地默认迎宾词 welcome_default_texts 已移除，强制
+  // 以映射表下发为准）
+  std::vector<std::string> texts = event.texts;
+  if (texts.empty() && !welcome_point_code_.empty()) {
+    if (const auto map_text = point_map_->text_for_code(welcome_point_code_)) {
+      texts = {*map_text};
+      RCLCPP_INFO(
+        get_logger(), "迎宾词取自映射表迎宾点 %s（%zu 字节）",
+        welcome_point_code_.c_str(), map_text->size());
+    }
+  }
+  if (texts.empty()) {
+    RCLCPP_WARN(
+      get_logger(),
+      "迎宾无播放词：指令未带 texts 且映射表迎宾点(%s)未配置 text，"
+      "本次迎宾不播报（引导语/变形/二维码/回执不受影响）",
+      welcome_point_code_.c_str());
+  }
   // ---- 二维码阶段 1「准备」（缓存比对/下载 + 转码 + 推送，耗时大头
   // ~3.5-5s）：std::async 后台线程执行，与引导语播报/变形/重定位并行
   // 重叠，总时长 = max(引导语+变形+重定位, 准备)；worker 在上屏（阶段
@@ -2321,18 +2342,24 @@ void MqttGuideBridgeNode::handle_scene(const CommandEvent & event)
   // 自然播完）、不影响二维码常驻（180s 独立计时）。占用未释放前新业务
   // 互斥；释放后若播报仍在，新业务到达自然接管（cancel_session 终止
   // 残留播报）。
+  // 无迎宾词（指令未带 texts 且映射表迎宾点未配 text，2026-10-19）：
+  // 跳过播报会话与业务占用（PlaylistSession 空表不可播），二维码常驻
+  // 与回执不受影响——迎宾流程主体（引导语/变形/重定位）已在上方同步
+  // 完成，无需占用窗口。
   // 赋值在 start_session 之后（事务顺序：先立会话再立占用，拒绝窗口即刻生效）
   //(2026-10-16 真机排查：迎宾变形后唤醒失效根因 = FormState=2 时运控
   //   agent 唤醒引擎切 line4 半平面阵列且该配置拾音无效；已在运控板
   //   cfg/t1/iflytek_engine_config.json 改 mic_type_half_plane=circle4
   //   修复，与本工程播报/静音/抑制链路无关）
-  start_session(
-    std::move(texts), TTS_MODE_SEQUENCE, tour_speak_interval_seconds_,
-    /*loop_forever=*/false, "迎宾:" + event.operation_id,
-    /*mute_mic=*/true);  // 迎宾讲解：长内容，静音防打断
-  business_ = Business::kWelcome;
-  business_busy_until_ = std::chrono::steady_clock::now() +
-    std::chrono::seconds(welcome_flow_timeout_seconds_);
+  if (!texts.empty()) {
+    start_session(
+      std::move(texts), TTS_MODE_SEQUENCE, tour_speak_interval_seconds_,
+      /*loop_forever=*/false, "迎宾:" + event.operation_id,
+      /*mute_mic=*/true);  // 迎宾讲解：长内容，静音防打断
+    business_ = Business::kWelcome;
+    business_busy_until_ = std::chrono::steady_clock::now() +
+      std::chrono::seconds(welcome_flow_timeout_seconds_);
+  }
 
   // v0.24.0（P-038）：迎宾流程主体完成（变形已结束 + 二维码已上屏 + 播报
   // 会话已立）——回 scene.result(success)。texts 播报与二维码显示属本地
@@ -2469,55 +2496,6 @@ std::string MqttGuideBridgeNode::point_display_name(
     }
   }
   return fallback;
-}
-
-namespace
-{
-// 点位名归一化（去全部空白 + 转小写）：现场映射表 name 的空格风格
-// 不一（「比亚迪 M9 DM-i」vs「比亚迪M9 DM-i」），归一化后均可命中
-std::string normalize_point_key(const std::string & s)
-{
-  std::string out;
-  out.reserve(s.size());
-  for (const char c : s) {
-    if (std::isspace(static_cast<unsigned char>(c))) {
-      continue;
-    }
-    out.push_back(
-      static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-  }
-  return out;
-}
-}  // namespace
-
-// ---------------------------------------------------------------------------
-// 导览到达默认讲解词匹配（worker 线程）：指令未携带 texts（MQTT 下行
-// 不带讲解词 / 语料触发）时按当前航点兜底。key 两条：航点 code（如 A）
-// 与映射表反查的 name（如「比亚迪 M9 DM-i」），配置点位名归一化后与
-// 任一相同即命中；命中多条按配置顺序全部返回（到达后依次播报）
-// ---------------------------------------------------------------------------
-std::vector<std::string> MqttGuideBridgeNode::match_nav_default_texts(
-  const std::string & waypoint) const
-{
-  std::vector<std::string> texts;
-  if (nav_default_texts_.empty()) {
-    return texts;
-  }
-  const auto code_key = normalize_point_key(waypoint);
-  std::string name_key;
-  for (const auto & entry : point_map_->points()) {
-    if (entry.code == waypoint) {
-      name_key = normalize_point_key(entry.name);
-      break;
-    }
-  }
-  for (const auto & [point, text] : nav_default_texts_) {
-    const auto key = normalize_point_key(point);
-    if (key == code_key || (!name_key.empty() && key == name_key)) {
-      texts.push_back(text);
-    }
-  }
-  return texts;
 }
 
 // ---------------------------------------------------------------------------
@@ -2674,13 +2652,22 @@ void MqttGuideBridgeNode::handle_welcome_prep(const CommandEvent & event)
     speak_hint(point_map_missing_text_, "point_map_missing");
     return;
   }
-  // 点位解析（映射表唯一权威，与 handle_navigate 同口径）：未命中直接
-  // 拒绝——播报提示 + 不启动导航不占业务（语料触发不发协议回执）
+  // 点位解析（映射表唯一权威，与 handle_navigate 同口径）：先精确两级
+  // 解析（code 优先、name 兜底），未命中再按名称关键词子串匹配
+  //（2026-10-19 现场需求：语料点位部分写「迎宾」两字不绑定 code——
+  // 查 name 含关键词的条目取其 code，App 换迎宾点 code 改表即生效，
+  // 无需改 yaml 重启；写 code 如 Y 仍兼容，精确解析优先）。仍未命中
+  // 直接拒绝——播报提示 + 不启动导航不占业务（语料触发不发协议回执）
   std::string waypoint;
   if (const auto code = point_map_->resolve(event.point_name)) {
     waypoint = *code;
     RCLCPP_INFO(
       get_logger(), "迎宾准备点位解析: 「%s」-> 航点 %s（映射表命中）",
+      event.point_name.c_str(), waypoint.c_str());
+  } else if (const auto code = point_map_->resolve_by_name_keyword(event.point_name)) {
+    waypoint = *code;
+    RCLCPP_INFO(
+      get_logger(), "迎宾准备点位解析: 「%s」-> 航点 %s（名称关键词命中）",
       event.point_name.c_str(), waypoint.c_str());
   } else {
     RCLCPP_WARN(

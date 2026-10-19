@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -40,7 +41,6 @@
 #include "guide_pulse/tour.hpp"
 #include "guide_pulse/tts_client.hpp"
 #include "guide_pulse/waypoint_nav_executor.hpp"
-#include "guide_pulse/welcome.hpp"
 
 namespace guide_pulse
 {
@@ -66,6 +66,13 @@ public:
   // 时长；BEST_EFFORT 丢事件时按原估算时序兜底），并即刻释放播报类
   // 业务占用（互斥窗口降级为兜底超时）
   void notify_tts_terminal(const std::string & trace_id);
+
+  // 点位映射表生效通知（2026-10-19 现场需求：导航语料随点位设置动态
+  // 生成）。main.cpp 注入；两条路径回调（参数为当前生效的整表，空表
+  // = 规则应清空）：1) App 推表 handle_point_map 替换成功后（worker
+  // 线程）；2) start() 启动加载持久化表后（主线程，加载成功与损坏按
+  // 空表均通知——规则状态与表保持一致）。未设置 = no-op
+  std::function<void(const std::vector<PointMapEntry> &)> on_point_map_updated;
 
 private:
   // ---- mqtt::callback ----
@@ -189,10 +196,6 @@ private:
   // 仅防御）。navigate 引导语 {point} 替换与 P-040 语音触发上报共用
   std::string point_display_name(
     const std::string & waypoint, const std::string & fallback) const;
-  // 导览到达默认讲解词匹配（worker 线程）：指令未携带 texts 时按当前
-  // 航点兜底——配置「点位名|讲解词」的点位名与航点 code、映射表反查的
-  // name 归一化（去空格+小写）比对，返回命中点位的全部讲解词
-  std::vector<std::string> match_nav_default_texts(const std::string & waypoint) const;
   bool publish_json(
     const std::string & topic, const std::string & payload, int qos, bool retained);
   bool seen_recently(const std::string & key);  // operation_id/event 幂等去重
@@ -286,7 +289,10 @@ private:
     // 正常路径播报终态回流即刻释放（提前于该截止）；导览在途期不设
     // 窗口（以 tour_->navigating() 为准）
   // ---- 展厅讲解增量参数 ----
-  std::vector<std::string> welcome_default_texts_;  // scene 未带 texts 时的迎宾词
+  // 迎宾点 code（2026-10-19 现场需求：迎宾词强制以映射表下发为准——
+  // scene 未带 texts 时取映射表该 code 条目的 text 作迎宾词；表未配
+  // text 则本次迎宾不播词。空串 = 禁用映射表迎宾词）
+  std::string welcome_point_code_;
   // 迎宾引导语（2026-10-17 现场需求：scene=welcome 到达后先播引导语
   //「元气满满，小T来迎接我的顾客了」，播完再变形，变形完成播迎宾词）。
   // 空 = 禁用（跳过引导语直接变形，回退原时序）
@@ -315,6 +321,12 @@ private:
   // 导览受理成功后的引导语（2026-10-17 现场需求：确认 [导航] 收到应答
   // accepted=true 后播「请跟我来…」；{point} 替换点位显示名。空=禁用）
   std::string navigate_lead_text_;
+  // 导航目标为迎宾点时的引导语（2026-10-19 现场需求：App 下发 navigate
+  // 去迎宾点 Y，普通引导语「请跟我来…去看看迎宾点这款车」语义不通——
+  // 迎宾点不是车型）：改播这句（与 welcome_prep 触发语料同款）。判定：
+  // code 命中 welcome_point_code 或点位显示名含「迎宾」关键词。空 =
+  // 回退普通引导语 navigate_lead_text
+  std::string navigate_lead_welcome_text_;
   // 导航出发播报语（2026-10-18 现场需求）：收到导航指令（语音/MQTT）
   // 受理后先播「稍等，马上出发」再起身变形人形（先开口、立刻动）；
   // 迎宾准备去迎宾点的导航不播（agent 已说过「好嘞，马上前去迎宾点」，
@@ -332,11 +344,11 @@ private:
   // 占位替换原始 point_name；2026-10-17 现场需求：映射表是唯一权威，
   // 未命中直接拒绝，不透传航点名）
   std::string point_map_unmatched_text_;
-  // 导览到达默认讲解词（navigate_default_texts 参数解析后的
-  // 「点位名 -> 讲解词」表）：指令未携带 texts（MQTT 下行缺省 / 语料
-  // 触发）时到达后按点位兜底播报；空表 = 关闭（到达不播报）
-  std::vector<std::pair<std::string, std::string>> nav_default_texts_;
   std::unique_ptr<PointMapStore> point_map_;  // 表本体（仅 worker 线程访问，免锁）
+                                         // 到达讲解词唯一来源 = 表内 text
+                                         //（2026-10-19 现场需求：本地
+                                         //  navigate_default_texts 已移除，
+                                         //  强制映射表权威）
   // ---- 迎宾准备（2026-10-18 现场需求）----
   // 迎宾准备就位播报语：语料触发导航去迎宾点，到达变四足（摄像头收平）
   // 后最后播报（如「元气满满，做好准备迎接顾客」）。空串 = 禁用

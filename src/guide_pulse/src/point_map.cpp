@@ -194,6 +194,26 @@ std::optional<std::string> PointMapStore::resolve(const std::string & point_name
   return std::nullopt;
 }
 
+std::optional<std::string> PointMapStore::resolve_by_name_keyword(
+  const std::string & keyword) const
+{
+  // name 子串匹配（2026-10-19 现场需求）：首个 name 含关键词的条目命中
+  //（取先到者，与 App 展示顺序一致）。空关键词不匹配（防空串全命中）。
+  // 典型用法：welcome_prep 语料点位部分写「迎宾」，映射表 name 如
+  // 「迎宾点」-> code Y——App 换迎宾点 code 改表即生效，无需改 yaml
+  if (keyword.empty()) {
+    return std::nullopt;
+  }
+  const auto hit = std::find_if(
+    points_.begin(), points_.end(),
+    [&keyword](const PointMapEntry & entry) {
+      return entry.name.find(keyword) != std::string::npos;});
+  if (hit != points_.end()) {
+    return hit->code;
+  }
+  return std::nullopt;
+}
+
 std::optional<std::string> PointMapStore::text_for_code(const std::string & code) const
 {
   const auto hit = std::find_if(

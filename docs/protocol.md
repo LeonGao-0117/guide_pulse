@@ -63,7 +63,10 @@ payload 仅 `operation_id`。本工程行为：最高权重抢占掐断语音 + 
 ```
 
 - `scene` 必填，当前唯一合法值 `welcome`（可扩展枚举）；未知值记日志忽略。
-- `texts` 可选（1..20 条，每条 1..2048）；缺省用 `welcome_default_texts`。
+- `texts` 可选（1..20 条，每条 1..2048）；缺省取映射表迎宾点
+  （`welcome_point_code`，默认 `Y`）条目的 `text`——2026-10-19 现场需求：
+  迎宾词与讲解词一样**强制以映射表下发为准**（本地 `welcome_default_texts`
+  已移除）；表未配则本次迎宾不播词（引导语/变形/二维码/回执照常）。
 - `qr_sha256` 可选（v0.22.0 P-036，64 位小写十六进制）：Server 下发时该
   机器人当前迎宾二维码图片的**内容哈希快照**（App 经 HTTP 按需上传/替换/
   清除，不随迎宾触发重传）。机器人侧与本地单文件缓存比对（QrCodeCache，
@@ -125,10 +128,12 @@ payload 仅 `operation_id`（与 `tts.stop` 同构）。契约：停止当前正
   （P-042）1..2048 个 Unicode 标量（规则同 `tts.texts` 单条）为该点位
   播放词——缺省 = 该点位无播放词，省略与空串不等价（空串按
   `invalid_request` 拒）。
-- **播放词本地策略**（P-042 契约留给 Robot）：navigate **到达**且指令
-  未携带 `texts` 时播放该点位 `text`；优先级 = 指令自带 `texts` >
-  点位表 `text` > 本地 `navigate_default_texts` 默认讲解词（App 未配
-  `text` 时的兜底）；迎宾准备（Y 点）不播。
+- **播放词本地策略**（P-042 契约留给 Robot；2026-10-19 现场需求：
+  **强制映射表权威**，本地 `navigate_default_texts` 已移除）：navigate
+  **到达**且指令未携带 `texts` 时播放该点位 `text`；优先级 = 指令自带
+  `texts` > 点位表 `text`；表未配 `text` = 到达不播报。迎宾（scene
+  welcome）同理：指令 `texts` > 映射表迎宾点（`welcome_point_code`，
+  默认 `Y`）`text`，未配不播迎宾词；迎宾准备（Y 点）不播。
 - **语义是全量替换**：每次下发都用 `points` 整表覆盖旧表（不做增量
   合并）。本工程落盘到 `point_map_file`（临时文件 + rename 原子写；
   部署 yaml 指定持久化分区路径 `/robot/persist/var/guide_pulse/

@@ -145,12 +145,11 @@ if(BUILD_TESTING)
   ament_target_dependencies(tts_client_test rclcpp aimdk_msgs)
   target_link_libraries(tts_client_test guide_pulse_protocol Threads::Threads)
 
-  # 3. 展厅讲解增量模块单测（纯 C++：播报状态机/迎宾/讲解状态机）
+  # 3. 展厅讲解增量模块单测（纯 C++：播报状态机/讲解状态机）
+  #（welcome_test 已随 welcome_default_texts 移除而删除：2026-10-19
+  #  迎宾词强制映射表权威，make_welcome_texts 兜底链不复存在）
   ament_add_gtest(playlist_test test/test_playlist.cpp)
   target_link_libraries(playlist_test guide_pulse_protocol Threads::Threads)
-
-  ament_add_gtest(welcome_test test/test_welcome.cpp)
-  target_link_libraries(welcome_test guide_pulse_protocol)
 
   # 3c. 迎宾变形纯函数单测：动作转移路径表/趴姿集合/reason 人话映射的
   #     不变式（路径逐条抄自 SDK _ACTION_RULES，抄错一格 = 机器人做出

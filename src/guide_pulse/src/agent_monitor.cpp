@@ -90,6 +90,17 @@ std::string normalize_phrase_text(const std::string & text)
       (cp >= 0xF900 && cp <= 0xFAFF))
     {
       append_utf8(out, cp);
+    } else if (cp >= 0x00C0 && cp <= 0x02FF && cp != 0x00D7 && cp != 0x00F7) {
+      // 拉丁扩展/IPA 字母（À..ɏ，2026-10-19 现场需求：点位名含车型
+      // 音标如「比亚迪ætəʊ 1」——æ/ə/ʊ 在此区间；丢弃会使语料缺字符
+      // 被截短，过短易误命中其他「比亚迪..N」话术，必须保留参与匹配；
+      // ×(00D7)/÷(00F7) 是符号非字母，仍丢弃）。拉丁扩展-1 大写
+      //（00C0..00DE）+0x20 转小写，与 ASCII 同口径；0x0100 起的
+      // 大小写映射复杂不做（音标车型名实际全小写）
+      if (cp >= 0x00C0 && cp <= 0x00DE) {
+        cp += 0x20;
+      }
+      append_utf8(out, cp);
     }
   }
   return out;
@@ -260,61 +271,82 @@ void AgentMonitor::on_asr_msg(const AsrResult::SharedPtr msg)
 // ---------------------------------------------------------------------------
 // agent TTS 话术的语料匹配（工作线程串行执行，成员免锁）
 // ---------------------------------------------------------------------------
+void AgentMonitor::set_navigate_rules(std::vector<PhraseRule> rules)
+{
+  RCLCPP_INFO(
+    node_->get_logger(), "导航语料规则更新: %zu 条（随点位映射表生成）",
+    rules.size());
+  emit([this, rules = std::move(rules)]() mutable {
+      navigate_rules_ = std::move(rules);  // 工作线程串行替换，与匹配免锁
+    });
+}
+
 bool AgentMonitor::match_phrases(const std::string & text, const std::string & trace_id)
 {
   const auto now = std::chrono::steady_clock::now();
-  for (const auto & rule : config_.rules) {
-    bool hit = false;
-    for (const auto & phrase : rule.phrases) {
-      if (phrase_matches(text, phrase)) {
-        hit = true;
-        break;
+  // 单组规则表的匹配尝试：命中即按规则收尾（冷却/延迟/触发），返回
+  // true = 该话术已被消化（调用方据此跳过 on_tts_text 打印）
+  const auto try_rules = [&](const std::vector<PhraseRule> & rules) {
+      for (const auto & rule : rules) {
+        bool hit = false;
+        for (const auto & phrase : rule.phrases) {
+          if (phrase_matches(text, phrase)) {
+            hit = true;
+            break;
+          }
+        }
+        if (!hit) {
+          continue;
+        }
+        // 冷却键 = action+point：relocate 的 A~E 五点互不挤占（各点话术不同，
+        // 不存在互相复读；冷却只为防同一点被 agent 复读重复触发）
+        auto & until = cooldown_until_[rule.action + "@" + rule.point];
+        if (now < until) {
+          RCLCPP_DEBUG(
+            node_->get_logger(), "语料命中但冷却中(%lds): action=%s",
+            std::chrono::duration_cast<std::chrono::seconds>(until - now).count(),
+            rule.action.c_str());
+          return true;  // 一条话术至多触发第一个命中的规则（已被消化）
+        }
+        until = now + std::chrono::seconds(config_.cooldown_seconds);
+        RCLCPP_INFO(
+          node_->get_logger(), "语料命中: action=%s point=%s agent话术「%s」",
+          rule.action.c_str(), rule.point.c_str(), text.c_str());
+        // navigate/relocate/welcome_prep 延迟触发（2026-10-17 现场需求；
+        // welcome_prep 2026-10-18 迎宾准备）：命中时 agent
+        // 正在说这句话（「请稍等」/「开始重定位」/「马上去迎宾点」），立即执行体验差——navigate 边说边动身、relocate 话音未落就发「重定位成功」自产播报
+        // 与 agent 话音相撞——挂起等该 trace 的 TTS 终态再触发。该 trace
+        // 已结束（话术回查慢于终态的乱序，如本地链路 BEGIN 触发的回查落空
+        // 重试）则立即触发不等待。15s 为 TtsStatus 丢失的兜底上限（话术
+        // ~20 字 ≈ 5s 播完，宽裕；到期由 check_deferred_deadline 强制触发）
+        if ((rule.action == "navigate" || rule.action == "relocate" ||
+            rule.action == "welcome_prep") && !trace_id.empty() &&
+          finished_traces_.count(trace_id) == 0)
+        {
+          deferred_ = DeferredPhrase{
+            rule.action, rule.point, text, trace_id,
+            now + std::chrono::seconds(15)};
+          RCLCPP_INFO(
+            node_->get_logger(),
+            "语料挂起等播报结束: action=%s point=%s trace=%s（说完再触发，15s 兜底）",
+            rule.action.c_str(), rule.point.c_str(), trace_id.c_str());
+          return true;
+        }
+        auto cb = on_phrase;
+        emit([cb, action = rule.action, point = rule.point, text] {
+          if (cb) {cb(action, point, text);}
+        });
+        return true;  // 一条话术至多触发第一个命中的规则
       }
-    }
-    if (!hit) {
-      continue;
-    }
-    // 冷却键 = action+point：relocate 的 A~E 五点互不挤占（各点话术不同，
-    // 不存在互相复读；冷却只为防同一点被 agent 复读重复触发）
-    auto & until = cooldown_until_[rule.action + "@" + rule.point];
-    if (now < until) {
-      RCLCPP_DEBUG(
-        node_->get_logger(), "语料命中但冷却中(%lds): action=%s",
-        std::chrono::duration_cast<std::chrono::seconds>(until - now).count(),
-        rule.action.c_str());
-      return true;  // 一条话术至多触发第一个命中的规则（已被消化）
-    }
-    until = now + std::chrono::seconds(config_.cooldown_seconds);
-    RCLCPP_INFO(
-      node_->get_logger(), "语料命中: action=%s point=%s agent话术「%s」",
-      rule.action.c_str(), rule.point.c_str(), text.c_str());
-    // navigate/relocate/welcome_prep 延迟触发（2026-10-17 现场需求；
-    // welcome_prep 2026-10-18 迎宾准备）：命中时 agent
-    // 正在说这句话（「请稍等」/「开始重定位」/「马上去迎宾点」），立即执行体验差——navigate 边说边动身、relocate 话音未落就发「重定位成功」自产播报
-    // 与 agent 话音相撞——挂起等该 trace 的 TTS 终态再触发。该 trace
-    // 已结束（话术回查慢于终态的乱序，如本地链路 BEGIN 触发的回查落空
-    // 重试）则立即触发不等待。15s 为 TtsStatus 丢失的兜底上限（话术
-    // ~20 字 ≈ 5s 播完，宽裕；到期由 check_deferred_deadline 强制触发）
-    if ((rule.action == "navigate" || rule.action == "relocate" ||
-         rule.action == "welcome_prep") && !trace_id.empty() &&
-      finished_traces_.count(trace_id) == 0)
-    {
-      deferred_ = DeferredPhrase{
-        rule.action, rule.point, text, trace_id,
-        now + std::chrono::seconds(15)};
-      RCLCPP_INFO(
-        node_->get_logger(),
-        "语料挂起等播报结束: action=%s point=%s trace=%s（说完再触发，15s 兜底）",
-        rule.action.c_str(), rule.point.c_str(), trace_id.c_str());
-      return true;
-    }
-    auto cb = on_phrase;
-    emit([cb, action = rule.action, point = rule.point, text] {
-      if (cb) {cb(action, point, text);}
-    });
-    return true;  // 一条话术至多触发第一个命中的规则
+      return false;  // 本组规则未命中
+    };
+  // 先静态规则（yaml：welcome/qr/relocate/静态 navigate/...），再动态
+  // 导航规则（点位映射表生成，表未下发时为空）；互不重叠（表下发后
+  // 动态条目按表生成，与表同步）
+  if (try_rules(config_.rules)) {
+    return true;
   }
-  return false;  // 未命中任何规则
+  return try_rules(navigate_rules_);
 }
 
 // ---------------------------------------------------------------------------

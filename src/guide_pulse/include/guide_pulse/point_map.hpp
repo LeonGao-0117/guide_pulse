@@ -51,6 +51,12 @@ public:
   // nullopt，调用方自行兜底
   std::optional<std::string> resolve(const std::string & point_name) const;
 
+  // 名称关键词 -> code 子串匹配（2026-10-19 现场需求：welcome_prep 语料
+  // 的点位部分写名称关键词如「迎宾」，不绑定 code——在 name 中找含
+  // 关键词的首个条目取其 code，App 换迎宾点 code 改表即生效）；空
+  // 关键词/未命中返回 nullopt（与 resolve 独立，不影响精确解析语义）
+  std::optional<std::string> resolve_by_name_keyword(const std::string & keyword) const;
+
   // code -> 该点位播放文本（v0.28.0 P-042）：条目未配置 text 或 code
   // 未命中返回 nullopt。供 navigate 到达播报（指令未带 texts 时的
   // 优先级来源，见 mqtt_guide_bridge_node 到达分支）

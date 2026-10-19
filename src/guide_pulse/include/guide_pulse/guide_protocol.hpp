@@ -36,9 +36,10 @@ struct PointMapEntry
   // 该点位播放文本（v0.28.0 P-042 可选）：1..2048 个 Unicode 标量
   //（规则同 tts.texts 单条）；缺省 = 该点位无播放文本。何时播放（本工程
   // 策略：navigate 到达且指令未带 texts 时）、与 navigate/relocate/scene
-  // 自带 texts 及本地 navigate_default_texts 的优先级归 Robot 本地策略
-  //（见 mqtt_guide_bridge_node 到达播报分支）。注意「省略」与「空串」
-  // 不等价：非空校验在解析层（minLength 1），此处只存合法值
+  // 自带 texts 的优先级归 Robot 本地策略（见 mqtt_guide_bridge_node
+  // 到达播报分支；2026-10-19 起本地默认词已移除，映射表是唯一来源）。
+  // 注意「省略」与「空串」不等价：非空校验在解析层（minLength 1），
+  // 此处只存合法值
   std::optional<std::string> text;
 };
 

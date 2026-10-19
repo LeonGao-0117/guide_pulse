@@ -144,7 +144,9 @@
    均已弃用），动作与语音并行、
    `interrupt=true` 打断上一个伴随动作；worker 同步短超时调用（正常
    毫秒级），失败仅 WARN 不重试不阻断播报。独立于迎宾变形开关；
-2. 确定迎宾词：指令 `texts` 优先，缺省用参数 `welcome_default_texts`；
+2. 确定迎宾词：指令 `texts` 优先，缺省取映射表迎宾点（`welcome_point_code`，
+   默认 `Y`）条目的 `text`——2026-10-19 现场需求：迎宾词强制以映射表
+   下发为准（`welcome_default_texts` 已移除），未配则本次不播迎宾词；
 3. 迎宾二维码（v0.22.0 P-036，`qr_sha256` 哈希快照驱动）：
    `QrCodeCache` 与本地单文件缓存比对——命中直接取缓存图片（免下载），
    未命中经 Server 文件面（HTTP Basic = 自身 MQTT 凭据）下载一次，
@@ -365,7 +367,7 @@ class NavExecutor {
 | --- | --- | --- |
 | `topic_prefix` | `robotCar/v1/robots` | RobotCar Server 固定 TopicPrefix（写死在 Server 代码，非部署配置） |
 | `broker_uri` / `enroll_origin` / `serial_number(_file)` | 同 tts_demo | enroll 凭 SN 换 MQTT 凭据 |
-| `welcome_default_texts` | `["欢迎光临！我是展厅讲解机器人，很高兴为您服务。"]` | scene 未带 texts 时的迎宾词 |
+| `welcome_point_code` | `"Y"` | 迎宾点 code：scene 未带 texts 时取映射表该条目 text 作迎宾词（2026-10-19 强制映射表权威，`welcome_default_texts` 已移除；空=禁用，未配不播词） |
 | `agent_monitor.relocate_phrases` | `[]` | 语料触发重定位：每条「航点名\|语料」，命中 -> 该航点 set_pose 重定位（空=关闭） |
 | `relocate_timeout_seconds` | `30` | 重定位等待导航模块验收的超时（set_pose goal 的 result（验收完才回，正常 ~1.5s），此值兜底 result 丢失/服务卡死；超时按 failed/localization_failed 收尾） |
 | `busy_hint_relocate_text` | `"我正在重定位，请稍后"` | 业务互斥拒绝提示（重定位等待期播；空=禁用） |
@@ -390,7 +392,6 @@ class NavExecutor {
 | 二维码缓存（纯 C++） | `test_qr_code_cache.cpp` | sha256 已知向量、PNG/JPEG 魔数、qr_sha256 格式、缓存写入/哈希拒绝/旧文件淘汰 |
 | TtsClient（进程内 Mock 服务） | `test_tts_client.cpp` | 沿用 tts_demo（字段映射/回执判定/超时） |
 | 播报状态机（纯 C++） | `test_playlist.cpp` | sequence/shuffle、单轮结束、无界循环、失败重试推进 |
-| 迎宾模块（纯 C++） | `test_welcome.cpp` | texts 优先/默认词回退、未知 scene 值忽略 |
 | 讲解模块（纯 C++，FakeNav） | `test_tour.cpp` | start/到达开播/失败不开播/替换/取消 |
 | 端到端集成 | `tools/run_integration_test.sh` | enroll Mock + mosquitto + 桥接 + Mock TTS + Mock 运控（SetMcAction/GetMcAction 状态机，迎宾变形走完整转移序列断言）+ 后端模拟器发 scene/navigate/tts/tts.stop，断言日志与回执 |
 

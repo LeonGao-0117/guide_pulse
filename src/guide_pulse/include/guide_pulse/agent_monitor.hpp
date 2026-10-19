@@ -63,9 +63,10 @@
 namespace guide_pulse
 {
 
-// 语料归一化：去空白与中英文标点（含全角），ASCII 字母转小写，保留
-// 文字与数字（CJK 表意文字/扩展）。ASR 的标点与分词不稳定，语料匹配
-// 前两侧都过本函数，配置语料无需关心标点写法
+// 语料归一化：去空白与中英文标点（含全角），ASCII 字母与拉丁扩展/
+// IPA 字母（如车型名音标 ætəʊ）转小写保留，数字保留（CJK 表意文字/
+// 扩展）。ASR 的标点与分词不稳定，语料匹配前两侧都过本函数，配置语料
+// 无需关心标点/空格写法
 std::string normalize_phrase_text(const std::string & text);
 
 // 语料匹配：归一化后的识别文本包含归一化后的语料即命中（用户在语料
@@ -129,6 +130,14 @@ public:
   AgentMonitor(rclcpp::Node::SharedPtr node, const Config & config);
   ~AgentMonitor();
 
+  // 动态更新导航语料规则（2026-10-19 现场需求：点位设置下发后，除
+  // 迎宾点外每个点位按映射表 name + 模板生成匹配语料——语料随表走，
+  // 改表即生效，无需改 yaml 重启）。整表替换 navigate 动态规则
+  //（空表 = 清空动态规则，回退 config_.rules 里的静态 navigate 条目）。
+  // 线程安全：经 emit 队列投递到工作线程串行执行，与 match_phrases
+  //（同在工作线程）天然互斥免锁
+  void set_navigate_rules(std::vector<PhraseRule> rules);
+
 private:
   // 回调投递到工作线程（队列上限 64，防积压）
   void emit(std::function<void()> task);
@@ -157,7 +166,12 @@ private:
   void check_deferred_deadline();
 
   rclcpp::Node::SharedPtr node_;  // 所属节点（订阅与日志）
-  Config config_;                 // 语料规则（构造后不变）
+  Config config_;                 // 语料规则（构造后不变；navigate 动态
+                                   // 规则另存 navigate_rules_）
+  // 动态生成的导航语料规则（点位映射表下发/加载后由 set_navigate_rules
+  // 更新，main.cpp 按模板生成）。仅工作线程访问（set 经 emit 队列投递、
+  // match_phrases 工作线程读），免锁
+  std::vector<PhraseRule> navigate_rules_;
 
   std::atomic<std::uint32_t> last_main_{0};  // AgentConversationMainState::IDLE
   std::atomic<bool> speaking_{false};

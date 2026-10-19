@@ -143,7 +143,10 @@ int main(int argc, char ** argv)
   // 格式「点位名|语料」，点位名 = 点位映射表 name/code（App 推表下发，
   // 如「腾势 B5」）；注入 type=navigate 后由 handle_navigate 经映射表
   // 两级解析（code 优先、name 兜底）取 code 发起导航，未命中即拒绝并
-  // 播报提示。非法条目（缺 | 或点位名空）跳过并告警，不挡其余条目
+  // 播报提示。非法条目（缺 | 或点位名空）跳过并告警，不挡其余条目。
+  // 2026-10-19 现场需求：导航语料默认由点位映射表动态生成（下方
+  // on_point_map_updated，点位设置下发即更新），本静态表仅作表未下发
+  // 时的兜底/联调手写触发用
   const auto navigate_phrases =
     node->get_parameter("agent_monitor.navigate_phrases").as_string_array();
   for (const auto & item : navigate_phrases) {
@@ -168,7 +171,9 @@ int main(int argc, char ** argv)
   // 迎宾准备语料（2026-10-18 现场需求：agent 说「好嘞，马上前去迎宾点
   // 需要先导航去Y点」类话术 -> 等 agent 说完 -> 先确保人形再导航去
   // point 迎宾点，到达变四足收摄像头、播就位语）：每条格式「点位名|
-  // 语料」，点位名 = 点位映射表 name/code（如 Y）。非法条目跳过并告警
+  // 语料」，点位名支持两种写法（2026-10-19 现场需求）——名称关键词
+  //（如「迎宾」，经映射表 name 子串匹配取 code，App 换 code 改表即
+  // 生效）或直接写 code（如 Y，精确解析优先）。非法条目跳过并告警
   const auto welcome_prep_phrases =
     node->get_parameter("agent_monitor.welcome_prep_phrases").as_string_array();
   for (const auto & item : welcome_prep_phrases) {
@@ -196,6 +201,44 @@ int main(int argc, char ** argv)
   // 独立子节点——launch 的 __node remap 会把同进程手动创建的节点改名
   // 成同名，触发 rosout 同名冲突 WARN）
   auto agent_monitor = std::make_shared<guide_pulse::AgentMonitor>(node, monitor_cfg);
+  // 导航语料动态生成（2026-10-19 现场需求）：点位设置（point_map）下发
+  // 或启动加载持久化表后，除迎宾点外每个点位按模板生成匹配语料——
+  // 语料随表走，App 改点位即生效，无需改 yaml 重启。模板 {point} 替换
+  // 映射表 name（显示名，如「比亚迪ætəʊ 1」->「要去看比亚迪ætəʊ 1，
+  // 没问题」）；point 用 code（handle_navigate 两级解析一级命中）。
+  // 匹配经 normalize_phrase_text 归一化：空格/中英文标点/大小写差异
+  // 自然消解。空模板 = 关闭动态生成（回退 yaml 静态 navigate_phrases）
+  {
+    const auto navigate_phrase_template = node->get_parameter(
+      "agent_monitor.navigate_phrase_template").as_string();
+    const auto welcome_point_code =
+      node->get_parameter("welcome_point_code").as_string();
+    if (!navigate_phrase_template.empty()) {
+      if (navigate_phrase_template.find("{point}") == std::string::npos) {
+        RCLCPP_WARN(
+          node->get_logger(),
+          "agent_monitor.navigate_phrase_template 缺少 {point} 占位符，"
+          "动态导航语料生成关闭（回退静态 navigate_phrases）: 「%s」",
+          navigate_phrase_template.c_str());
+      } else {
+        node->on_point_map_updated =
+          [agent_monitor, navigate_phrase_template, welcome_point_code](
+          const std::vector<guide_pulse::PointMapEntry> & points) {
+            std::vector<guide_pulse::AgentMonitor::PhraseRule> rules;
+            for (const auto & entry : points) {
+              if (!welcome_point_code.empty() && entry.code == welcome_point_code) {
+                continue;  // 迎宾点排除：去迎宾点由 welcome_prep 语料触发
+              }
+              std::string phrase = navigate_phrase_template;
+              phrase.replace(
+                phrase.find("{point}"), 7U, entry.name);
+              rules.push_back({"navigate", entry.code, {std::move(phrase)}});
+            }
+            agent_monitor->set_navigate_rules(std::move(rules));
+          };
+      }
+    }
+  }
   // TTS 话术原文（BEGIN 后异步回查运控板日志，TtsStatus.text 恒空）
   agent_monitor->on_tts_text = [n = node->get_logger()](
     const std::string &, const std::string & text) {

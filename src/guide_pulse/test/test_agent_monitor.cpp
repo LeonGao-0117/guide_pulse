@@ -95,6 +95,34 @@ TEST(PhraseMatches, RelocatePhrase)
   EXPECT_FALSE(phrase_matches("好的，这就带您去展厅A点", phrase_a));        // 缺「开始重定位」
 }
 
+// 归一化：拉丁扩展/IPA 字母保留（2026-10-19 动态导航语料：
+// 车型名含音标如「比亚迪ætəʊ 1」，æ/ə/ʊ 属拉丁扩展区间——丢弃会使
+// 语料缺字符被截短，过短易误命中其他「比亚迪..N」话术，须完整参与
+// 匹配）；拉丁扩展-1 大写（À..Þ）+0x20 转小写，×/÷ 是符号非字母仍丢弃
+TEST(NormalizePhraseText, LatinExtendedPreserved)
+{
+  EXPECT_EQ(normalize_phrase_text("比亚迪ætəʊ 1"), "比亚迪ætəʊ1");
+  EXPECT_EQ(normalize_phrase_text("比亚迪Æ 2"), "比亚迪æ2");       // 拉丁扩展-1 大写转小写
+  EXPECT_EQ(normalize_phrase_text("2×3÷4"), "234");               // ×÷ 丢弃
+}
+
+// 匹配：动态生成的导航语料（点位映射表 name 按模板生成，2026-10-19
+// 现场需求）与 agent 话术写法差异（空格/标点/大小写）归一化后命中；
+// 车型名相近（M9 与 M9 DM-i、ætəʊ 1 与 2）互不误触
+TEST(PhraseMatches, NavigateDynamicPhrase)
+{
+  const std::string phrase = "要去看比亚迪ætəʊ 1，没问题";
+  EXPECT_TRUE(phrase_matches("要去看比亚迪ætəʊ 1，没问题。", phrase));   // 尾标点
+  EXPECT_TRUE(phrase_matches("嗯，要去看比亚迪ætəʊ 1，没问题哈", phrase));  // 前后夹语气词
+  EXPECT_TRUE(phrase_matches(                                             // 语料侧带空格/大小写差异
+    "要去看比亚迪 Ætəʊ 1，没问题", phrase));
+  EXPECT_TRUE(phrase_matches(                                             // sea lion 大小写（现场实测 agent 说小写）
+    "要去看比亚迪sea lion 7，没问题", "要去看比亚迪Sea Lion 7，没问题"));
+  EXPECT_FALSE(phrase_matches("要去看比亚迪ætəʊ 2，没问题", phrase));   // 相邻车型不误触
+  EXPECT_FALSE(phrase_matches("要去看比亚迪M9，没问题", "要去看比亚迪M9 DM-i，没问题"));
+  EXPECT_FALSE(phrase_matches("要去看比亚迪，没问题", phrase));         // 缺车型名不命中
+}
+
 // 匹配：空语料/空识别不命中
 TEST(PhraseMatches, EmptyInputs)
 {

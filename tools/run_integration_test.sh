@@ -160,7 +160,6 @@ echo -n "SIM-guide-it" > "${WORK_DIR}/sn"
   -p tts_speech_ms_per_char:=10 \
   -p suppress_tail_lead_ms:=300 \
   -p point_map_file:="${WORK_DIR}/point_map.json" \
-  -p "welcome_default_texts:=[\"${DEFAULT_WELCOME}\"]" \
   > "${WORK_DIR}/bridge.log" 2>&1 &
 BRIDGE_PID=$!
 PIDS+=("$BRIDGE_PID")
@@ -213,10 +212,17 @@ $SIM stop > /dev/null 2>&1
 
 # ---------------------------------------------------------------------------
 # 4. 用例 2：迎宾（scene=welcome）
-#    2a. 未带 texts -> 本地默认迎宾词，单轮播完不循环
+#    2a. 未带 texts -> 迎宾词强制取映射表迎宾点（welcome_point_code=Y）
+#        条目的 text（2026-10-19：本地默认迎宾词已移除），单轮播完不循环。
+#        先推含 Y 播放词的初始表（1 条；2d 起的重表不含 Y 不影响本组）
 # ---------------------------------------------------------------------------
+$SIM point-map "Y=迎宾点=${DEFAULT_WELCOME}" > /dev/null 2>&1
+wait_log "点位映射表同步: 1 条（含播放词 1 条）" "${WORK_DIR}/bridge.log" 5 \
+  || fail "初始映射表（Y 迎宾词）未被同步"
 $SIM welcome > /dev/null 2>&1
 wait_log "迎宾开始" "${WORK_DIR}/bridge.log" 5 || fail "未见迎宾开始日志"
+wait_log "迎宾词取自映射表迎宾点 Y" "${WORK_DIR}/bridge.log" 5 \
+  || fail "迎宾词未取自映射表迎宾点"
 # 迎宾引导语（2026-10-17 现场需求）：先播 TTS「元气满满，小T来迎接我
 # 的顾客了」，播完再变形，变形完成后才播迎宾词——三段顺序都要断言
 wait_log "text='元气满满，小T来迎接我的顾客了。'" "${WORK_DIR}/mock_tts.log" 5 \
@@ -239,7 +245,7 @@ FIRST_MOTION_LINE=$(grep -n "迎宾变形: 发动作" "${WORK_DIR}/bridge.log" |
 }
 wait_log "迎宾变形完成: 已切到 BIPED_LOCOMOTION_WBC" "${WORK_DIR}/bridge.log" 30 || fail "未见迎宾变形完成日志"
 wait_log "迎宾变形流程结束，开始迎宾播报" "${WORK_DIR}/bridge.log" 5 || fail "未见变形后开播日志"
-wait_log "text='${DEFAULT_WELCOME}'" "${WORK_DIR}/mock_tts.log" 10 || fail "变形完成后未播默认迎宾词"
+wait_log "text='${DEFAULT_WELCOME}'" "${WORK_DIR}/mock_tts.log" 10 || fail "变形完成后未播映射表迎宾词"
 # 顺序硬断言：bridge.log 中「变形结束」必须先于「迎宾播报会话开始」
 WAIT_LINE=$(grep -n "迎宾变形流程结束，开始迎宾播报" "${WORK_DIR}/bridge.log" | head -1 | cut -d: -f1)
 SPEAK_LINE=$(grep -n "播报会话开始: 迎宾:" "${WORK_DIR}/bridge.log" | head -1 | cut -d: -f1)
@@ -252,7 +258,7 @@ wait_log "单轮播完，会话结束" "${WORK_DIR}/bridge.log" 5 || fail "迎�
 # v0.24.0（P-038）：迎宾流程主体完成回 scene.result success
 wait_log '"outcome":"success".*"type":"scene.result"' "${WORK_DIR}/bridge.log" 5 \
   || fail "迎宾完成未回 scene.result success"
-log "用例 2a 通过：变形完成（行走态->ROTATE->WBC）后才开播，默认词一轮结束"
+log "用例 2a 通过：变形完成（行走态->ROTATE->WBC）后才开播，映射表迎宾词一轮结束"
 
 # 2b. 带 texts -> App 指定迎宾词优先；再次迎宾应再次查形态——此时已是
 # 人形（Mock 状态 BIPED_LOCOMOTION_WBC），应零动作直接确认（幂等）。
@@ -267,6 +273,10 @@ SET_COUNT=$(grep -c "收到 SetMcAction" "${WORK_DIR}/mock_mc.log" || true)
 sleep 5
 COUNT_A=$(grep -c "text='指定迎宾词甲'" "${WORK_DIR}/mock_tts.log" || true)
 [ "$COUNT_A" -eq 1 ] || fail "指定迎宾词不应循环（甲 ${COUNT_A} 次）"
+# 优先级负断言：指令带 texts 时不得再播映射表迎宾词（指令 texts >
+# 表 text；2a 播过一次 DEFAULT_WELCOME，之后不应再出现）
+WELCOME_COUNT_2B=$(grep -c "text='${DEFAULT_WELCOME}'" "${WORK_DIR}/mock_tts.log" || true)
+[ "${WELCOME_COUNT_2B}" -eq 1 ] || fail "指令 texts 应优先于映射表迎宾词（迎宾词播了 ${WELCOME_COUNT_2B} 次，期望仅 2a 的 1 次）"
 log "用例 2b 通过：迎宾 texts 优先且按序单轮（甲→乙）；已人形时零动作确认"
 
 # 2c. 动作切换中迎宾到达 -> 等稳定后再变形（复现真机 2026-10-15 故障：
