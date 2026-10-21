@@ -123,6 +123,26 @@ TEST(PhraseMatches, NavigateDynamicPhrase)
   EXPECT_FALSE(phrase_matches("要去看比亚迪，没问题", phrase));         // 缺车型名不命中
 }
 
+// 匹配：固定指令居句尾、前面带自由发挥长内容也命中（2026-10-20 现场
+// 实话术：agent 应答「安排！…看看越野模式的中控界面～要去看腾势 B5，
+// 没问题」，指令在句尾且「腾势 B5」带空格）；另覆盖当时未命中的真实
+// 原因——2 条测试表生成的「要去看腾势，没问题」缺 b5，不是该句的
+// 子串，正确不命中（防退化回归）
+TEST(PhraseMatches, NavigatePhraseAtTailWithFreeText)
+{
+  const std::string phrase = "要去看腾势B5，没问题";  // 点位表 name=腾势B5 按模板生成
+  // 2026-10-20 21:36 现场 agent 原话（指令在句尾+自由发挥前缀+空格差异）
+  EXPECT_TRUE(phrase_matches(
+    "安排！这就带您到腾势B5旁边，摸一摸NAPPA皮座椅，看看越野模式的中控界面～"
+    "要去看腾势 B5，没问题", phrase));
+  // 2 条测试表场景（当时未命中的根因）：「要去看腾势，没问题」缺 b5
+  EXPECT_FALSE(phrase_matches(
+    "安排！这就带您到腾势B5旁边，摸一摸NAPPA皮座椅，看看越野模式的中控界面～"
+    "要去看腾势 B5，没问题", "要去看腾势，没问题"));
+  // 相邻车型不误触
+  EXPECT_FALSE(phrase_matches("要去看腾势 B5，没问题", "要去看腾势B8，没问题"));
+}
+
 // 匹配：空语料/空识别不命中
 TEST(PhraseMatches, EmptyInputs)
 {

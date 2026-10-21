@@ -9,8 +9,10 @@
 guide_bridge:
   ros__parameters:
     # ---- 部署环境 ----
-    broker_uri: "tcp://124.223.200.153:12883"
-    enroll_origin: "http://124.223.200.153:8780"
+    #broker_uri: "tcp://124.223.200.153:12883"
+    #enroll_origin: "http://124.223.200.153:8780"
+    broker_uri: "tcp://43.161.197.161:12883"
+    enroll_origin: "http://43.161.197.161:8780"
     serial_number: ""                    # 留空自动获取（环境变量 > 本地文件）
     serial_number_file: "/robot/info/sn"
     display_remote_host: "10.1.1.100"    # 运控板（屏幕显示/SSH 回查共用）

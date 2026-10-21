@@ -400,6 +400,10 @@ void AgentMonitor::check_deferred_deadline()
 //     行。注意该行超长时 logger 会折行：主行带时间戳、~ 结尾，余下内容
 //     在无时间戳续行（2026-10-19 现场：M9 固定语位于长话术尾部全在续行，
 //     单行 grep 永远拿不到完整话术）——回查须 -A3 带续行拼接后提取
+//   云端 NLG 结果（2026-10-20 现场发现：ogg opus 音频直推链路 dispatching
+//     status 行 text 恒为空，上述路径全落空）：完整话术在
+//     'received the last nlg result: 话术, event_id: <event_id>' 行（行内
+//     是 event_id，非 item_id），按剥掉 item_0_ 前缀的 event_id 检索
 // ---------------------------------------------------------------------------
 namespace
 {
@@ -427,6 +431,7 @@ struct FetchLines
   std::string local_line;   // 路径1输出：形如 "text=话术 domain="
   std::string cloud_line;   // 路径2输出：纯话术文本
   std::string stream_line;  // 路径3输出：形如 "text=\"话术\" domain=\"omnissdk\""
+  std::string nlg_line;     // 路径4输出：纯话术文本（NLG 最终结果行）
 };
 
 FetchLines ssh_fetch_lines(const std::string & cmd)
@@ -444,6 +449,7 @@ FetchLines ssh_fetch_lines(const std::string & cmd)
     if (line == "=1=") {section = 1; continue;}
     if (line == "=2=") {section = 2; continue;}
     if (line == "=3=") {section = 3; continue;}
+    if (line == "=4=") {section = 4; continue;}
     if (line.empty()) {continue;}
     if (section == 1 && out.local_line.empty()) {
       out.local_line = line;
@@ -451,6 +457,8 @@ FetchLines ssh_fetch_lines(const std::string & cmd)
       out.cloud_line = line;
     } else if (section == 3 && out.stream_line.empty()) {
       out.stream_line = line;
+    } else if (section == 4 && out.nlg_line.empty()) {
+      out.nlg_line = line;
     }
   }
   pclose(p);
@@ -506,7 +514,7 @@ void AgentMonitor::fetch_tts_text(const std::string & trace_id)
   if (!safe_trace_id(trace_id) || config_.ssh_password.find('\'') != std::string::npos) {
     return;  // trace/密码含非法字符：静默跳过回查（防御，不打印）
   }
-  // 一次 SSH 同时跑三条路径（省第二次连接 1~2s）。远程命令直白书写后
+  // 一次 SSH 同时跑四条路径（省第二次连接 1~2s）。远程命令直白书写后
   // base64 编码、单引号传递解码执行——两侧 shell 均零转义。
   // 各条 grep 打当前档+最新滚动档（$F，ls -t 取前二；2026-10-19 现场
   // 亲历 agent.log 100MB 滚动把几分钟前的话术行滚进旧档）：日志含高频
@@ -521,6 +529,20 @@ void AgentMonitor::fetch_tts_text(const std::string & trace_id)
   //       提取（拼接话术里的多余空格过归一化自然消解）；剔除 text=""
   //       空段后取最后一条（状态流转发多次，末尾终态行文本最全）。
   //       多文件 grep 用 -h 抑制文件名前缀（=1=/=2= 同）
+  //   =4= 云端 NLG 结果（2026-10-20 现场发现：ogg opus 音频直推链路
+  //       dispatching status 行 text 恒为空、无 text.done、非本地合成，
+  //       =1=/=2=/=3= 全落空）：完整话术在 'received the last nlg
+  //       result: 话术, event_id: <event_id>' 行。该行用 event_id（无
+  //       item_0_ 前缀），按 trace 搜搜不到——剥前缀得 event_id 后按
+  //       行尾 'event_id: <id>$' 锚定检索，取最后一条（末尾最全），sed
+  //       去头尾得纯话术
+  // 路径4检索用的 event_id：trace 为 item_0_event_xxx 形态时剥前缀
+  //（白名单字符集剥前缀后仍安全；非该前缀的 trace 原样参与匹配）
+  std::string event_id = trace_id;
+  constexpr char kItemPrefix[] = "item_0_";
+  if (event_id.rfind(kItemPrefix, 0) == 0) {
+    event_id.erase(0, sizeof(kItemPrefix) - 1);
+  }
   const std::string remote =
     "F=$(ls -t /robot/persist/log/agent/agent.log* | head -2); "
     "echo =1=; "
@@ -534,7 +556,11 @@ void AgentMonitor::fetch_tts_text(const std::string & trace_id)
     "grep -ah -A3 'dispatching status item_id=" + trace_id + " ' $F"
     " | grep -av '^--' | tr '\\n~' '  '"
     " | grep -ao 'text=\"[^\"]*\" domain=\"[^\"]*\"'"
-    " | grep -av '^text=\"\"' | tail -1";
+    " | grep -av '^text=\"\"' | tail -1; "
+    "echo =4=; "
+    "grep -ah 'received the last nlg result' $F"
+    " | grep -a \"event_id: " + event_id + "$\" | tail -1"
+    " | sed 's/^.*nlg result: //; s/, event_id: [^,]*$//'";
   const std::string cmd =
     "SSHPASS='" + config_.ssh_password + "' sshpass -e ssh "
     "-o StrictHostKeyChecking=accept-new -o ConnectTimeout=3 " + config_.ssh_target +
@@ -603,6 +629,17 @@ void AgentMonitor::fetch_tts_text(const std::string & trace_id)
           return;
         }
       }
+    }
+    // 路径 4：云端 NLG 最终文本——=4= 段输出已是纯话术（sed 已去
+    // 头尾）；NLG 行无 domain 字段，但自产播报走本地 PlayTts 不产生
+    // nlg result 行，无需自产过滤
+    if (!out.nlg_line.empty()) {
+      const std::string text = out.nlg_line;
+      if (!match_phrases(text, trace_id)) {
+        auto cb = on_tts_text;
+        emit([cb, trace_id, text] { if (cb) cb(trace_id, text); });
+      }
+      return;
     }
     if (attempt == 0) {
       std::this_thread::sleep_for(std::chrono::milliseconds(600));
