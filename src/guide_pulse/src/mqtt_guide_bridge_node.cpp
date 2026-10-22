@@ -238,6 +238,8 @@ void MqttGuideBridgeNode::declare_and_load_params()
   // 安抚语料池：受理引导语播完后，每隔 min~max 秒（随机）挑一句播报
   //（随机取、不与上一条连续重复），安抚顾客「不要着急、跟我走」，
   // 防导航途中长时间沉默太空；到达/取消/失败即停。空列表 = 禁用
+  // 2026-10-22 现场需求：清道话术「小T正在赶路，麻烦大家给我让点
+  // 空间吧」入池——固定首句播完后途中也要轮播到这句
   declare_parameter<std::vector<std::string>>(
     "navigate_chatter_texts",
     std::vector<std::string>{
@@ -245,6 +247,7 @@ void MqttGuideBridgeNode::declare_and_load_params()
       "马上就到了，请跟紧我",
       "请注意脚下，跟我来",
       "别着急，我们很快就到啦",
+      "小T正在赶路，麻烦大家给我让点空间吧",
     });
   // 去迎宾点专用池（2026-10-21 现场需求：去迎宾点途中没有顾客跟走，
   // 「请跟我走」话术不对，改播赶路/就位类的话；迎宾准备（语料触发）
