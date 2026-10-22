@@ -17,15 +17,25 @@
 namespace
 {
 
-// 日志前缀时间改为 RFC3339 UTC 毫秒（如 2026-09-30T05:15:10.776Z）。
-// Humble 的 RCUTILS_CONSOLE_OUTPUT_FORMAT 没有日历时间 token（{time} 仅
-// epoch 秒），故安装进程级自定义 output handler 直接格式化。行为与默认
-// console handler 对齐：ERROR 及以上走 stderr，单次 fprintf 整行输出
-// 避免多线程日志交错。
-void rfc3339_log_output_handler(
+// 日志行格式精简 + 时间本地化（2026-10-21 现场需求）：
+//   [10-21 17:47:58.135] [INFO] [mc_transform.cpp:493] 消息
+// - 时间：系统本地时区（与现场钟一致；原 RFC3339 UTC 比北京时间慢 8h，
+//   现场对不上表）。Humble 的 RCUTILS_CONSOLE_OUTPUT_FORMAT 没有日历
+//   时间 token（{time} 仅 epoch 秒），故安装进程级自定义 output handler
+//   直接格式化
+// - 精简（现场反馈日志太乱）：去掉 logger 名层（launch 前缀
+//   [guide_bridge-1] 已标识来源进程）、年份与时区标记（latest.log 按
+//   天排查，月-日防跨天文件歧义）；保留 [文件:行号]（2026-10-18 现场
+//   需求：按日志直接定位打印点；location 为空的日志（第三方库）不带
+//   该段）
+// - 行为与默认 console handler 对齐：ERROR 及以上走 stderr，单次
+//   fprintf 整行输出避免多线程日志交错。
+void local_log_output_handler(
   const rcutils_log_location_t * location, int severity, const char * name,
   rcutils_time_point_value_t timestamp, const char * format, va_list * args)
 {
+  (void)name;  // logger 名不再输出（launch 前缀已标识来源进程）
+
   // 先测长度再格式化，避免长 payload 日志（播报列表文本可达 ~4KB）被截断
   std::string message(1, '\0');
   {
@@ -41,16 +51,17 @@ void rfc3339_log_output_handler(
     }
   }
 
-  // epoch 纳秒 -> UTC 年月日时分秒.毫秒
+  // epoch 纳秒 -> 本地「月-日 时:分:秒.毫秒」（时区随系统 TZ，现场
+  // Asia/Shanghai；localtime_r 线程安全，与 gmtime_r 同款用法）
   static constexpr int64_t kNsPerSec = 1000000000LL;
   const std::time_t secs = static_cast<std::time_t>(timestamp / kNsPerSec);
   const int millis = static_cast<int>((timestamp % kNsPerSec) / 1000000LL);
   std::tm tm_buf{};
-  gmtime_r(&secs, &tm_buf);
+  localtime_r(&secs, &tm_buf);
   char time_buf[64];  // gcc 无法推断 tm 字段宽度，给足空间避免 -Wformat-truncation
   std::snprintf(
-    time_buf, sizeof(time_buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
-    tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
+    time_buf, sizeof(time_buf), "%02d-%02d %02d:%02d:%02d.%03d",
+    tm_buf.tm_mon + 1, tm_buf.tm_mday,
     tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, millis);
 
   // severity 枚举步长 10（DEBUG=10..FATAL=50），映射为默认前缀同名大写
@@ -61,22 +72,21 @@ void rfc3339_log_output_handler(
     (idx >= 1 && idx <= 5) ? kNames[idx] : kNames[0];
 
   // 源码位置（2026-10-18 现场需求：排查时按日志直接定位打印点）：取
-  // 文件名 basename 免绝对路径刷屏；location 为空的日志（第三方库）
-  // 不带该段
+  // 文件名 basename 免绝对路径刷屏；line_number 是 size_t，用 %zu 匹配
   char where_buf[192];
   const char * where = "";
   if (location != nullptr && location->file_name != nullptr) {
     const char * base = std::strrchr(location->file_name, '/');
     base = (base != nullptr) ? base + 1 : location->file_name;
     std::snprintf(
-      where_buf, sizeof(where_buf), " [%s:%d]", base, location->line_number);
+      where_buf, sizeof(where_buf), " [%s:%zu]", base,
+      static_cast<std::size_t>(location->line_number));
     where = where_buf;
   }
 
   std::fprintf(
     severity >= RCUTILS_LOG_SEVERITY_ERROR ? stderr : stdout,
-    "[%s] [%s] [%s]%s: %s\n", severity_name, time_buf,
-    (name != nullptr) ? name : "", where, message.c_str());
+    "[%s] [%s]%s %s\n", time_buf, severity_name, where, message.c_str());
 }
 
 }  // namespace
@@ -87,7 +97,7 @@ int main(int argc, char ** argv)
   //（集成测试轮询桥接日志与运维 tail 排障都依赖实时输出）
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
   rclcpp::init(argc, argv);
-  rcutils_logging_set_output_handler(rfc3339_log_output_handler);
+  rcutils_logging_set_output_handler(local_log_output_handler);
 
   auto node = std::make_shared<guide_pulse::MqttGuideBridgeNode>(
     rclcpp::NodeOptions());
@@ -168,7 +178,7 @@ int main(int argc, char ** argv)
   if (!navigate_stop_phrases.empty()) {
     monitor_cfg.rules.push_back({"navigate_stop", "", navigate_stop_phrases});
   }
-  // 迎宾准备语料（2026-10-18 现场需求：agent 说「好嘞，马上前去迎宾点
+  // 迎宾准备语料（2026-10-18 现场需求：agent 说「整装待发，即刻就位
   // 需要先导航去Y点」类话术 -> 等 agent 说完 -> 先确保人形再导航去
   // point 迎宾点，到达变四足收摄像头、播就位语）：每条格式「点位名|
   // 语料」，点位名支持两种写法（2026-10-19 现场需求）——名称关键词
@@ -186,6 +196,24 @@ int main(int argc, char ** argv)
     }
     monitor_cfg.rules.push_back(
       {"welcome_prep", item.substr(0, sep), {item.substr(sep + 1)}});
+  }
+  // 送客语料（2026-10-21 现场需求：agent 说「热情相送，宾至如归」
+  // 类话术 -> 等 agent 说完 -> 先确保人形再导航去 point 迎宾点送顾客，
+  // 到达变四足收摄像头、播感谢语 send_off_done_text）：每条格式「点位名|
+  // 语料」，点位名写法与 welcome_prep_phrases 一致（名称关键词如「迎宾」
+  // 或直接写 code 如 Y，精确解析优先）。非法条目跳过并告警
+  const auto send_off_phrases =
+    node->get_parameter("agent_monitor.send_off_phrases").as_string_array();
+  for (const auto & item : send_off_phrases) {
+    const auto sep = item.find('|');
+    if (sep == std::string::npos || sep == 0 || sep + 1 >= item.size()) {
+      RCLCPP_WARN(
+        node->get_logger(),
+        "送客语料格式非法（应为 点位名|语料），跳过该条: 「%s」", item.c_str());
+      continue;
+    }
+    monitor_cfg.rules.push_back(
+      {"send_off", item.substr(0, sep), {item.substr(sep + 1)}});
   }
   // TTS 话术回查（trace_id -> 运控板日志）：SSH 目标复用屏幕推送配置；
   // self_domain 过滤自产播报回环（话术请求侧已知，运控板日志无记录）
@@ -309,7 +337,7 @@ int main(int argc, char ** argv)
       event.point_name = point;
       event.operation_id = guide_pulse::generate_uuid_v7();
       event.event_id = guide_pulse::generate_uuid_v7();
-      event.local = true;  // 本地注入：不发协议回执
+      event.local = true;  // 本地注入：失败不发回执（成功时发 relocate.result，2026-10-21 需求）
       node->inject_command(std::move(event));
       return;
     }
@@ -331,6 +359,19 @@ int main(int argc, char ** argv)
       // 经点位映射表解析后导航去迎宾点；到达后变四足收摄像头、播就位语
       guide_pulse::CommandEvent event;
       event.type = "welcome_prep";
+      event.point_name = point;
+      event.operation_id = guide_pulse::generate_uuid_v7();
+      event.event_id = guide_pulse::generate_uuid_v7();
+      event.local = true;  // 本地注入：不发协议回执
+      node->inject_command(std::move(event));
+      return;
+    }
+    if (action == "send_off") {
+      // 注入等价本地 send_off 指令（2026-10-21 现场需求）：链路与
+      // welcome_prep 同款（点位解析 -> 确保人形 -> 导航去迎宾点送顾客），
+      // 到达后变四足收摄像头、播感谢语 send_off_done_text
+      guide_pulse::CommandEvent event;
+      event.type = "send_off";
       event.point_name = point;
       event.operation_id = guide_pulse::generate_uuid_v7();
       event.event_id = guide_pulse::generate_uuid_v7();

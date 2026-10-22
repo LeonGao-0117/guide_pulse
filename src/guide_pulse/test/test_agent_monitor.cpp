@@ -17,8 +17,8 @@ using guide_pulse::phrase_matches;
 // 归一化：中文标点/空白剔除，文字保留
 TEST(NormalizePhraseText, RemovesCjkPunctuationAndSpaces)
 {
-  EXPECT_EQ(normalize_phrase_text("好嘞，马上开始迎接我的顾客喽"), "好嘞马上开始迎接我的顾客喽");
-  EXPECT_EQ(normalize_phrase_text("好嘞， 马上开始迎接我的顾客喽！"), "好嘞马上开始迎接我的顾客喽");
+  EXPECT_EQ(normalize_phrase_text("恭候光临，倒屣相迎"), "恭候光临倒屣相迎");
+  EXPECT_EQ(normalize_phrase_text("恭候光临， 倒屣相迎！"), "恭候光临倒屣相迎");
   EXPECT_EQ(normalize_phrase_text("  好 嘞 。 马上　开始  "), "好嘞马上开始");  // 含全角空格
 }
 
@@ -39,16 +39,16 @@ TEST(NormalizePhraseText, PunctuationOnlyToEmpty)
 // 匹配：识别文本包含语料即命中（语气词前后夹不影响）
 TEST(PhraseMatches, SubstringAfterNormalize)
 {
-  EXPECT_TRUE(phrase_matches("嗯，好嘞，马上开始迎接我的顾客喽哈", "好嘞，马上开始迎接我的顾客喽"));
-  EXPECT_TRUE(phrase_matches("好嘞马上开始迎接我的顾客喽", "好嘞，马上开始迎接我的顾客喽！"));
+  EXPECT_TRUE(phrase_matches("嗯，恭候光临，倒屣相迎哈", "恭候光临，倒屣相迎"));
+  EXPECT_TRUE(phrase_matches("恭候光临倒屣相迎", "恭候光临，倒屣相迎！"));
   EXPECT_TRUE(phrase_matches("OK Start 3", "ok, start 3"));
 }
 
 // 匹配：不同语句/短于语料不命中（识别文本是语料子串不算，防误触发）
 TEST(PhraseMatches, NoFalsePositive)
 {
-  EXPECT_FALSE(phrase_matches("今天天气不错", "好嘞，马上开始迎接我的顾客喽"));
-  EXPECT_FALSE(phrase_matches("迎接我的顾客", "好嘞，马上开始迎接我的顾客喽"));
+  EXPECT_FALSE(phrase_matches("今天天气不错", "恭候光临，倒屣相迎"));
+  EXPECT_FALSE(phrase_matches("倒屣相迎", "恭候光临，倒屣相迎"));
   EXPECT_FALSE(phrase_matches("随便说点什么", "，。！"));  // 空语料不命中
 }
 
@@ -83,6 +83,27 @@ TEST(PhraseMatches, QrCancelPhrase)
   EXPECT_FALSE(phrase_matches(phrase, show_phrase));
 }
 
+// 匹配：送客话术命中（2026-10-21 现场需求：agent 说「热情相送，宾至
+// 如归」-> 变人形导航送顾客回迎宾点，到达变四足播感谢语；与迎宾
+// 准备/开始迎宾话术整句子串判定互不误触）
+TEST(PhraseMatches, SendOffPhrase)
+{
+  const std::string phrase = "热情相送，宾至如归";
+  EXPECT_TRUE(phrase_matches(phrase, phrase));                 // 原句
+  EXPECT_TRUE(phrase_matches("热情相送，宾至如归。", phrase));  // 尾标点
+  EXPECT_TRUE(phrase_matches(                                  // 前后夹语气词
+    "嗯热情相送宾至如归啦", phrase));
+  EXPECT_FALSE(phrase_matches("热情相送", phrase));    // 话术截断不命中
+  EXPECT_FALSE(phrase_matches("宾至如归", phrase));    // 缺「热情相送」不命中
+  // 与另外两条迎宾话术互不误触（整句子串判定，字面无重叠）
+  const std::string prep_phrase = "整装待发，即刻就位";      // 迎宾准备
+  const std::string welcome_phrase = "恭候光临，倒屣相迎";  // 开始迎宾
+  EXPECT_FALSE(phrase_matches(prep_phrase, phrase));
+  EXPECT_FALSE(phrase_matches(welcome_phrase, phrase));
+  EXPECT_FALSE(phrase_matches(phrase, prep_phrase));
+  EXPECT_FALSE(phrase_matches(phrase, welcome_phrase));
+}
+
 // 匹配：重定位话术命中（2026-10-16 语料触发重定位：展厅 A~E 五点各一条
 // 语料；点位字母不同互不误触，缺「开始重定位」不命中）
 TEST(PhraseMatches, RelocatePhrase)
@@ -102,7 +123,7 @@ TEST(PhraseMatches, RelocatePhrase)
 TEST(NormalizePhraseText, LatinExtendedPreserved)
 {
   EXPECT_EQ(normalize_phrase_text("比亚迪ætəʊ 1"), "比亚迪ætəʊ1");
-  EXPECT_EQ(normalize_phrase_text("比亚迪Æ 2"), "比亚迪æ2");       // 拉丁扩展-1 大写转小写
+  EXPECT_EQ(normalize_phrase_text("比亚迪Æ 3"), "比亚迪æ3");       // 拉丁扩展-1 大写转小写
   EXPECT_EQ(normalize_phrase_text("2×3÷4"), "234");               // ×÷ 丢弃
 }
 
@@ -118,7 +139,7 @@ TEST(PhraseMatches, NavigateDynamicPhrase)
     "要去看比亚迪 Ætəʊ 1，没问题", phrase));
   EXPECT_TRUE(phrase_matches(                                             // sea lion 大小写（现场实测 agent 说小写）
     "要去看比亚迪sea lion 7，没问题", "要去看比亚迪Sea Lion 7，没问题"));
-  EXPECT_FALSE(phrase_matches("要去看比亚迪ætəʊ 2，没问题", phrase));   // 相邻车型不误触
+  EXPECT_FALSE(phrase_matches("要去看比亚迪ætəʊ 3，没问题", phrase));   // 相邻车型不误触
   EXPECT_FALSE(phrase_matches("要去看比亚迪M9，没问题", "要去看比亚迪M9 DM-i，没问题"));
   EXPECT_FALSE(phrase_matches("要去看比亚迪，没问题", phrase));         // 缺车型名不命中
 }
@@ -146,7 +167,7 @@ TEST(PhraseMatches, NavigatePhraseAtTailWithFreeText)
 // 匹配：空语料/空识别不命中
 TEST(PhraseMatches, EmptyInputs)
 {
-  EXPECT_FALSE(phrase_matches("", "好嘞，马上开始迎接我的顾客喽"));
+  EXPECT_FALSE(phrase_matches("", "恭候光临，倒屣相迎"));
   EXPECT_FALSE(phrase_matches("好嘞", ""));
 }
 

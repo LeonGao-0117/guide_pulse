@@ -564,7 +564,7 @@ TEST(PointMapEventTest, ParsesOptionalTextEntries)
     "point_map",
     R"({"operation_id":")" + std::string(kOperationId) +
     R"(","points":[{"code":"A","name":"比亚迪ætəʊ 1","text":"这就是比亚迪ætəʊ 1的展车了"},)"
-    R"({"code":"B","name":"比亚迪ætəʊ 2"}]})");
+    R"({"code":"B","name":"比亚迪ætəʊ 3"}]})");
   std::string error;
   const auto event = guide_pulse::parse_command_event(payload, "robot-001", error);
   ASSERT_TRUE(event.has_value()) << error;

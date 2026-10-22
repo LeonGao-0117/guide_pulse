@@ -111,7 +111,7 @@ TEST_F(PointMapStoreTest, ResolveNameToCode)
   EXPECT_EQ(store.resolve("B"), std::optional<std::string>("B"));  // 命中 code「B」
   EXPECT_EQ(store.resolve("展位B"), std::optional<std::string>("B"));
   // 未命中的名称
-  EXPECT_FALSE(store.resolve("比亚迪ATTO 2").has_value());
+  EXPECT_FALSE(store.resolve("比亚迪ATTO 3").has_value());
   EXPECT_FALSE(store.resolve("a").has_value());  // 大小写敏感
   EXPECT_FALSE(store.resolve("").has_value());
 }
@@ -265,7 +265,7 @@ TEST_F(PointMapStoreTest, TextPersistsAndReloadsAcrossRestart)
     ASSERT_TRUE(store.load());
     std::vector<PointMapEntry> points = {
       {"A", "比亚迪ætəʊ 1", std::optional<std::string>("这就是比亚迪ætəʊ 1的展车了")},
-      {"B", "比亚迪ætəʊ 2"},  // 未配播放词
+      {"B", "比亚迪ætəʊ 3"},  // 未配播放词
     };
     ASSERT_TRUE(store.replace(points));
   }

@@ -116,7 +116,7 @@ payload 仅 `operation_id`（与 `tts.stop` 同构）。契约：停止当前正
 {"payload": {"operation_id": "<uuidv7，Server 铸造的子 ID>",
              "points": [{"code": "A", "name": "比亚迪ætəʊ 1",
                          "text": "这就是比亚迪ætəʊ 1的展车了…"},
-                        {"code": "B", "name": "比亚迪ætəʊ 2"}]}}
+                        {"code": "B", "name": "比亚迪ætəʊ 3"}]}}
 ```
 
 - 家庭级群发：App 是映射表唯一权威来源，Server 只校验转发不保存；

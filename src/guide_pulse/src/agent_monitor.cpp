@@ -312,24 +312,22 @@ bool AgentMonitor::match_phrases(const std::string & text, const std::string & t
         RCLCPP_INFO(
           node_->get_logger(), "语料命中: action=%s point=%s agent话术「%s」",
           rule.action.c_str(), rule.point.c_str(), text.c_str());
-        // navigate/relocate/welcome_prep 延迟触发（2026-10-17 现场需求；
-        // welcome_prep 2026-10-18 迎宾准备）：命中时 agent
-        // 正在说这句话（「请稍等」/「开始重定位」/「马上去迎宾点」），立即执行体验差——navigate 边说边动身、relocate 话音未落就发「重定位成功」自产播报
+        // navigate/relocate/welcome_prep/send_off 延迟触发（2026-10-17 现场需求；
+        // welcome_prep 2026-10-18 迎宾准备；send_off 2026-10-21 送客）：命中时 agent
+        // 正在说这句话（「请稍等」/「开始重定位」/「整装待发」/
+        // 「热情相送宾至如归」），立即执行体验差——navigate 边说边动身、relocate 话音未落就发「重定位成功」自产播报
         // 与 agent 话音相撞——挂起等该 trace 的 TTS 终态再触发。该 trace
         // 已结束（话术回查慢于终态的乱序，如本地链路 BEGIN 触发的回查落空
         // 重试）则立即触发不等待。15s 为 TtsStatus 丢失的兜底上限（话术
         // ~20 字 ≈ 5s 播完，宽裕；到期由 check_deferred_deadline 强制触发）
         if ((rule.action == "navigate" || rule.action == "relocate" ||
-            rule.action == "welcome_prep") && !trace_id.empty() &&
+            rule.action == "welcome_prep" || rule.action == "send_off") &&
+          !trace_id.empty() &&
           finished_traces_.count(trace_id) == 0)
         {
           deferred_ = DeferredPhrase{
             rule.action, rule.point, text, trace_id,
             now + std::chrono::seconds(15)};
-          RCLCPP_INFO(
-            node_->get_logger(),
-            "语料挂起等播报结束: action=%s point=%s trace=%s（说完再触发，15s 兜底）",
-            rule.action.c_str(), rule.point.c_str(), trace_id.c_str());
           return true;
         }
         auto cb = on_phrase;
@@ -400,10 +398,16 @@ void AgentMonitor::check_deferred_deadline()
 //     行。注意该行超长时 logger 会折行：主行带时间戳、~ 结尾，余下内容
 //     在无时间戳续行（2026-10-19 现场：M9 固定语位于长话术尾部全在续行，
 //     单行 grep 永远拿不到完整话术）——回查须 -A3 带续行拼接后提取
+//   云端音频收尾（2026-10-21 现场发现）：response.audio.done 单行 JSON
+//     的 "text" 是整轮全量话术（内部换行是 \n 转义不折行）——话术含
+//     换行时 NLG/dispatching 行都会物理折行拿不到全量，该行是唯一
+//     可靠全量源；写入偏晚（音频收完才落），早查落空靠终态重查兜底
 //   云端 NLG 结果（2026-10-20 现场发现：ogg opus 音频直推链路 dispatching
-//     status 行 text 恒为空，上述路径全落空）：完整话术在
-//     'received the last nlg result: 话术, event_id: <event_id>' 行（行内
-//     是 event_id，非 item_id），按剥掉 item_0_ 前缀的 event_id 检索
+//     status 行 text 恒为空，上述路径全落空）：话术在
+//     'received the last nlg result: 分段, event_id: <event_id>' 行（行内
+//     是 event_id，非 item_id），按剥掉 item_0_ 前缀的 event_id 检索；
+//     NLG 流式按句分段一行一段，须全部分段拼接（折行分段仍取不到，
+//     文本可能不全，未命中不消化等 audio.done 重查）
 // ---------------------------------------------------------------------------
 namespace
 {
@@ -426,12 +430,16 @@ bool safe_trace_id(const std::string & trace_id)
 
 // 执行合并回查命令：一次 SSH 同时跑本地/云端/音频直推三条 grep（=1=/=2=
 // /=3= 标记分段），返回各自首个非空输出行（空串 = 未查到/失败）
+// FetchLines 结构（=4= 新增 audio.done 全量源、=5= nlg 分段拼接，
+// 2026-10-21 现场送客语料「热情相送，宾至如归」跨 NLG 换行折行段
+// 失配问题，见 fetch_tts_text 命令注释）
 struct FetchLines
 {
   std::string local_line;   // 路径1输出：形如 "text=话术 domain="
   std::string cloud_line;   // 路径2输出：纯话术文本
   std::string stream_line;  // 路径3输出：形如 "text=\"话术\" domain=\"omnissdk\""
-  std::string nlg_line;     // 路径4输出：纯话术文本（NLG 最终结果行）
+  std::string audio_line;   // 路径4输出：audio.done 全量话术（\n 转义已还原为空格）
+  std::string nlg_line;     // 路径5输出：nlg 分段话术拼接（可能不全，折行分段取不到）
 };
 
 FetchLines ssh_fetch_lines(const std::string & cmd)
@@ -450,6 +458,7 @@ FetchLines ssh_fetch_lines(const std::string & cmd)
     if (line == "=2=") {section = 2; continue;}
     if (line == "=3=") {section = 3; continue;}
     if (line == "=4=") {section = 4; continue;}
+    if (line == "=5=") {section = 5; continue;}
     if (line.empty()) {continue;}
     if (section == 1 && out.local_line.empty()) {
       out.local_line = line;
@@ -457,7 +466,9 @@ FetchLines ssh_fetch_lines(const std::string & cmd)
       out.cloud_line = line;
     } else if (section == 3 && out.stream_line.empty()) {
       out.stream_line = line;
-    } else if (section == 4 && out.nlg_line.empty()) {
+    } else if (section == 4 && out.audio_line.empty()) {
+      out.audio_line = line;
+    } else if (section == 5 && out.nlg_line.empty()) {
       out.nlg_line = line;
     }
   }
@@ -514,7 +525,7 @@ void AgentMonitor::fetch_tts_text(const std::string & trace_id)
   if (!safe_trace_id(trace_id) || config_.ssh_password.find('\'') != std::string::npos) {
     return;  // trace/密码含非法字符：静默跳过回查（防御，不打印）
   }
-  // 一次 SSH 同时跑四条路径（省第二次连接 1~2s）。远程命令直白书写后
+  // 一次 SSH 同时跑五条路径（省第二次连接 1~2s）。远程命令直白书写后
   // base64 编码、单引号传递解码执行——两侧 shell 均零转义。
   // 各条 grep 打当前档+最新滚动档（$F，ls -t 取前二；2026-10-19 现场
   // 亲历 agent.log 100MB 滚动把几分钟前的话术行滚进旧档）：日志含高频
@@ -528,15 +539,28 @@ void AgentMonitor::fetch_tts_text(const std::string & trace_id)
   //       压成空格拼成整条记录，再按 text="[^"]*" domain="[^"]*" 逐段
   //       提取（拼接话术里的多余空格过归一化自然消解）；剔除 text=""
   //       空段后取最后一条（状态流转发多次，末尾终态行文本最全）。
-  //       多文件 grep 用 -h 抑制文件名前缀（=1=/=2= 同）
-  //   =4= 云端 NLG 结果（2026-10-20 现场发现：ogg opus 音频直推链路
+  //       多文件 grep 用 -h 抑制文件名前缀（=1=/=2= 同）。注意：话术
+  //       本身含换行时（=4= 场景同源）折行续段的 domain 无引号，该
+  //       正则失配，由 =4= 兜底
+  //   =4= 云端音频收尾事件 response.audio.done（2026-10-21 现场发现：
+  //       话术含换行时 nlg result 行物理折行，全量行行尾无 event_id、
+  //       续行无行前缀，双双被滤失配——该轮话术只回查到最后一个分段
+  //       「宾至如归」，跨段语料「热情相送宾至如归」失配）：单行
+  //       JSON 不折行，text 字段是整轮全量话术，内部换行是 \n 两字符
+  //       转义（sed 还原为空格——不还原时归一化丢 \ 留 n，语料恰跨
+  //       换行处会夹进字母 n 失配）。按 "item_id":"<trace>" 过滤。
+  //       写入时机偏晚（音频收完才落），SPEAKING 早查会落空，靠
+  //       TtsStatus 终态重查兜底
+  //   =5= 云端 NLG 结果：'received the last nlg result: 分段, event_id:
+  //       <event_id>' 行（2026-10-20 现场发现：ogg opus 音频直推链路
   //       dispatching status 行 text 恒为空、无 text.done、非本地合成，
-  //       =1=/=2=/=3= 全落空）：完整话术在 'received the last nlg
-  //       result: 话术, event_id: <event_id>' 行。该行用 event_id（无
-  //       item_0_ 前缀），按 trace 搜搜不到——剥前缀得 event_id 后按
-  //       行尾 'event_id: <id>$' 锚定检索，取最后一条（末尾最全），sed
-  //       去头尾得纯话术
-  // 路径4检索用的 event_id：trace 为 item_0_event_xxx 形态时剥前缀
+  //       =1=/=2=/=3= 全落空）。NLG 流式按句分段回调，一行一段；按
+  //       行尾 event_id 锚定、sed 去头尾后**全部分段拼接**（旧实现
+  //       tail -1 取末行——「末尾最全」仅在话术无换行、末尾存在全量
+  //       行时成立）。拼接仍取不到折行分段（主行被 event_id$ 滤、
+  //       续行被行前缀滤），文本可能不全：调用方未命中时不消化，
+  //       等终态重查拿 =4= 全量再匹配
+  // 路径5检索用的 event_id：trace 为 item_0_event_xxx 形态时剥前缀
   //（白名单字符集剥前缀后仍安全；非该前缀的 trace 原样参与匹配）
   std::string event_id = trace_id;
   constexpr char kItemPrefix[] = "item_0_";
@@ -558,9 +582,15 @@ void AgentMonitor::fetch_tts_text(const std::string & trace_id)
     " | grep -ao 'text=\"[^\"]*\" domain=\"[^\"]*\"'"
     " | grep -av '^text=\"\"' | tail -1; "
     "echo =4=; "
+    "grep -ah 'response.audio.done' $F"
+    " | grep -a '\"item_id\":\"" + trace_id + "\"' | tail -1"
+    " | grep -o '\"text\":\"[^\"]*\"' | cut -d'\"' -f4"
+    " | sed 's/\\\\n/ /g; s/\\\\t/ /g'; "
+    "echo =5=; "
     "grep -ah 'received the last nlg result' $F"
-    " | grep -a \"event_id: " + event_id + "$\" | tail -1"
-    " | sed 's/^.*nlg result: //; s/, event_id: [^,]*$//'";
+    " | grep -a \"event_id: " + event_id + "$\""
+    " | sed 's/^.*nlg result: //; s/, event_id: [^,]*$//'"
+    " | tr '\\n' ' ';";
   const std::string cmd =
     "SSHPASS='" + config_.ssh_password + "' sshpass -e ssh "
     "-o StrictHostKeyChecking=accept-new -o ConnectTimeout=3 " + config_.ssh_target +
@@ -630,15 +660,29 @@ void AgentMonitor::fetch_tts_text(const std::string & trace_id)
         }
       }
     }
-    // 路径 4：云端 NLG 最终文本——=4= 段输出已是纯话术（sed 已去
-    // 头尾）；NLG 行无 domain 字段，但自产播报走本地 PlayTts 不产生
-    // nlg result 行，无需自产过滤
-    if (!out.nlg_line.empty()) {
-      const std::string text = out.nlg_line;
+    // 路径 4：云端音频收尾事件全量文本——单行 JSON 提取的 text，整轮
+    // 话术最全（内部换行转义已在命令侧 sed 还原为空格）；audio.done
+    // 无 domain 字段，但自产播报走本地 PlayTts 不产生该行，无需自产过滤
+    if (!out.audio_line.empty()) {
+      const std::string text = out.audio_line;
       if (!match_phrases(text, trace_id)) {
         auto cb = on_tts_text;
         emit([cb, trace_id, text] { if (cb) cb(trace_id, text); });
       }
+      return;
+    }
+    // 路径 5：云端 NLG 分段拼接文本——可能不全（折行分段取不到，
+    // 2026-10-21 送客场景即缺「您这边请！热情相送，」折行段），命中
+    // 才消化；未命中打观测行后解除去重标记，允许 TtsStatus 终态重查
+    // 拿 =4= audio.done 全量再匹配一次（早查时 audio.done 尚未写入）
+    if (!out.nlg_line.empty()) {
+      const std::string text = out.nlg_line;
+      if (match_phrases(text, trace_id)) {
+        return;  // 已命中消化（延迟触发挂起等说完）
+      }
+      auto cb = on_tts_text;
+      emit([cb, trace_id, text] { if (cb) cb(trace_id, text); });
+      fetched_traces_.erase(trace_id);  // 文本可能残缺：不挡终态重查
       return;
     }
     if (attempt == 0) {

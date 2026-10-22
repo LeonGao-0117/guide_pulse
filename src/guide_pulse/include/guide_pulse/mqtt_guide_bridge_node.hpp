@@ -95,8 +95,11 @@ private:
   void handle_navigate(const CommandEvent & event);     // 讲解模块入口
   // 迎宾准备模块入口（2026-10-18 现场需求，仅本地注入：AgentMonitor 命中
   // agent_monitor.welcome_prep_phrases 语料）：先确保人形（导航前置）->
-  // 导航去迎宾点 -> 到达后变四足收摄像头 -> 播就位语。不发协议回执
-  void handle_welcome_prep(const CommandEvent & event);
+  // 导航去迎宾点 -> 到达后变四足收摄像头 -> 播就位语。不发协议回执。
+  // send_off=true 为送客模式（2026-10-21 现场需求，type=send_off 注入，
+  // 命中 agent_monitor.send_off_phrases 语料）：链路同款，仅到达后播
+  // 感谢语 send_off_done_text（不再播就位语）
+  void handle_welcome_prep(const CommandEvent & event, bool send_off = false);
   void handle_point_map(const CommandEvent & event);    // 点位映射表全量替换入口（v0.25.0）
   void handle_show_qr(const CommandEvent & event);      // 语料触发二维码显示入口（本地注入，占业务互斥 20s）
   void handle_cancel_qr(const CommandEvent & event);    // 语料触发取消二维码显示入口（本地注入，占业务互斥 20s）
@@ -172,25 +175,34 @@ private:
   // 播报一条业务拒绝提示（worker 线程）：不强抢进行中的其他播报、
   // 失败仅告警不影响回执；text 空则跳过（配置禁用）。回执由调用方负责
   void speak_hint(const std::string & text, const char * trace_id);
+  // ---- 导航途中随机播报（2026-10-21 现场需求，仅 worker 线程）----
+  // 取下一句途中播报词：本次导航固定首句（navigate_chatter_first_text /
+  // navigate_chatter_welcome_first_text，受理时按目标定格）待播则先播
+  // 固定句；否则按 nav_chatter_welcome_ 选池后随机取一条（不与上一条
+  // 连续重复）；池空且无固定句返回空串
+  std::string pick_nav_chatter_text();
+  // 播报间隔：下一句等待 = text 播报时长估算（同尾部宽限公式）+
+  // 静默秒数（间隔语义 = 两句之间的静默，不含播报时间）
+  std::chrono::milliseconds nav_chatter_next_delay(const std::string & text) const;
   // 变形后重定位（worker 线程，2026-10-18 现场需求）：导航/迎宾前置
   // 变形**实际发生且成功**（McTransform::biped_transformed）时，同步发
   // 不带航点的 {command: set_pose} 到 t1_slam_nav_ws——变形动作自带约
   // 180° 转身把 AMCL 定位带偏，服务端用最新停留点（最近一次导航结束
-  // 实际停的位置）重设初值拉回；本身就是人形（零动作路径）不发送。
+  // 实际停的位置）重设初值拉回；本身就是人形（零动作路径）不发送
+  //（2026-10-21 现场需求：已是人形不 set_pose，撤销 2026-10-19 的
+  // force 强制机制——机器人没动定位未被带偏，强制重定位多此一举；
+  // 变形后发送前先等 relocate_after_transform_delay_seconds——落位
+  // 余晃期抖动会干扰 set_pose 初值，默认 2s，0 = 落位即发）。
   // 失败/被拒（无停留点/导航栈未起等）只记日志不阻断业务——补偿性
-  // 重定位，尽力而为。force=true（2026-10-19 现场需求）：未变形也强制
-  // 发 set_pose——语料触发的导航上报必须建立在真实重定位成功之上
-  //（首版把「已是人形跳过」当成功，真机验证未做重定位也发了上报，
-  // 被现场打回）。返回 true = 成功（含 force=false 未变形的跳过路径），
-  // false = 尝试了但失败——语料触发的 navigate.triggered 上报据此把关
-  //（只有重定位成功才发消息给后端）。调用点：handle_navigate
-  //（force=event.local）/ handle_welcome_prep（force=true，恒语料触发）
-  //（均在双足门禁通过后、发导航 goal 前——set_pose 在途时发 go 会被
-  // 「任务在跑」拒，必须等它终态）、handle_scene（force=false，变形
-  // wait_done 后、二维码上屏前，返回值不用——迎宾无 triggered 上报面）。
-  // handle_relocate 不调：它自己的 set_pose 带航点，初值即重设，无二次
-  // 修正面
-  bool relocate_after_transform(const std::string & source, bool force = false);
+  // 重定位，尽力而为。返回 true = 成功（含未变形跳过路径），false =
+  // 变形后尝试了但失败——语料触发的 navigate.triggered 上报据此把关
+  //（只有重定位成功才发消息给后端）。调用点：handle_navigate /
+  // handle_welcome_prep（均在双足门禁通过后、发导航 goal 前——
+  // set_pose 在途时发 go 会被「任务在跑」拒，必须等它终态）、
+  // handle_scene（变形 wait_done 后、二维码上屏前，返回值不用——迎宾
+  // 无 triggered 上报面）。handle_relocate 不调：它自己的 set_pose 带
+  // 航点，初值即重设，无二次修正面
+  bool relocate_after_transform(const std::string & source);
   // 航点 code -> 映射表显示名（App 界面展示的人话名，如 A ->
   // 比亚迪ATTO 1）；反查失败返回 fallback（表结构上 code 必来自表内，
   // 仅防御）。navigate 引导语 {point} 替换与 P-040 语音触发上报共用
@@ -309,6 +321,10 @@ private:
                                         // 导览业务，防「一直 busy 拒新业务」
   // ---- 重定位业务参数（2026-10-17：终态=导航模块验收结果）----
   int relocate_timeout_seconds_;        // 等待验收超时（默认 30s）
+  // 变形后重定位发送前等待秒数（2026-10-21 现场需求）：变形动作落位后
+  // 机器人还有余晃，立即发 set_pose 重设初值会被余晃期抖动干扰，先等
+  // 这么多秒再发。0 = 原行为（落位即发）
+  int relocate_after_transform_delay_seconds_{2};
   std::string busy_hint_relocate_text_; // 互斥拒绝提示（重定位中，空=不播）
   std::string busy_hint_navigate_text_; // 互斥拒绝提示（导航在途，空=不播）
   std::string navigate_failed_text_;    // 导航失败提示（回执后播，空=不播）
@@ -329,13 +345,31 @@ private:
   std::string navigate_lead_welcome_text_;
   // 导航出发播报语（2026-10-18 现场需求）：收到导航指令（语音/MQTT）
   // 受理后先播「稍等，马上出发」再起身变形人形（先开口、立刻动）；
-  // 迎宾准备去迎宾点的导航不播（agent 已说过「好嘞，马上前去迎宾点」，
+  // 迎宾准备去迎宾点的导航不播（agent 已说过「整装待发，即刻就位」，
   // handle_welcome_prep 独立链路天然跳过）。空=禁用
   std::string navigate_depart_text_;
   // 重定位出发播报语（2026-10-18 现场需求）：仅 MQTT 下行的 relocate
   // 先播「马上开始重定位，请稍后」再起身变形人形；语料触发不播（agent
   // 已说「好的，这就在A点开始重定位」）。空=禁用
   std::string relocate_depart_text_;
+  // ---- 导航途中随机播报（2026-10-21 现场需求）----
+  // 安抚语料池（如「请不用着急，跟着我慢慢走」）：受理引导语播完后，
+  // 每隔 min~max 秒（随机）挑一句播报（随机取、不与上一条连续重复），
+  // 防导航途中长时间沉默太空；到达/取消/失败即停。
+  // 去迎宾点的导航（迎宾准备/App 下发）无顾客跟走，改用迎宾专用池
+  // navigate_chatter_welcome_texts（两池各自为空 = 对应场景不播）
+  std::vector<std::string> navigate_chatter_texts_;
+  std::vector<std::string> navigate_chatter_welcome_texts_;  // 去迎宾点专用池
+  std::string navigate_chatter_first_text_;         // 普通导航固定首句（空=不固定）
+  std::string navigate_chatter_welcome_first_text_;  // 去迎宾点固定首句（空=不固定）
+  int navigate_chatter_silence_seconds_{0};  // 一句播完到下一句的静默秒数
+                                         //（间隔不含播报时间；加载时钳 >=1；两池共用）
+  // 下一次途中播报时刻（nullopt = 未安排：不在导航/对应池为空/已到）；
+  // 仅 worker 线程访问，免锁；新导航 start 时重置、受理事件安排
+  std::optional<std::chrono::steady_clock::time_point> nav_chatter_next_at_;
+  bool nav_chatter_welcome_{false};      // 本次在途导航用迎宾语料池（受理时定格）
+  bool nav_chatter_first_pending_{false};  // 本次导航固定首句待播（受理时按配置定格）
+  std::size_t nav_chatter_last_index_{0};  // 上一条语料下标（防连续重复）
   std::string nav_point_display_;       // 本次导航点位显示名（映射表 name，引导语用）
   // ---- 点位映射表（v0.25.0 P-039）----
   std::string point_map_file_;          // 落盘路径（空=纯内存，联调用）
@@ -353,12 +387,21 @@ private:
   // 迎宾准备就位播报语：语料触发导航去迎宾点，到达变四足（摄像头收平）
   // 后最后播报（如「元气满满，做好准备迎接顾客」）。空串 = 禁用
   std::string welcome_prep_done_text_;
+  // 送客到达播报语（2026-10-21 现场需求）：语料触发送顾客回迎宾点，
+  // 到达变四足（摄像头收平）后最后播报的感谢语（如「再次感谢您对
+  // 比亚迪的支持，欢迎下次光临」）。空串 = 禁用（到达即释放业务）
+  std::string send_off_done_text_;
   // 迎宾准备到达后延迟变形秒数（2026-10-18 测试需求）：到达 Y 点收到
   // 导航 result 后不立即变形，等这么多秒再变四足。0 = 原行为（到达即变形）
   int welcome_prep_transform_delay_seconds_{0};
   // 当前在途导航是否迎宾准备（本地注入）：是则到达后变四足 + 播就位语，
   // 不做默认车型讲解词兜底、不播 navigate 引导语；仅 worker 线程访问
   bool nav_welcome_prep_{false};
+  // 当前在途导航是否送客（本地注入，2026-10-21 现场需求）：与迎宾准备
+  // 同款到达链路（变四足收摄像头），但最后播感谢语 send_off_done_text；
+  // 途中随机播报用普通安抚池（顾客在跟随，「请跟紧我」比迎宾赶路池
+  // 贴切）；仅 worker 线程访问
+  bool nav_send_off_{false};
 
   // ---- 迎宾变形（scene=welcome 时确保人形形态）：由 McTransform 模块
   // 承担，参数校验在 start() 内完成（welcome_transform 等）----
