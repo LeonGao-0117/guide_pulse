@@ -631,6 +631,61 @@ std::optional<TtsResultReceipt> build_nav_triggered_event(
   return build_up_receipt_envelope(robot_id, triggered_type, std::move(payload));
 }
 
+std::optional<TtsResultReceipt> build_nav_completed_event(
+  const std::string & robot_id, const std::string & completed_type,
+  const std::string & point_name, const std::string & trigger,
+  const std::string & outcome, const std::string & reason)
+{
+  // v0.30.0（P-044）语音触发动作终态上报：与 build_nav_triggered_event
+  // 对称（type/trigger/point_name 同规校验），在 outcome 上补出终态。
+  // failed reason 枚举同对应 *.result 的 failed 枚举（按指令分型）；
+  // 无 rejected——自主动作无指令可拒绝
+  std::array<const char *, 5> failed_reasons = {};
+  std::size_t failed_reason_count = 0;
+  if (completed_type == NAVIGATE_COMPLETED_TYPE) {
+    failed_reasons = {RESULT_REASON_BUSY, RESULT_REASON_POINT_NOT_FOUND,
+      RESULT_REASON_NAVIGATION_FAILED, RESULT_REASON_ABORTED,
+      RESULT_REASON_LOCALIZATION_LOST};
+    failed_reason_count = failed_reasons.size();
+  } else if (completed_type == RELOCATE_COMPLETED_TYPE) {
+    failed_reasons = {RESULT_REASON_BUSY, RESULT_REASON_POINT_NOT_FOUND,
+      RESULT_REASON_LOCALIZATION_FAILED, nullptr, nullptr};
+    failed_reason_count = 3;
+  } else {
+    return std::nullopt;
+  }
+  if (trigger != TRIGGER_VOICE) {
+    return std::nullopt;
+  }
+  const auto scalars = utf8_scalar_count(point_name);
+  if (scalars < 1U || scalars > POINT_NAME_MAX_SCALARS) {
+    return std::nullopt;
+  }
+  const bool outcome_ok =
+    outcome == ACTION_RESULT_SUCCESS || outcome == ACTION_RESULT_FAILED;
+  const bool reason_ok =
+    (outcome == ACTION_RESULT_SUCCESS && reason.empty()) ||
+    (outcome == ACTION_RESULT_FAILED &&
+      std::find(
+        failed_reasons.begin(), failed_reasons.begin() + failed_reason_count,
+        reason) != failed_reasons.begin() + failed_reason_count);
+  if (!outcome_ok || !reason_ok) {
+    return std::nullopt;
+  }
+  // 契约 additionalProperties=false：payload 恰好 point_name + trigger +
+  // outcome（+ failed 时的 reason），不得携带 operation_id（与
+  // *.triggered 同理：不关联任何下发指令）
+  json payload = {
+    {"point_name", point_name},
+    {"trigger", trigger},
+    {"outcome", outcome},
+  };
+  if (outcome == ACTION_RESULT_FAILED) {
+    payload["reason"] = reason;  // failed 必填（契约）
+  }
+  return build_up_receipt_envelope(robot_id, completed_type, std::move(payload));
+}
+
 std::vector<std::string> make_round_order(
   const std::vector<std::string> & texts, const std::string & mode)
 {

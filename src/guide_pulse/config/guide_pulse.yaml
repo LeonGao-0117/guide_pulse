@@ -22,7 +22,8 @@ guide_bridge:
     # ---- 现场常调项 ----
     # 二维码业务互斥窗口秒数（2026-10-17 现场需求：显示与取消二维码显示
     # 是两个业务，与其他业务互斥，超时 20s；只管互斥占用，二维码常驻
-    # 时长仍由 display_show_timeout_seconds 独立计时默认 180s）
+    # 时长仍由 display_show_timeout_seconds 独立计时默认 120s=2 分钟，
+    # 2026-10-22 现场需求全流程统一；切换场景各业务入口先撤屏不等超时）
     qr_business_timeout_seconds: 20
     # 真机航点导航：对接 t1_slam_nav_ws 的 /liwei_navigation/navigate
     # action（navigate=go / relocate=set_pose；接口文档见 t1_slam_nav_ws/
@@ -116,13 +117,13 @@ guide_bridge:
     # 迎宾引导语（2026-10-17 现场需求：迎宾先播引导语，播完（TtsStatus
     # 终态回流/字数估算兜底）再变形，变形完成播迎宾词；空串 = 禁用
     #（直接变形，回退原时序））
-    welcome_lead_text: "元气满满，小T来迎接我的顾客了。"
+    welcome_lead_text: "哈喽哈喽！电池满格，热情也满格"
     # 迎宾准备就位播报语（2026-10-18 现场需求：语料触发导航去迎宾点，
     # 到达变形四足、摄像头收平后最后播报；空串 = 禁用）
     welcome_prep_done_text: "元气满满，做好准备迎接顾客"
     # 送客到达播报语（2026-10-21 现场需求：语料触发送顾客回迎宾点，
     # 到达变形四足、摄像头收平后最后播报的感谢语；空串 = 禁用）
-    send_off_done_text: "再次感谢您对比亚迪的支持，欢迎下次光临"
+    send_off_done_text: "欢乐的时光过的特别快，又到时间讲拜拜！祝您一路绿灯、续航永不掉线，希望有我的陪伴，能给你带去满满的小惊喜，您可以扫码收下我们的选车小资料，方便您回去再慢慢对比，如果有需要可以随时和我们联系。"
     # 迎宾准备到达后延迟变形秒数（2026-10-18 测试需求）：到达 Y 点收到
     # 导航 result 后不立即变形，等这么多秒再变四足；0 = 原行为（到达即变形）
     welcome_prep_transform_delay_seconds: 5
@@ -141,6 +142,12 @@ guide_bridge:
     # 2026-10-17 现场需求：映射表是唯一权威，未命中直接拒绝，
     # 不再原样透传航点名；空串 = 禁用播报）
     point_map_unmatched_text: "未找到点位{point}，请重新配置映射表"
+    # MQTT scene=welcome 三场景路由（2026-10-22 现场需求）：后端下发
+    # texts 为三选一标记词「准备迎宾」「开始迎宾」「欢送顾客」时分别
+    # 触发 迎宾准备（导航去迎宾点，到达变四足播就位语）/ 原迎宾流程
+    # （迎宾词走映射表）/ 送客（到达播感谢语）——标记词内置匹配无需
+    # 配置，且不作 TTS 播报内容；下列语料是语音触发面 + MQTT 完整话术
+    # 形态的补充指令词（改一处双面生效）
     welcome_point_code: "Y"
     agent_monitor.welcome_phrases:       # agent 话术命中任一条 -> 迎宾（空=关闭）
       - "恭候光临，倒屣相迎"
@@ -159,7 +166,7 @@ guide_bridge:
                                          #  send_off_done_text；格式同上
                                          #  2026-10-21 现场需求
       - "迎宾|热情相送，宾至如归"
-    agent_monitor.qr_phrases:            # agent 话术命中任一条 -> 显示二维码3分钟（空=关闭）
+    agent_monitor.qr_phrases:            # agent 话术命中任一条 -> 显示二维码2分钟（空=关闭）
       - "收到，这就给您显示二维码，您可以扫描二维码留下您的个人信息哦"
     agent_monitor.qr_cancel_phrases:     # agent 话术命中任一条 -> 取消二维码显示（空=关闭；
                                          #  2026-10-17 现场需求：显示/取消是两个互斥业务，

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -92,22 +93,52 @@ private:
   void maintain_connection();   // 回调线程外的订阅恢复/上线通告（防 paho 自死锁）
   void handle_command(const CommandEvent & event);  // tts / tts.stop / scene / navigate / navigate.stop / point_map / show_qr / cancel_qr / relocate / welcome_prep（MQTT 下行 + 本地注入）
   void handle_scene(const CommandEvent & event);        // 迎宾模块入口
+  // MQTT 迎宾三场景路由（2026-10-22 现场需求）：App 下发 scene=welcome
+  // 的 texts 是小T应答话术（末尾一字不差带固定指令，小T提示词 §10.2）
+  // 或三选一短标记词（联调实测后端直接下发「准备迎宾」「开始迎宾」
+  // 「欢送顾客」），按指令分流——「整装待发，即刻就位」/「准备迎宾」
+  // 准备迎宾、「热情相送，宾至如归」/「欢送顾客」欢送顾客 -> 转
+  // handle_welcome_prep（MQTT 来源照发 scene.result 回执，成功发起导航
+  // 即 success；短标记词点位取 welcome_point_code，空则关键词「迎宾」）；
+  // 「恭候光临，倒屣相迎」/「开始迎宾」开始迎宾 -> 清除 texts（话术/
+  // 标记词不作迎宾词，迎宾词走映射表）返回 false 走原 handle_scene；
+  // 未命中任何指令不改写（兼容 v0.20.0 指定迎宾词）。标记词为内置
+  // 追加（declare_and_load_params，无需配置），长指令匹配语料与语音
+  // 触发同源（agent_monitor.* 配置），均归一化子串匹配
+  // （normalize/phrase_matches 同 AgentMonitor）——语音/MQTT 双触发面
+  // 一套指令词，改 yaml 一处即双面生效
+  bool route_welcome_scene(CommandEvent & event);
   void handle_navigate(const CommandEvent & event);     // 讲解模块入口
-  // 迎宾准备模块入口（2026-10-18 现场需求，仅本地注入：AgentMonitor 命中
-  // agent_monitor.welcome_prep_phrases 语料）：先确保人形（导航前置）->
-  // 导航去迎宾点 -> 到达后变四足收摄像头 -> 播就位语。不发协议回执。
+  // 导航指令话术甄别（2026-10-22 现场需求）：App 下发 navigate 的 texts
+  // 若是小T带看复述话术（「要去看X，没问题」类指令）则 true——讲解词
+  // 应回退映射表而非照播话术。短语来源：navigate_phrase_template 前后
+  // 缀特征 + 静态 agent_monitor.navigate_phrases（与语音触发同源）
+  bool navigate_texts_are_agent_reply(const std::vector<std::string> & texts) const;
+  // 迎宾准备模块入口（2026-10-18 现场需求，原仅本地注入：AgentMonitor
+  // 命中 agent_monitor.welcome_prep_phrases 语料；2026-10-22 起 MQTT
+  // scene 路由可达）：先确保人形（导航前置）-> 导航去迎宾点 -> 到达后
+  // 变四足收摄像头 -> 播就位语。返回 true = 导航已发起（MQTT 路由来源
+  // 据此回 scene.result(success)），false = 前置校验失败被拒（映射表空/
+  // 点位未命中/双足未确认，MQTT 来源回 failed/scene_failed）。
   // send_off=true 为送客模式（2026-10-21 现场需求，type=send_off 注入，
   // 命中 agent_monitor.send_off_phrases 语料）：链路同款，仅到达后播
   // 感谢语 send_off_done_text（不再播就位语）
-  void handle_welcome_prep(const CommandEvent & event, bool send_off = false);
+  bool handle_welcome_prep(const CommandEvent & event, bool send_off = false);
+  // 送客二维码收敛（2026-10-22 现场需求，仅 worker 线程）：收割
+  // send_off_qr_task_ 后台准备结果；show=true 且准备成功时 play_prepared
+  // 上屏（到达变四足完成后、感谢语开播前——感谢语提及「扫码」，先屏
+  // 后声），show=false 仅收割防泄漏（导航失败/停止路径，不显示）。
+  // future 无效（非送客/未启动）时 no-op。上屏失败只告警不阻断感谢语
+  void finish_send_off_qr(bool show, const std::string & source);
   void handle_point_map(const CommandEvent & event);    // 点位映射表全量替换入口（v0.25.0）
   void handle_show_qr(const CommandEvent & event);      // 语料触发二维码显示入口（本地注入，占业务互斥 20s）
   void handle_cancel_qr(const CommandEvent & event);    // 语料触发取消二维码显示入口（本地注入，占业务互斥 20s）
   void handle_relocate(const CommandEvent & event);     // 地图重定位入口（MQTT 下行 + 本地注入）：set_pose 受理 -> 等导航模块验收（worker 轮询）-> 终态回执+播报
-  // 重定位终态收尾（worker 线程）：回执 relocate.result（验收通过=success /
-  // 验收失败或 30s 超时=failed:localization_failed；语料触发不回执，改为
-  // 验收通过时发 relocate.triggered 上报——2026-10-19 需求：只有重定位
-  // 成功才发消息给后端）-> 释放业务占用 -> 成功时播报（texts 优先，缺省
+  // 重定位终态收尾（worker 线程）：MQTT 下行回执 relocate.result（验收
+  // 通过=success / 验收失败或 30s 超时=failed:localization_failed）；
+  // 语料触发验收通过时发 relocate.triggered 上报 + relocate.completed
+  // 终态上报（P-044，替代原孤儿 relocate.result 方案；失败仍都不发）
+  // -> 释放业务占用 -> 成功时播报（texts 优先，缺省
   // 「{point_name}点 重定位 成功」，重定位前后空格分段防 TTS 连读）；
   // 失败播 relocate_failed_text 提示（2026-10-17 现场需求）。业务在回执
   // 发出后才结束
@@ -169,6 +200,19 @@ private:
   // 失败的语音触发）。一次性事件不进 receipt_cache_
   //（无指令重发场景，publish 失败与回执同策略仅告警）
   void send_nav_triggered(const std::string & triggered_type, const std::string & point_name);
+  // v0.30.0（P-044）语音触发动作终态上报：发布恰好一条
+  // navigate.completed / relocate.completed（payload {point_name,
+  // trigger:voice, outcome, reason?}，无 operation_id），与
+  // send_nav_triggered 一一对应——调用方以 nav_triggered_ 把关：只有
+  // 发过 *.triggered 的语料动作才发终态（协议要求两事件按时间序一一
+  // 对应，未发 triggered 的动作不补孤儿 completed）。到达/成功回
+  // success，失败（含兜底超时归并 navigation_failed /
+  // localization_failed）回 failed+枚举 reason，被 navigate.stop /
+  // tts.stop 打断回 failed:aborted；掉线/重启无终态（shutdown 不发）。
+  // 一次性事件不进 receipt_cache_（同 triggered 策略）
+  void send_nav_completed(
+    const std::string & completed_type, const std::string & point_name,
+    const std::string & outcome, const std::string & reason = "");
   // 回执发布公共段：查缓存 -> 构造 -> 缓存（含淘汰）-> 发布（worker 线程）
   void publish_receipt(
     const std::string & operation_id, std::optional<TtsResultReceipt> receipt);
@@ -305,8 +349,35 @@ private:
   // scene 未带 texts 时取映射表该 code 条目的 text 作迎宾词；表未配
   // text 则本次迎宾不播词。空串 = 禁用映射表迎宾词）
   std::string welcome_point_code_;
+  // ---- MQTT 迎宾三场景路由表（2026-10-22 现场需求，仅 worker 线程
+  // 访问；declare_and_load_params 从语料触发同款配置解析填充 + 内置
+  // 追加短标记词（后端实测 texts 为「准备迎宾」「开始迎宾」「送别
+  // 顾客」三选一），匹配见 route_welcome_scene）----
+  struct WelcomeSceneRoute
+  {
+    std::string point;   // 迎宾点点位名（welcome_prep/send_off 用：
+                         // 名称关键词如「迎宾」或直接 code 如 Y，经映射
+                         // 表两级解析+关键词兜底，与语料触发同口径）
+    std::string phrase;  // 触发指令原文（匹配时经 normalize_phrase_text）
+  };
+  // 准备迎宾指令表（yaml 源：agent_monitor.welcome_prep_phrases
+  // 「点位名|指令」；内置追加标记词「准备迎宾」，点位取迎宾点）
+  std::vector<WelcomeSceneRoute> welcome_prep_routes_;
+  // 欢送顾客指令表（yaml 源：agent_monitor.send_off_phrases
+  // 「点位名|指令」；内置追加标记词「欢送顾客」，点位取迎宾点）
+  std::vector<WelcomeSceneRoute> send_off_routes_;
+  // 开始迎宾指令表（yaml 源：agent_monitor.welcome_phrases + 内置标记词
+  // 「开始迎宾」；命中则 scene texts 是话术/标记词，清除后迎宾词走映射表）
+  std::vector<std::string> welcome_scene_phrases_;
+  // 导航语料动态生成模板（源：agent_monitor.navigate_phrase_template，
+  // {point} 占位；甄别 navigate texts 是否带看复述话术用，见
+  // navigate_texts_are_agent_reply）
+  std::string navigate_phrase_template_;
+  // 静态导航指令短语表（源：agent_monitor.navigate_phrases「点位名|语料」
+  // 的语料部分，归一化后存）
+  std::vector<std::string> navigate_route_phrases_;
   // 迎宾引导语（2026-10-17 现场需求：scene=welcome 到达后先播引导语
-  //「元气满满，小T来迎接我的顾客了」，播完再变形，变形完成播迎宾词）。
+  //「哈喽哈喽！电池满格，热情也满格」，播完再变形，变形完成播迎宾词）。
   // 空 = 禁用（跳过引导语直接变形，回退原时序）
   std::string welcome_lead_text_;
   int welcome_flow_timeout_seconds_;    // 迎宾占用兜底超时：终态回流即释放
@@ -387,9 +458,10 @@ private:
   // 迎宾准备就位播报语：语料触发导航去迎宾点，到达变四足（摄像头收平）
   // 后最后播报（如「元气满满，做好准备迎接顾客」）。空串 = 禁用
   std::string welcome_prep_done_text_;
-  // 送客到达播报语（2026-10-21 现场需求）：语料触发送顾客回迎宾点，
-  // 到达变四足（摄像头收平）后最后播报的感谢语（如「再次感谢您对
-  // 比亚迪的支持，欢迎下次光临」）。空串 = 禁用（到达即释放业务）
+  // 送客到达播报语（2026-10-21 现场需求；2026-10-22 换长文案）：语料
+  // 触发送顾客回迎宾点，到达变四足（摄像头收平）后最后播报的感谢语
+  //（提及「扫码收选车小资料」，与送客二维码上屏配套，见 send_off_qr_
+  // task_）。空串 = 禁用（到达即释放业务）
   std::string send_off_done_text_;
   // 迎宾准备到达后延迟变形秒数（2026-10-18 测试需求）：到达 Y 点收到
   // 导航 result 后不立即变形，等这么多秒再变四足。0 = 原行为（到达即变形）
@@ -402,6 +474,16 @@ private:
   // 途中随机播报用普通安抚池（顾客在跟随，「请跟紧我」比迎宾赶路池
   // 贴切）；仅 worker 线程访问
   bool nav_send_off_{false};
+  // 送客二维码后台准备任务（2026-10-22 现场需求：送客到达变形完成后
+  // 上屏二维码，感谢语提及「扫码收选车小资料」配套）。阶段 1（缓存
+  // 比对/下载 + 转码 + 推送，耗时大头 ~3.5s）在 handle_welcome_prep
+  // 受理送客时后台启动、与导航并行；到达分支 finish_send_off_qr(true)
+  // 收割后 play_prepared 上屏（先屏后声，与迎宾同款时序）。线程模型同
+  // 迎宾 handle_scene 的 qr_task：prepare 全程 subprocess 不触碰 ROS
+  // 客户端，跨线程 happens-before 由 future.get() 建立；失败/停止路径
+  // finish_send_off_qr(false) 收割防泄漏（不显示）。仅 worker 线程
+  // 访问成员本身
+  std::future<bool> send_off_qr_task_;
 
   // ---- 迎宾变形（scene=welcome 时确保人形形态）：由 McTransform 模块
   // 承担，参数校验在 start() 内完成（welcome_transform 等）----
@@ -495,6 +577,15 @@ private:
   // 查点位映射表导航）：是则到达/失败/中止均不发协议回执（Server
   // 不认识本地铸造的 operation_id），仅 worker 线程访问，受理时赋值
   bool nav_local_{false};
+
+  // 在途语料触发的导航是否已发 navigate.triggered（P-044 配套标志，
+  // 仅 worker 线程访问）：*.completed 与 *.triggered 一一对应（协议
+  // v0.30.0），未发 triggered 的动作（前置重定位失败仍照常出发的
+  // 导航）终态也不发 completed——否则 App 收到无 triggered 可配对的
+  // 孤儿终态。handle_navigate / handle_welcome_prep 发 triggered 时
+  // 置 true，各终态路径（到达/失败/中止）与 nav_operation_id_ 一并
+  // 清空
+  bool nav_triggered_{false};
 
   // ---- 重定位等待态（2026-10-17：业务终态 = 导航模块验收结果，非受理）。
   // 仅 worker 线程访问，免锁；relocate_pending_=true 期间业务互斥生效

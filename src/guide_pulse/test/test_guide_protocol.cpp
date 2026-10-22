@@ -1096,4 +1096,131 @@ TEST(BuildNavTriggeredTest, EachBuildGetsFreshEventId)
   EXPECT_NE(a->event_id, b->event_id);
 }
 
+// ---------------------------------------------------------------------------
+// v0.30.0（P-044）navigate.completed / relocate.completed 终态上报构造
+// ---------------------------------------------------------------------------
+using guide_pulse::ACTION_RESULT_FAILED;
+using guide_pulse::ACTION_RESULT_REJECTED;
+using guide_pulse::ACTION_RESULT_SUCCESS;
+using guide_pulse::NAVIGATE_COMPLETED_TYPE;
+using guide_pulse::RELOCATE_COMPLETED_TYPE;
+using guide_pulse::RESULT_REASON_ABORTED;
+using guide_pulse::RESULT_REASON_LOCALIZATION_FAILED;
+using guide_pulse::RESULT_REASON_NAVIGATION_FAILED;
+using guide_pulse::TRIGGER_VOICE;
+
+TEST(BuildNavCompletedTest, BuildsSuccessEnvelope)
+{
+  // 两类型同构：direction=up、success 时 payload 恰好 point_name +
+  // trigger + outcome（禁 reason），不得携带 operation_id（契约
+  // additionalProperties=false）
+  for (const char * type : {NAVIGATE_COMPLETED_TYPE, RELOCATE_COMPLETED_TYPE}) {
+    const auto receipt = guide_pulse::build_nav_completed_event(
+      "robot-001", type, "比亚迪ATTO 1", TRIGGER_VOICE, ACTION_RESULT_SUCCESS);
+    ASSERT_TRUE(receipt.has_value()) << type;
+    const auto envelope = json::parse(receipt->envelope_json);
+    EXPECT_EQ(envelope["spec_version"], "1.0");
+    EXPECT_EQ(envelope["robot_id"], "robot-001");
+    EXPECT_EQ(envelope["direction"], "up");
+    EXPECT_EQ(envelope["type"], type);
+    EXPECT_EQ(envelope["payload"]["point_name"], "比亚迪ATTO 1");
+    EXPECT_EQ(envelope["payload"]["trigger"], "voice");
+    EXPECT_EQ(envelope["payload"]["outcome"], "success");
+    EXPECT_FALSE(envelope["payload"].contains("reason"));
+    EXPECT_FALSE(envelope["payload"].contains("operation_id"));
+    EXPECT_EQ(envelope["payload"].size(), 3U);
+  }
+}
+
+TEST(BuildNavCompletedTest, BuildsFailedEnvelopeWithPerTypeReason)
+{
+  // failed 必填 reason：navigate.completed 可用 aborted/navigation_failed，
+  // relocate.completed 可用 localization_failed；reason 枚举按指令分型
+  //（同对应 *.result 的 failed 枚举）
+  const auto nav = guide_pulse::build_nav_completed_event(
+    "robot-001", NAVIGATE_COMPLETED_TYPE, "A", TRIGGER_VOICE,
+    ACTION_RESULT_FAILED, RESULT_REASON_ABORTED);
+  ASSERT_TRUE(nav.has_value());
+  auto nav_envelope = json::parse(nav->envelope_json);
+  EXPECT_EQ(nav_envelope["payload"]["outcome"], "failed");
+  EXPECT_EQ(nav_envelope["payload"]["reason"], "aborted");
+  EXPECT_EQ(nav_envelope["payload"].size(), 4U);
+
+  const auto reloc = guide_pulse::build_nav_completed_event(
+    "robot-001", RELOCATE_COMPLETED_TYPE, "A", TRIGGER_VOICE,
+    ACTION_RESULT_FAILED, RESULT_REASON_LOCALIZATION_FAILED);
+  ASSERT_TRUE(reloc.has_value());
+  auto reloc_envelope = json::parse(reloc->envelope_json);
+  EXPECT_EQ(reloc_envelope["payload"]["outcome"], "failed");
+  EXPECT_EQ(reloc_envelope["payload"]["reason"], "localization_failed");
+}
+
+TEST(BuildNavCompletedTest, RejectsInvalidArguments)
+{
+  // 未知上报类型（tts.result / navigate.result / triggered 均非本构造面）
+  EXPECT_FALSE(guide_pulse::build_nav_completed_event(
+    "robot-001", "tts.result", "A", TRIGGER_VOICE, ACTION_RESULT_SUCCESS));
+  EXPECT_FALSE(guide_pulse::build_nav_completed_event(
+    "robot-001", guide_pulse::NAVIGATE_RESULT_TYPE, "A", TRIGGER_VOICE,
+    ACTION_RESULT_SUCCESS));
+  EXPECT_FALSE(guide_pulse::build_nav_completed_event(
+    "robot-001", guide_pulse::NAVIGATE_TRIGGERED_TYPE, "A", TRIGGER_VOICE,
+    ACTION_RESULT_SUCCESS));
+  // 触发类型可扩展枚举：当前唯一值 voice
+  EXPECT_FALSE(guide_pulse::build_nav_completed_event(
+    "robot-001", NAVIGATE_COMPLETED_TYPE, "A", "app", ACTION_RESULT_SUCCESS));
+  // point_name 1..64 Unicode 标量：空串 / 65 标量均非法（按码点非字节）
+  EXPECT_FALSE(guide_pulse::build_nav_completed_event(
+    "robot-001", NAVIGATE_COMPLETED_TYPE, "", TRIGGER_VOICE,
+    ACTION_RESULT_SUCCESS));
+  EXPECT_FALSE(guide_pulse::build_nav_completed_event(
+    "robot-001", RELOCATE_COMPLETED_TYPE, std::string(65, 'A'), TRIGGER_VOICE,
+    ACTION_RESULT_SUCCESS));
+  // 没有 rejected：自主动作无指令可拒绝（契约明确排除该分支）
+  EXPECT_FALSE(guide_pulse::build_nav_completed_event(
+    "robot-001", NAVIGATE_COMPLETED_TYPE, "A", TRIGGER_VOICE,
+    ACTION_RESULT_REJECTED, TTS_REASON_COMMAND_EXPIRED));
+  // success 禁 reason / failed 必填 reason
+  EXPECT_FALSE(guide_pulse::build_nav_completed_event(
+    "robot-001", NAVIGATE_COMPLETED_TYPE, "A", TRIGGER_VOICE,
+    ACTION_RESULT_SUCCESS, RESULT_REASON_NAVIGATION_FAILED));
+  EXPECT_FALSE(guide_pulse::build_nav_completed_event(
+    "robot-001", NAVIGATE_COMPLETED_TYPE, "A", TRIGGER_VOICE,
+    ACTION_RESULT_FAILED));
+  EXPECT_FALSE(guide_pulse::build_nav_completed_event(
+    "robot-001", NAVIGATE_COMPLETED_TYPE, "A", TRIGGER_VOICE,
+    ACTION_RESULT_FAILED, ""));
+  // failed reason 按指令分型：navigation_failed/aborted 不属于
+  // relocate.completed 的枚举（localization_failed 归 relocate，
+  // navigate 侧用 localization_lost）
+  EXPECT_FALSE(guide_pulse::build_nav_completed_event(
+    "robot-001", RELOCATE_COMPLETED_TYPE, "A", TRIGGER_VOICE,
+    ACTION_RESULT_FAILED, RESULT_REASON_NAVIGATION_FAILED));
+  EXPECT_FALSE(guide_pulse::build_nav_completed_event(
+    "robot-001", RELOCATE_COMPLETED_TYPE, "A", TRIGGER_VOICE,
+    ACTION_RESULT_FAILED, RESULT_REASON_ABORTED));
+  EXPECT_FALSE(guide_pulse::build_nav_completed_event(
+    "robot-001", NAVIGATE_COMPLETED_TYPE, "A", TRIGGER_VOICE,
+    ACTION_RESULT_FAILED, RESULT_REASON_LOCALIZATION_FAILED));
+  // 未知 reason 一律拒绝
+  EXPECT_FALSE(guide_pulse::build_nav_completed_event(
+    "robot-001", NAVIGATE_COMPLETED_TYPE, "A", TRIGGER_VOICE,
+    ACTION_RESULT_FAILED, "transform_failed"));
+}
+
+TEST(BuildNavCompletedTest, EachBuildGetsFreshEventId)
+{
+  // 一次动作恰好一条：每次构造独立 event_id（QoS 1 重发须由调用方复用
+  // 同一信封原文，与 triggered/回执面同策略）
+  const auto a = guide_pulse::build_nav_completed_event(
+    "robot-001", NAVIGATE_COMPLETED_TYPE, "A", TRIGGER_VOICE,
+    ACTION_RESULT_SUCCESS);
+  const auto b = guide_pulse::build_nav_completed_event(
+    "robot-001", NAVIGATE_COMPLETED_TYPE, "A", TRIGGER_VOICE,
+    ACTION_RESULT_SUCCESS);
+  ASSERT_TRUE(a.has_value());
+  ASSERT_TRUE(b.has_value());
+  EXPECT_NE(a->event_id, b->event_id);
+}
+
 }  // namespace

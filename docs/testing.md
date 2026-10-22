@@ -35,7 +35,7 @@ backend_simulator → mosquitto(:1884) → guide_bridge → mock_tts_service(SDK
 
 1. **tts 基线**：下发 tts → Mock TTS 收到第一条 → 收到 `tts.result(accepted)`；
 2. **迎宾**：下发 `scene(welcome)` 无 texts → 先播引导语
-   `welcome_lead_text`（「元气满满，小T来迎接我的顾客了」，2026-10-17
+   `welcome_lead_text`（「哈喽哈喽！电池满格，热情也满格」，2026-10-17
    需求）→ 播完变形（Mock 运控完整转移序列，断言引导语播完日志先于
    首条变形动作）→ 变形完成后播默认迎宾词一轮（出现后不再重复——
    单轮语义）；带 texts → 播指令词；导航/重定位用例前先 `point-map`

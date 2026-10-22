@@ -115,8 +115,8 @@ int main(int argc, char ** argv)
     monitor_cfg.rules.push_back({"welcome", "", welcome_phrases});
   }
   // 二维码语料（agent 说「这就给您显示二维码」类话术 -> 屏幕显示默认
-  // 二维码 3 分钟，等价迎宾二维码的独立显示路径；2026-10-17 起为互斥
-  // 业务，占 20s 窗口）
+  // 二维码 2 分钟（2026-10-22 现场需求：全流程统一时长），等价迎宾
+  // 二维码的独立显示路径；2026-10-17 起为互斥业务，占 20s 窗口）
   const auto qr_phrases =
     node->get_parameter("agent_monitor.qr_phrases").as_string_array();
   if (!qr_phrases.empty()) {
@@ -292,7 +292,8 @@ int main(int argc, char ** argv)
   //（点位解析/导航开始/停止导航/二维码显示等）自然衔接）：welcome 注入
   // scene=welcome（与 MQTT 下发迎宾指令完全同链路：互斥窗口/变形/
   // 二维码/播报/伴随动作全部复用）；show_qr / cancel_qr 注入本地纯屏幕
-  // 指令（默认二维码上屏常驻 3 分钟 / 撤屏恢复默认表情，worker 串行
+  // 指令（默认二维码上屏常驻 2 分钟（2026-10-22 全流程统一时长） /
+  // 撤屏恢复默认表情，worker 串行
   // 处理；2026-10-17 起两者各为互斥业务，占 qr_business_timeout_seconds
   //（默认 20s）窗口）；relocate 注入本地 relocate 指令（纯定位：point
   // 航点上 set_pose 重定位，机器人不动，等待验收期占业务互斥）；

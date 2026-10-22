@@ -253,14 +253,22 @@
   播报会话：播完后**继续常驻**，
   直至 ①任意新业务（tts/scene/navigate/tts.stop）到达立即取消
   （新 scene 重入则重新显示并重置超时）或 ②`display_show_timeout_seconds`
-  （默认 180s）超时自动恢复默认表情——二者取先到者。
+  （默认 120s=2 分钟，2026-10-22 现场需求：全流程统一时长）超时自动
+  恢复默认表情——二者取先到者。
+- **切换场景先撤屏（2026-10-22 现场需求）**：切到下一场景（导览
+  navigate / 迎宾 scene·welcome_prep / 送客 send_off / 重定位
+  relocate / 播报 tts·tts.stop）时，常驻中的二维码一律在业务入口
+  **先恢复默认表情让位**，不等 2 分钟超时，也不等新场景自己的二维码
+  上屏（迎宾/送客的新二维码按各自时序在变形完成后才上屏）；被互斥
+  拒绝的指令不切换场景，二维码保留。
 - **语料触发二维码显示（2026-10-16；2026-10-17 改互斥业务）**：
   AgentMonitor 监测 agent TTS 应答话术（trace_id 回查运控板日志原文，
   `agent_monitor.qr_phrases` 语料表，如「收到，这就给您显示二维码，您
   可以扫描二维码留下您的个人信息哦。」）命中 -> 本地注入 `show_qr`
   指令（仅本地类型，与 MQTT 下行同 worker 串行链路）->
   `handle_show_qr` 显示默认二维码图片（`config/QRCode.png`），常驻
-  `display_show_timeout_seconds`（默认 180s=3 分钟）。**2026-10-17
+  `display_show_timeout_seconds`（默认 120s=2 分钟，2026-10-22 现场
+  需求：全流程统一时长）。**2026-10-17
   现场需求起为互斥业务**：显示二维码是一个业务，上屏成功即占
   kShowQr 业务 `qr_business_timeout_seconds`（默认 20s）互斥窗口，
   期间其他业务（tts/scene/navigate/relocate）被拒（App 下发 tts 回

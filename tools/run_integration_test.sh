@@ -223,9 +223,9 @@ $SIM welcome > /dev/null 2>&1
 wait_log "迎宾开始" "${WORK_DIR}/bridge.log" 5 || fail "未见迎宾开始日志"
 wait_log "迎宾词取自映射表迎宾点 Y" "${WORK_DIR}/bridge.log" 5 \
   || fail "迎宾词未取自映射表迎宾点"
-# 迎宾引导语（2026-10-17 现场需求）：先播 TTS「元气满满，小T来迎接我
-# 的顾客了」，播完再变形，变形完成后才播迎宾词——三段顺序都要断言
-wait_log "text='元气满满，小T来迎接我的顾客了。'" "${WORK_DIR}/mock_tts.log" 5 \
+# 迎宾引导语（2026-10-17 现场需求）：先播 TTS「哈喽哈喽！电池满格，
+# 热情也满格」，播完再变形，变形完成后才播迎宾词——三段顺序都要断言
+wait_log "text='哈喽哈喽！电池满格，热情也满格'" "${WORK_DIR}/mock_tts.log" 5 \
   || fail "未播迎宾引导语（welcome_lead_text）"
 wait_log "迎宾引导语播完（.*），开始变形" "${WORK_DIR}/bridge.log" 10 \
   || fail "未见引导语播完日志"

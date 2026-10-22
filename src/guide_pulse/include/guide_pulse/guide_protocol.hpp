@@ -11,7 +11,10 @@
 // 点位映射表同步 P-039 + v0.21.0 relocate 地图重定位（2026-10-17 接入
 // MQTT 下行处理，含 relocate.result 回执） + v0.26.0 语音触发导航/
 // 重定位上报 navigate.triggered/relocate.triggered P-040）+ v0.28.0
-// point_map 条目新增可选播放文本 text P-042（2026-10-19 接入）。
+// point_map 条目新增可选播放文本 text P-042（2026-10-19 接入）
+// + v0.30.0 语音触发动作完成上报 navigate/relocate.completed P-044
+//（2026-10-22 接入，语料触发动作终态不再发本地 operation_id 的孤儿
+// *.result）。
 // ============================================================================
 #pragma once
 
@@ -77,6 +80,27 @@ inline constexpr const char * SCENE_WELCOME = "welcome";
 // ---------------------------------------------------------------------------
 inline constexpr const char * NAVIGATE_TRIGGERED_TYPE = "navigate.triggered";
 inline constexpr const char * RELOCATE_TRIGGERED_TYPE = "relocate.triggered";
+
+// ---------------------------------------------------------------------------
+// 语音触发动作完成上报（v0.30.0 P-044，协议详见 RobotCar
+// command-protocol.md「navigate.completed / relocate.completed」章节）：
+// 语音触发的导航/重定位**完成或失败确定**时发布恰好一条终态上报，
+// 与 *.triggered 对称（payload 同样无 operation_id，不关联任何下发
+// 指令），在 outcome 上补出终态。App 由此得知「机器人自己去的那个
+// 点，最后到没到」。outcome = success（禁 reason：到达点位/重定位
+// 成功）/ failed（必填 reason，枚举同对应 *.result 的 failed 枚举：
+// navigate.completed 为 busy/point_not_found/navigation_failed/aborted/
+// localization_lost；relocate.completed 为 busy/point_not_found/
+// localization_failed）；**没有 rejected**——自主动作无指令可拒绝，
+// 本地拒绝触发时连 *.triggered 都不发，自然也没有终态。与
+// *.triggered 一一对应、按时间序关联（单机串行动作，不引入共享关联
+// ID）。Server 按 event_id 去重后推 App（WebSocket
+// robot.navigation.completed，payload {command, point_name, trigger,
+// outcome, reason?}）。掉线/重启则无终态（App 不得把「没收到
+// completed」当失败）
+// ---------------------------------------------------------------------------
+inline constexpr const char * NAVIGATE_COMPLETED_TYPE = "navigate.completed";
+inline constexpr const char * RELOCATE_COMPLETED_TYPE = "relocate.completed";
 
 // 触发类型 trigger（可扩展枚举，当前唯一值 voice；扩枚举须先改契约
 // 再改这里，同 SCENE_WELCOME 模式）
@@ -243,6 +267,22 @@ std::optional<TtsResultReceipt> build_action_result_event(
 std::optional<TtsResultReceipt> build_nav_triggered_event(
   const std::string & robot_id, const std::string & triggered_type,
   const std::string & point_name, const std::string & trigger);
+
+// 构造 navigate.completed / relocate.completed 语音触发动作终态上报
+// 信封（v0.30.0 P-044，仅上行自主事件，与 build_nav_triggered_event
+// 对称）。completed_type 仅接受 NAVIGATE_COMPLETED_TYPE /
+// RELOCATE_COMPLETED_TYPE；trigger 仅接受 TRIGGER_VOICE；point_name
+// 须为 1..64 个 Unicode 标量（应与同一次动作的 *.triggered 携带值
+// 一致）。outcome：success（reason 必须为空）/ failed（reason 必填
+// 且为该指令的 failed 枚举之一——navigate.completed：busy /
+// point_not_found / navigation_failed / aborted / localization_lost；
+// relocate.completed：busy / point_not_found / localization_failed）；
+// 无 rejected（自主动作无指令可拒绝）。payload 无 operation_id
+//（契约：不关联任何下发指令）。参数非法返回 nullopt
+std::optional<TtsResultReceipt> build_nav_completed_event(
+  const std::string & robot_id, const std::string & completed_type,
+  const std::string & point_name, const std::string & trigger,
+  const std::string & outcome, const std::string & reason = "");
 
 // 生成一轮播放顺序：sequence 原序返回；shuffle 每轮重新洗牌（Fisher-Yates）。
 // 契约建议 shuffle 每轮开始前重新洗牌，避免固定顺序。

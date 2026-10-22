@@ -19,6 +19,7 @@
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <nlohmann/json.hpp>
 
+#include "guide_pulse/agent_monitor.hpp"  // normalize_phrase_text/phrase_matches（迎宾三场景路由匹配）
 #include "guide_pulse/service_call.hpp"
 
 namespace guide_pulse
@@ -145,7 +146,10 @@ void MqttGuideBridgeNode::declare_and_load_params()
     "display_remote_pass", "");  // 空禁用显示；亦可环境变量注入后写入参数
   declare_parameter<std::string>("display_remote_dir", "/home/run/screen_display");
   declare_parameter<int>("display_request_timeout_seconds", 5);
-  declare_parameter<int>("display_show_timeout_seconds", 180);  // 3 分钟
+  // 二维码常驻显示统一超时（2026-10-22 现场需求：不分流程——语料触发
+  // show_qr / 迎宾 / 送客二维码一律 2 分钟到点撤屏恢复默认表情；切到
+  // 下一场景（导览/迎宾/送客等）不等超时，各业务入口先 cancel 让位）
+  declare_parameter<int>("display_show_timeout_seconds", 120);  // 2 分钟
   // 二维码业务（show_qr/cancel_qr）互斥窗口秒数（2026-10-17 现场需求：
   // 显示与取消二维码显示是两个业务，各占此窗口与其他业务互斥；默认
   // 20s。只管互斥占用，二维码常驻时长仍由 display_show_timeout_seconds
@@ -296,16 +300,20 @@ void MqttGuideBridgeNode::declare_and_load_params()
   // 兜底）再变形，变形完成播迎宾词。空串 = 禁用（直接进变形，回退原
   // 时序）。MQTT 下行与语料触发共用
   declare_parameter<std::string>(
-    "welcome_lead_text", "元气满满，小T来迎接我的顾客了。");
+    "welcome_lead_text", "哈喽哈喽！电池满格，热情也满格");
   // 迎宾准备就位播报语（2026-10-18 现场需求）：语料触发导航去迎宾点，
   // 到达变四足（摄像头收平）后最后播报。空串 = 禁用
   declare_parameter<std::string>(
     "welcome_prep_done_text", "元气满满，做好准备迎接顾客");
-  // 送客到达播报语（2026-10-21 现场需求）：语料触发送顾客回迎宾点，
-  // 到达变四足（摄像头收平）后最后播报的感谢语。空串 = 禁用（到达即
+  // 送客到达播报语（2026-10-21 现场需求；2026-10-22 换长文案，语料
+  // 提及「扫码收选车小资料」——与送客二维码上屏配套）：语料触发送顾客
+  // 回迎宾点，到达变四足（摄像头收平）后最后播报。空串 = 禁用（到达即
   // 释放业务）
   declare_parameter<std::string>(
-    "send_off_done_text", "再次感谢您对比亚迪的支持，欢迎下次光临");
+    "send_off_done_text",
+    "欢乐的时光过的特别快，又到时间讲拜拜！祝您一路绿灯、续航永不掉线，"
+    "希望有我的陪伴，能给你带去满满的小惊喜，您可以扫码收下我们的选车"
+    "小资料，方便您回去再慢慢对比，如果有需要可以随时和我们联系。");
   // 迎宾准备到达后延迟变形秒数（2026-10-18 测试需求）：到达 Y 点收到
   // 导航 result 后不立即变形，等这么多秒再变四足。0 = 原行为（到达即变形）
   declare_parameter<int>("welcome_prep_transform_delay_seconds", 0);
@@ -326,7 +334,7 @@ void MqttGuideBridgeNode::declare_and_load_params()
   declare_parameter<std::vector<std::string>>("agent_monitor.welcome_phrases",
     std::vector<std::string>{});
   // 命中任一语料 -> 屏幕显示默认二维码 display_show_timeout_seconds
-  //（默认 180s=3 分钟）。空列表 = 关闭
+  //（默认 120s=2 分钟，2026-10-22 现场需求统一时长）。空列表 = 关闭
   declare_parameter<std::vector<std::string>>("agent_monitor.qr_phrases",
     std::vector<std::string>{});
   // 命中任一语料 -> 取消二维码显示（2026-10-17 现场需求：agent 说
@@ -557,6 +565,78 @@ void MqttGuideBridgeNode::declare_and_load_params()
     get_parameter("welcome_prep_transform_delay_seconds").as_int()));
   welcome_flow_timeout_seconds_ = std::max(1, static_cast<int>(
     get_parameter("welcome_flow_timeout_seconds").as_int()));
+
+  // ---- MQTT 迎宾三场景路由表（2026-10-22 现场需求）----
+  // 复用语料触发同款配置（语音/MQTT 双触发面一套指令词，改 yaml 一处
+  // 即双面生效）：welcome_prep/send_off 条目格式「点位名|指令」，welcome
+  // 条目即指令本身。解析校验与 main.cpp 注入 AgentMonitor 同款（非法
+  // 条目告警跳过，不影响另一触发面）。先拷贝再迭代（as_string_array
+  // 返回 Parameter 内部引用，range-for 临时 Parameter 会悬空，同款
+  // 真机踩坑注释）
+  {
+    const auto load_routes =
+      [this](const char * name, std::vector<WelcomeSceneRoute> & routes) {
+        const auto items = get_parameter(name).as_string_array();
+        for (const auto & item : items) {
+          const auto sep = item.find('|');
+          if (sep == std::string::npos || sep == 0 || sep + 1 >= item.size()) {
+            RCLCPP_WARN(
+              get_logger(),
+              "%s 格式非法（应为 点位名|指令），MQTT 迎宾路由跳过该条: 「%s」",
+              name, item.c_str());
+            continue;
+          }
+          WelcomeSceneRoute route;
+          route.point = item.substr(0, sep);
+          route.phrase = item.substr(sep + 1);
+          if (normalize_phrase_text(route.phrase).empty()) {
+            RCLCPP_WARN(
+              get_logger(),
+              "%s 指令部分归一化后为空（纯标点/空白），MQTT 迎宾路由跳过该条: 「%s」",
+              name, item.c_str());
+            continue;
+          }
+          routes.push_back(std::move(route));
+        }
+      };
+    load_routes("agent_monitor.welcome_prep_phrases", welcome_prep_routes_);
+    load_routes("agent_monitor.send_off_phrases", send_off_routes_);
+    // ---- 内置短标记词（2026-10-22 联调实测：后端 scene=welcome 下发的
+    // texts 是三选一标记词「准备迎宾」「开始迎宾」「欢送顾客」，不携带
+    // agent 完整话术——日志实测 texts=["开始迎宾"]）——追加进三张路由
+    // 表，route_welcome_scene 命中后 texts 只用于路由不作播报（与 yaml
+    // 长指令双形态兼容，归一化子串匹配互不冲突：标记词间互不为子串，
+    // agent 话术「开始迎接我的顾客」也不含「开始迎宾」整词）。准备
+    // 迎宾/欢送顾客的点位取迎宾点：welcome_point_code（精确 code）优先，
+    // 空则名称关键词「迎宾」（handle_welcome_prep 内两级解析 + 关键词
+    // 兜底，与语料触发同口径，App 换迎宾点改映射表即生效） ----
+    const std::string marker_point =
+      welcome_point_code_.empty() ? "迎宾" : welcome_point_code_;
+    welcome_prep_routes_.push_back({marker_point, "准备迎宾"});
+    send_off_routes_.push_back({marker_point, "欢送顾客"});
+    welcome_scene_phrases_.push_back("开始迎宾");
+    const auto welcome_phrases =
+      get_parameter("agent_monitor.welcome_phrases").as_string_array();
+    for (const auto & phrase : welcome_phrases) {
+      if (normalize_phrase_text(phrase).empty()) {
+        continue;  // 空指令（纯标点）不作为有效路由词（同语料触发口径）
+      }
+      welcome_scene_phrases_.push_back(phrase);
+    }
+    navigate_phrase_template_ =
+      get_parameter("agent_monitor.navigate_phrase_template").as_string();
+    const auto navigate_phrases =
+      get_parameter("agent_monitor.navigate_phrases").as_string_array();
+    for (const auto & item : navigate_phrases) {
+      const auto sep = item.find('|');
+      const auto phrase =
+        (sep == std::string::npos) ? item : item.substr(sep + 1);
+      if (normalize_phrase_text(phrase).empty()) {
+        continue;
+      }
+      navigate_route_phrases_.push_back(phrase);
+    }
+  }
 
   // robot_id/凭据来自 enroll 响应，构造时未知；主题在 apply_credential 后生成
   boot_id_ = generate_uuid_v7();
@@ -1400,8 +1480,10 @@ void MqttGuideBridgeNode::worker_loop()
           }
         }
       } else if (screen_ && screen_->active() && now >= screen_->deadline()) {
-        // 二维码常驻超时：恢复默认表情（PlayEmotion 单通道，新请求即打断）
-        screen_->cancel("超时3min");
+        // 二维码常驻超时（display_show_timeout_seconds，全流程统一 2 分钟，
+        // 2026-10-22 现场需求）：恢复默认表情（PlayEmotion 单通道，新请求
+        // 即打断）
+        screen_->cancel("超时2min");
       } else if (relocate_pending_) {
         // 重定位验收轮询（250ms 周期）：终态只认导航模块的验收结果
         //（set_pose goal 的 result）或超时（relocate_timeout_seconds，默认 30s）
@@ -1487,18 +1569,29 @@ void MqttGuideBridgeNode::worker_loop()
           // ponytail: NavOutcome.detail 是自由文本（服务被拒/超时/FAILED 归并），
           // 无结构化分类，point_not_found/localization_lost 不猜——细分时给
           // NavOutcome 加 reason 枚举再映射
+          // v0.24.0（P-038）+ v0.30.0（P-044）：MQTT 下行走 navigate.result
+          // 回执；语料触发（nav_local_）已发过 navigate.triggered
+          //（nav_triggered_）则改发 navigate.completed 终态上报（payload
+          // 无 operation_id，与 triggered 一一对应），未发 triggered 的
+          //（前置重定位失败仍出发的导航）不发——App 不感知
           if (!nav_local_) {
             send_action_result(
               NAVIGATE_RESULT_TYPE, nav_operation_id_,
               arrival->ok ? ACTION_RESULT_SUCCESS : ACTION_RESULT_FAILED,
               arrival->ok ? "" : RESULT_REASON_NAVIGATION_FAILED);
+          } else if (nav_triggered_) {
+            send_nav_completed(
+              NAVIGATE_COMPLETED_TYPE, nav_point_display_,
+              arrival->ok ? ACTION_RESULT_SUCCESS : ACTION_RESULT_FAILED,
+              arrival->ok ? "" : RESULT_REASON_NAVIGATION_FAILED);
           }
           nav_operation_id_.clear();
+          nav_triggered_ = false;
           if (arrival->ok) {
             // ---- 迎宾准备/送客到达（2026-10-18 现场需求；送客 2026-10-21）：
             // 变形四足作为待命形态（摄像头舵机收平 0 度），变形完成后最后
             // 播报——迎宾准备播就位语「元气满满，做好准备迎接顾客」、
-            // 送客播感谢语 send_off_done_text「再次感谢您对比亚迪的支持…」。
+            // 送客播感谢语 send_off_done_text「欢乐的时光过的特别快…」。
             // 不走默认车型讲解词兜底（迎宾点不是车型点）；变形阻塞 worker
             // 等待（与迎宾变形同模式，上限 transform_wait_timeout_seconds），
             // 期间新指令排队 ----
@@ -1537,6 +1630,14 @@ void MqttGuideBridgeNode::worker_loop()
                   send_off ? "感谢语" : "就位语", prep_source.c_str());
               }
               transform_->wait_done();
+              // ---- 送客二维码上屏（阶段 2，2026-10-22 现场需求）：变形
+              // 完成、感谢语开播前显示（先屏后声，与迎宾同款时序；常驻
+              // 时长 display_show_timeout_seconds 独立计时，新业务到达
+              // 由各业务入口 screen_->cancel 让位）。future 此刻通常早已
+              // 完成（准备 ~3.5s << 导航时长），get() 零等待 ----
+              if (send_off) {
+                finish_send_off_qr(true, prep_source);
+              }
               // 变形结束（成败均已在变形线程记日志）-> 最后播报：送客播
               // 感谢语、迎宾准备播就位语（短内容不静音：结束后要能被唤醒
               // 迎接顾客；空串 = 禁用，到达即释放业务）
@@ -1602,9 +1703,15 @@ void MqttGuideBridgeNode::worker_loop()
             RCLCPP_ERROR(
               get_logger(), "导航失败: %s (%s)，%s",
               tour_->current_point().c_str(), arrival->detail.c_str(),
-              nav_local_ ? "不发协议回执（语料触发，Server 不认识本地 id）"
-                         : "已回执 navigate.result/failed:navigation_failed");
+              nav_local_
+                ? (nav_triggered_
+                  ? "已发 navigate.completed/failed:navigation_failed 终态上报（P-044）"
+                  : "不发协议回执与终态上报（语料触发但未发 triggered，前置重定位失败）")
+                : "已回执 navigate.result/failed:navigation_failed");
             // 导航失败：导览业务结束，释放占用（迎宾准备/送客标志一并清理）
+            if (nav_send_off_) {
+              finish_send_off_qr(false, "");  // 送客导航失败：丢弃二维码显示（收割后台防泄漏）
+            }
             nav_welcome_prep_ = false;
             nav_send_off_ = false;
             business_ = Business::kNone;
@@ -1781,7 +1888,15 @@ void MqttGuideBridgeNode::handle_command(const CommandEvent & event)
   }
 
   if (event.type == "scene") {
-    handle_scene(event);
+    // MQTT 迎宾三场景路由（2026-10-22 现场需求）：texts 带固定指令时
+    // 分流准备迎宾/欢送顾客（开始迎宾指令仅清除 texts 后仍走原流程）。
+    // 拷贝一份再路由：命中开始迎宾指令时改写 texts（agent 话术不作
+    // 迎宾词，迎宾词走映射表），不改原始事件
+    CommandEvent scene_event = event;
+    if (route_welcome_scene(scene_event)) {
+      return;  // 已分流处理（含 scene.result 回执）
+    }
+    handle_scene(scene_event);
     return;
   }
 
@@ -1854,13 +1969,23 @@ void MqttGuideBridgeNode::handle_command(const CommandEvent & event)
     const bool had_nav = tour_->navigating();
     if (had_nav && !nav_operation_id_.empty()) {
       // 被中止的导航对原指令就是失败确定：回 failed/aborted（v0.24.0）。
-      // 语料触发（nav_local_）不发回执
+      // 语料触发（nav_local_）不发回执，已发过 triggered（P-040）的改发
+      // navigate.completed/failed:aborted 终态上报（P-044——tts.stop 停止
+      // 一切，在途语音导航一并被打断，App 侧 triggered 有终态可配对）
       if (!nav_local_) {
         send_action_result(
           NAVIGATE_RESULT_TYPE, nav_operation_id_, ACTION_RESULT_FAILED,
           RESULT_REASON_ABORTED);
+      } else if (nav_triggered_) {
+        send_nav_completed(
+          NAVIGATE_COMPLETED_TYPE, nav_point_display_, ACTION_RESULT_FAILED,
+          RESULT_REASON_ABORTED);
       }
       nav_operation_id_.clear();
+      nav_triggered_ = false;
+    }
+    if (nav_send_off_) {
+      finish_send_off_qr(false, "");  // 送客被停止：丢弃二维码显示（收割后台防泄漏）
     }
     nav_welcome_prep_ = false;  // 迎宾准备/送客在途一并取消（不变形不播就位语/感谢语）
     nav_send_off_ = false;
@@ -1887,16 +2012,31 @@ void MqttGuideBridgeNode::handle_command(const CommandEvent & event)
     // cancel_session），无需处理语音/二维码
     if (tour_->navigating()) {
       if (!nav_operation_id_.empty()) {
-        // 被停止的 navigate 一律回 failed/aborted（v0.24.0 P-038）。
-        // 2026-10-18 现场需求：语料触发的导航（本地 operation_id）也发
-        // 回执——与 navigate.triggered 上报配套，后端对语音触发的导览
-        // 既有「开始」也有「被停止」终态可感知
-        send_action_result(
-          NAVIGATE_RESULT_TYPE, nav_operation_id_, ACTION_RESULT_FAILED,
-          RESULT_REASON_ABORTED);
+        // 被停止的 navigate 一律有终态（v0.24.0 P-038 / v0.30.0 P-044）：
+        // MQTT 下行回 failed/aborted 回执；语料触发的导航曾以本地铸造的
+        // operation_id 发孤儿 navigate.result（Server 对应不到任何已下发
+        // 指令只记日志），P-044 起改发 navigate.completed/failed:aborted
+        // 终态上报（payload {point_name, trigger, outcome, reason}，无
+        // operation_id，与 navigate.triggered 一一配对，Server 去重后推
+        // App robot.navigation.completed）——后端对语音触发的导览既有
+        //「开始」也有「被停止」终态可感知（2026-10-18 现场需求的正确
+        // 协议化表达）。未发 triggered 的（前置重定位失败仍出发）不发
+        if (!nav_local_) {
+          send_action_result(
+            NAVIGATE_RESULT_TYPE, nav_operation_id_, ACTION_RESULT_FAILED,
+            RESULT_REASON_ABORTED);
+        } else if (nav_triggered_) {
+          send_nav_completed(
+            NAVIGATE_COMPLETED_TYPE, nav_point_display_, ACTION_RESULT_FAILED,
+            RESULT_REASON_ABORTED);
+        }
         nav_operation_id_.clear();
+        nav_triggered_ = false;
       }
       tour_->cancel();  // 取消导航并清空到达槽（不触发回调）
+      if (nav_send_off_) {
+        finish_send_off_qr(false, "");  // 送客被停止：丢弃二维码显示（收割后台防泄漏）
+      }
       nav_welcome_prep_ = false;  // 迎宾准备/送客在途一并取消（不变形不播就位语/感谢语）
       nav_send_off_ = false;
       business_ = Business::kNone;  // 导览业务到此终止，释放占用
@@ -1918,8 +2058,8 @@ void MqttGuideBridgeNode::handle_command(const CommandEvent & event)
 // agent_monitor.qr_phrases 语料，如「收到，这就给您显示二维码，您可以
 // 扫描二维码留下您的个人信息哦。」）。纯屏幕动作：显示默认二维码图片
 //（同迎宾未携带 qr_sha256 的兜底 config/QRCode.png），常驻
-// display_show_timeout_seconds（默认 180s=3 分钟，worker 按 ScreenDisplay
-// deadline 超时恢复默认表情）。已在显示时重复触发：互斥窗口（20s）内
+// display_show_timeout_seconds（默认 120s=2 分钟，2026-10-22 现场需求
+// 全流程统一时长，worker 按 ScreenDisplay deadline 超时恢复默认表情）。已在显示时重复触发：互斥窗口（20s）内
 // 复读被拒（business_busy），窗口外复读重新上屏并重置常驻计时。业务语义（2026-10-17 现场需求）：显示二维码是一个
 // 互斥业务——上屏成功即占 kShowQr 业务 qr_business_timeout_seconds
 //（默认 20s），期间其他业务（tts/scene/navigate/relocate/cancel_qr 除
@@ -2043,6 +2183,11 @@ void MqttGuideBridgeNode::handle_relocate(const CommandEvent & event)
   // 均不上报（App 不感知失败的语音重定位）；2026-10-21 现场需求起
   // 成功时还加发 relocate.result 回执（同样只在成功时）
 
+  // 切换场景先撤屏（2026-10-22 现场需求）：重定位是业务切换（变形+
+  // 播报），屏幕常驻的旧二维码先恢复默认表情让位（未显示 no-op）；
+  // 放在点位校验之后——被拒（未命中映射表）不切换场景，二维码保留
+  screen_->cancel("relocate");
+
   // ---- 重定位出发播报（2026-10-18 现场需求）：仅 MQTT 下行先播「马上
   // 开始重定位，请稍后」；语料触发不播——agent 已说「好的，这就在A点
   // 开始重定位」，再说就重复。先开口、立刻动（不等播完，与导航出发语
@@ -2128,9 +2273,11 @@ void MqttGuideBridgeNode::handle_relocate(const CommandEvent & event)
 
 // ---------------------------------------------------------------------------
 // 重定位终态收尾（worker 线程，验证结果来自 poll_set_pose_verified 或
-// 超时）：回执 relocate.result（验收通过=success；验收失败/超时=
-// failed:localization_failed；语料触发自 2026-10-21 现场需求起成功
-// 同样发本回执——先 relocate.triggered 后 result，失败仍不发）
+// 超时）：MQTT 下行回执 relocate.result（验收通过=success；验收失败/
+// 超时=failed:localization_failed）；语料触发验收通过时发
+// relocate.triggered 上报 + relocate.completed 终态上报（P-044，替代
+// 原 2026-10-21 方案的孤儿 relocate.result；失败仍都不发——App 不感知
+// 失败的语音重定位）
 // -> 释放业务占用（业务在回执发出后才结束）
 // -> 成功时播报（texts 优先，缺省「{point_name}点 重定位 成功」（重定位
 // 前后空格分段，TTS 连读易错），单轮；
@@ -2149,7 +2296,9 @@ void MqttGuideBridgeNode::finish_relocate(bool verified)
       get_logger(), "%s重定位验收通过: 航点「%s」operation_id=%s，%s",
       source, relocate_waypoint_.c_str(), relocate_operation_id_.c_str(),
       relocate_local_
-        ? "语料触发：发 relocate.triggered 上报 + relocate.result 回执（成功后才发，2026-10-21 需求）"
+        ? "语料触发：发 relocate.triggered 上报 + relocate.completed 终态上报"
+          "（成功后才发，2026-10-19 需求；终态自 P-044 起改用 completed，"
+          "不再发本地 operation_id 的孤儿 relocate.result）"
         : "回执 success");
     if (!relocate_local_) {
       send_action_result(
@@ -2159,13 +2308,16 @@ void MqttGuideBridgeNode::finish_relocate(bool verified)
       // relocate.triggered 上报（P-040 事件形状不变，仅发布时机从
       // 受理时挪到终态成功；App 拿到即「语音重定位已成功」的事实）
       send_nav_triggered(RELOCATE_TRIGGERED_TYPE, relocate_display_name_);
-      // 2026-10-21 现场需求：语料触发的重定位成功同样发 relocate.result
-      // 回执给后端。先 triggered（告知语音触发的事实）后 result（终态），
-      // 后端按时序关联；operation_id 为本地 UUID v7，旧顾虑「Server
-      // 不认识本地 id 故不发回执」作废。失败/超时仍不发（App 不感知
-      // 失败的语音重定位，2026-10-19 口径不变）
-      send_action_result(
-        RELOCATE_RESULT_TYPE, relocate_operation_id_, ACTION_RESULT_SUCCESS);
+      // v0.30.0（P-044，替代 2026-10-21 现场需求的孤儿 relocate.result
+      // 方案）：语料触发的重定位成功改发 relocate.completed 终态上报
+      //（payload {point_name, trigger:voice, outcome:success}，无
+      // operation_id）——与 relocate.triggered 背靠背、按时间序一一对应，
+      // Server 去重后推 App robot.navigation.completed；旧方案发本地
+      // UUID v7 的 relocate.result，Server 对应不到任何已下发指令只记
+      // 日志，App 无事件可收。失败/超时仍不发（App 不感知失败的语音
+      // 重定位，2026-10-19 口径不变）
+      send_nav_completed(
+        RELOCATE_COMPLETED_TYPE, relocate_display_name_, ACTION_RESULT_SUCCESS);
     }
     // 播报在业务释放之后（协议语义：重定位成功即 success，texts 播报
     // 与否属本地细节不影响结果；播报期间新业务可替换会话——音频单会话）
@@ -2303,6 +2455,87 @@ void MqttGuideBridgeNode::handle_point_map(const CommandEvent & event)
 }
 
 // ---------------------------------------------------------------------------
+// MQTT 迎宾三场景路由（2026-10-22 现场需求，见头文件声明注释）：
+// App 下发 scene=welcome 的 texts 是小T的应答话术，末尾一字不差带
+// 固定指令（小T提示词 §10.2 指令对照表），按指令路由三种场景——
+//   「整装待发，即刻就位」准备迎宾 -> handle_welcome_prep(false)：
+//     导航去迎宾点，到达变四足收摄像头、播就位语
+//   「热情相送，宾至如归」欢送顾客 -> handle_welcome_prep(true)：
+//     导航去迎宾点送顾客，到达变四足、播感谢语
+//   「恭候光临，倒屣相迎」开始迎宾 -> 清除 texts 返回 false 走原
+//     handle_scene（texts 是 agent 话术不作迎宾词，迎宾词走映射表）
+// 匹配：全部 texts 归一化拼接后子串匹配（phrase_matches 自带双侧
+// 归一化，与 AgentMonitor 语音触发同款同源语料——语音/MQTT 双触发
+// 面一套指令词）；未命中任何指令不改写原事件（兼容 v0.20.0 App
+// 指定迎宾词的旧行为）。回执：MQTT 来源照发 scene.result——
+// welcome_prep/send_off 成功发起导航即 success（受理语义，到达后的
+// 变形/就位语/感谢语属本地细节），前置校验失败（映射表空/点位未
+// 命中/双足未确认）回 failed/scene_failed；语料触发（local）不回执
+//（与既有本地注入口径一致）
+// ---------------------------------------------------------------------------
+bool MqttGuideBridgeNode::route_welcome_scene(CommandEvent & event)
+{
+  if (event.texts.empty()) {
+    return false;  // 未携带话术：无从路由，走原迎宾流程（迎宾词走映射表）
+  }
+  // 拼接全部 texts 再匹配（agent 回复可能拆多条；归一化去空白/标点，
+  // 指令是长特征短语，跨条拼接误命中可忽略）
+  std::string joined;
+  for (const auto & text : event.texts) {
+    joined += text;
+  }
+
+  // 准备迎宾 / 欢送顾客：转本地等价指令（保留 MQTT operation_id 供
+  // 日志与回执关联；点位名取指令条目「点位名|指令」部分，经映射表
+  // 两级解析 + 名称关键词兜底，与语料触发同口径）
+  const auto try_route =
+    [&](const std::vector<WelcomeSceneRoute> & routes, bool send_off) {
+      for (const auto & route : routes) {
+        if (!phrase_matches(joined, route.phrase)) {
+          continue;
+        }
+        RCLCPP_INFO(
+          get_logger(),
+          "迎宾场景路由: texts 命中%s指令，转%s流程（话术只用于路由，"
+          "就位语/感谢语照常播）: point=%s operation_id=%s",
+          send_off ? "欢送顾客" : "准备迎宾", send_off ? "送客" : "迎宾准备",
+          route.point.c_str(), event.operation_id.c_str());
+        CommandEvent routed = event;
+        routed.type = send_off ? "send_off" : "welcome_prep";
+        routed.point_name = route.point;
+        routed.texts.clear();  // 话术已消费：流程内不播 agent 应答
+        const bool started = handle_welcome_prep(routed, send_off);
+        if (!event.local) {
+          send_action_result(
+            SCENE_RESULT_TYPE, event.operation_id,
+            started ? ACTION_RESULT_SUCCESS : ACTION_RESULT_FAILED,
+            started ? "" : RESULT_REASON_SCENE_FAILED);
+        }
+        return true;
+      }
+      return false;
+    };
+  if (try_route(welcome_prep_routes_, false) || try_route(send_off_routes_, true)) {
+    return true;
+  }
+
+  // 开始迎宾指令：话术属 agent 应答不作迎宾词——清除 texts 让
+  // handle_scene 回退映射表迎宾点条目（2026-10-19 映射表权威需求）
+  for (const auto & phrase : welcome_scene_phrases_) {
+    if (phrase_matches(joined, phrase)) {
+      RCLCPP_INFO(
+        get_logger(),
+        "迎宾场景路由: texts 命中开始迎宾指令，话术不作迎宾词"
+        "（迎宾词走映射表）: operation_id=%s",
+        event.operation_id.c_str());
+      event.texts.clear();
+      break;
+    }
+  }
+  return false;  // 走原 handle_scene（开始迎宾 / 未带指令的普通迎宾）
+}
+
+// ---------------------------------------------------------------------------
 // 迎宾模块（scene=welcome）：确定迎宾词（强制映射表权威，2026-10-19
 // 现场需求——指令 texts 优先，缺省取映射表迎宾点 [welcome_point_code]
 // 条目的 text；两者皆空 = 不播迎宾词，引导语/
@@ -2312,6 +2545,12 @@ void MqttGuideBridgeNode::handle_point_map(const CommandEvent & event)
 void MqttGuideBridgeNode::handle_scene(const CommandEvent & event)
 {
   // 协议层已保证 scene=welcome（可扩展枚举唯一值），未知值在解析层丢弃
+
+  // 切换场景先撤屏（2026-10-22 现场需求）：迎宾开始时若屏幕仍在常驻
+  // 上一流程的二维码（语料触发/上一轮迎宾/送客，2 分钟窗口内），先
+  // 恢复默认表情再进迎宾流程（引导语/变形），不等变形后新二维码上屏
+  // 才被动替换；未显示时 no-op
+  screen_->cancel("迎宾场景切换");
 
   // 迎宾词两级：1) 指令自带 texts（v0.20.0，App 指定）；2) 映射表
   // 迎宾点（welcome_point_code，默认 Y）条目 text（2026-10-19 需求：
@@ -2377,7 +2616,7 @@ void MqttGuideBridgeNode::handle_scene(const CommandEvent & event)
       RCLCPP_INFO(
         get_logger(), "迎宾开始: operation_id=%s 迎宾词=%zu 条 二维码=无（未携带 qr_sha256）",
         event.operation_id.c_str(), texts.size());
-      screen_->cancel("scene未携带二维码");
+      // 本次无新二维码上屏，入口已撤屏（上方场景切换 cancel），无需再动
     }
   } else {
     RCLCPP_INFO(
@@ -2421,7 +2660,7 @@ void MqttGuideBridgeNode::handle_scene(const CommandEvent & event)
       });
   }
   // ---- 迎宾引导语（2026-10-17 现场需求）：先播 TTS 引导语（默认
-  //「元气满满，小T来迎接我的顾客了」），播完再变形——先出声招呼、
+  //「哈喽哈喽！电池满格，热情也满格」），播完再变形——先出声招呼、
   // 再起身变形的迎宾节奏。复用播报会话机制（麦克风静音/唤醒抑制/
   // trace 前缀全套）；worker 正阻塞在本函数，定时分支的 play_current
   // 到不了，受理后手动首播（与 tts 指令受理同款）。播完判定：TtsStatus
@@ -2500,7 +2739,7 @@ void MqttGuideBridgeNode::handle_scene(const CommandEvent & event)
   // tts_early 分支，2026-10-16）；welcome_flow_timeout_seconds（默认
   // 120s）仅作终态事件丢失时的兜底超时——到期退出迎宾占用，后续
   // navigate/tts 不再被 business_busy 拒绝；两条路径均不停播报（单轮
-  // 自然播完）、不影响二维码常驻（180s 独立计时）。占用未释放前新业务
+  // 自然播完）、不影响二维码常驻（120s 独立计时）。占用未释放前新业务
   // 互斥；释放后若播报仍在，新业务到达自然接管（cancel_session 终止
   // 残留播报）。
   // 无迎宾词（指令未带 texts 且映射表迎宾点未配 text，2026-10-19）：
@@ -2717,6 +2956,48 @@ std::string MqttGuideBridgeNode::point_display_name(
 }
 
 // ---------------------------------------------------------------------------
+// 导航指令话术甄别（2026-10-22 现场需求）：App 下发 navigate 的 texts
+// 若是小T带看复述话术（末尾「要去看X，没问题」类固定指令）则不是
+// 讲解词——返回 true，调用方清除 texts 让到达讲解词回退映射表（映射
+// 表权威，与迎宾词同口径）。甄别特征：navigate_phrase_template 的
+// 前后缀（如「要去看」+「没问题」）同时出现即命中（{point} 部分是
+// 开放的点位名，不逐点生成——前后缀组合特征已足够强），外加静态
+// agent_monitor.navigate_phrases 的语料部分；模板与静态表均未配置时
+// 不甄别（保持 v0.20.0 原行为：App 指定的 texts 照播）
+// ---------------------------------------------------------------------------
+bool MqttGuideBridgeNode::navigate_texts_are_agent_reply(
+  const std::vector<std::string> & texts) const
+{
+  if (navigate_phrase_template_.empty() && navigate_route_phrases_.empty()) {
+    return false;  // 无可匹配的指令特征（配置关闭）：不甄别
+  }
+  std::string joined;
+  for (const auto & text : texts) {
+    joined += text;
+  }
+  for (const auto & phrase : navigate_route_phrases_) {
+    if (phrase_matches(joined, phrase)) {
+      return true;
+    }
+  }
+  static const std::string kToken = "{point}";
+  const auto token_pos = navigate_phrase_template_.find(kToken);
+  if (token_pos != std::string::npos) {
+    const auto prefix = normalize_phrase_text(
+      navigate_phrase_template_.substr(0, token_pos));
+    const auto suffix = normalize_phrase_text(
+      navigate_phrase_template_.substr(token_pos + kToken.size()));
+    if (!prefix.empty() && !suffix.empty() &&
+      normalize_phrase_text(joined).find(prefix) != std::string::npos &&
+      normalize_phrase_text(joined).find(suffix) != std::string::npos)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // 讲解模块（navigate，两个来源共用：MQTT 下行（App 触发，回
 // navigate.result）与本地注入（AgentMonitor 命中 agent_monitor.
 // navigate_phrases 语料，2026-10-17 车型导览：agent 复述「好的，您是想
@@ -2839,20 +3120,33 @@ void MqttGuideBridgeNode::handle_navigate(const CommandEvent & event)
       "到达变四足+播就位语）: point=%s operation_id=%s",
       waypoint.c_str(), event.operation_id.c_str());
   }
+  // 讲解词甄别（2026-10-22 现场需求）：App 下发 navigate 带的 texts 若
+  // 是小T带看复述话术（「要去看X，没问题」类指令）则不作讲解词——
+  // 清除后到达讲解词回退映射表（映射表权威，与迎宾词同口径）；未命中
+  // 指令特征（如 App 明确指定的随动播报）保持原行为照播
+  std::vector<std::string> nav_texts = event.texts;
+  if (!nav_texts.empty() && navigate_texts_are_agent_reply(nav_texts)) {
+    RCLCPP_INFO(
+      get_logger(),
+      "导航 texts 命中带看指令话术，不作讲解词（到达讲解词走映射表）: %s",
+      event.operation_id.c_str());
+    nav_texts.clear();
+  }
   RCLCPP_INFO(
     get_logger(), "导航开始: point=%s 讲解词=%zu 条 operation_id=%s",
-    waypoint.c_str(), event.texts.size(), event.operation_id.c_str());
+    waypoint.c_str(), nav_texts.size(), event.operation_id.c_str());
   // v0.24.0（P-038）：记录 operation_id 供到达/失败/中止时回
   // navigate.result。单业务模型下在途导航不会被新 navigate 替换
   //（business_busy 先行拒绝并回 failed/busy），此处无需为旧导航回 aborted。
   // 语料触发（local，2026-10-17 车型导览）：终态不发协议回执
   nav_operation_id_ = event.operation_id;
   nav_local_ = event.local;
+  nav_triggered_ = false;  // 是否已发 triggered（P-044 终态配对标志，下方按需置位）
   if (nav_welcome_prep_) {
     // 迎宾准备升级：不带讲解词（到达只做变形+就位语，讲解词无意义）
     tour_->start(waypoint, {});
   } else {
-    tour_->start(waypoint, event.texts);
+    tour_->start(waypoint, nav_texts);
   }
   // 新导航重置途中播报定时与池标志（受理事件按目标重新安排）
   nav_chatter_next_at_.reset();
@@ -2869,28 +3163,34 @@ void MqttGuideBridgeNode::handle_navigate(const CommandEvent & event)
   if (event.local) {
     if (relocate_ok) {
       send_nav_triggered(NAVIGATE_TRIGGERED_TYPE, nav_point_display_);
+      nav_triggered_ = true;  // 终态（到达/失败/中止）据此配发 navigate.completed（P-044）
     } else {
       RCLCPP_WARN(
         get_logger(),
         "前置重定位失败，不发 navigate.triggered 上报（只有重定位成功"
-        "才发，2026-10-19 需求）: point=%s", nav_point_display_.c_str());
+        "才发，2026-10-19 需求），终态亦不发 navigate.completed: point=%s",
+        nav_point_display_.c_str());
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// 迎宾准备模块（type=welcome_prep，2026-10-18 现场需求，仅本地注入：
+// 迎宾准备模块（type=welcome_prep，2026-10-18 现场需求，原仅本地注入：
 // AgentMonitor 命中 agent_monitor.welcome_prep_phrases 语料，如「整装
-// 待发，即刻就位 需要先导航去Y点」，等 agent 说完该句再触发）。
+// 待发，即刻就位 需要先导航去Y点」，等 agent 说完该句再触发；2026-10-22
+// 起 MQTT scene 三场景路由亦可到达，见 route_welcome_scene）。
 // 送客模式（type=send_off，2026-10-21 现场需求，send_off=true）：命中
 // agent_monitor.send_off_phrases 语料（如「热情相送，宾至如归」），
 // 链路完全同款，仅到达后播感谢语 send_off_done_text（而非就位语）。
 // 流程：点位名经映射表解析（同 navigate 口径，未命中拒绝+语音提示）
 // -> 先确保人形（2026-10-18 导航前置：四足状态下要先站起来才能走）
-// -> 发起导航（占导览业务，不发协议回执；语音触发回推 navigate.
-// triggered）-> worker 到达分支接管：变四足收摄像头 + 播就位语/感谢语
+// -> 发起导航（占导览业务；语音触发回推 navigate.triggered）-> worker
+// 到达分支接管：变四足收摄像头 + 播就位语/感谢语。
+// 返回 true = 导航已发起；false = 前置校验失败被拒（映射表空/点位未
+// 命中/双足未确认）——MQTT 路由来源据此回 scene.result，本地注入
+// 调用方不使用返回值
 // ---------------------------------------------------------------------------
-void MqttGuideBridgeNode::handle_welcome_prep(const CommandEvent & event, bool send_off)
+bool MqttGuideBridgeNode::handle_welcome_prep(const CommandEvent & event, bool send_off)
 {
   // 日志/变形 source 前缀：送客与迎宾准备共用本函数，文案按模式区分
   const char * const label = send_off ? "送客" : "迎宾准备";
@@ -2900,7 +3200,7 @@ void MqttGuideBridgeNode::handle_welcome_prep(const CommandEvent & event, bool s
     RCLCPP_WARN(
       get_logger(), "%s被拒绝: 点位映射表为空（未配置）", label);
     speak_hint(point_map_missing_text_, "point_map_missing");
-    return;
+    return false;
   }
   // 点位解析（映射表唯一权威，与 handle_navigate 同口径）：先精确两级
   // 解析（code 优先、name 兜底），未命中再按名称关键词子串匹配
@@ -2926,7 +3226,7 @@ void MqttGuideBridgeNode::handle_welcome_prep(const CommandEvent & event, bool s
     speak_hint(
       replace_point_placeholder(point_map_unmatched_text_, event.point_name),
       "point_map_unmatched");
-    return;
+    return false;
   }
   cancel_session();
   screen_->cancel(send_off ? "send_off" : "welcome_prep");
@@ -2947,7 +3247,7 @@ void MqttGuideBridgeNode::handle_welcome_prep(const CommandEvent & event, bool s
       get_logger(), "%s被拒: 双足形态未确认（变形失败或运控不可用），"
       "不下发导航指令: %s", label, event.operation_id.c_str());
     speak_hint(navigate_transform_failed_text_, "welcome_prep_transform_failed");
-    return;
+    return false;
   }
   // 变形后重定位（与 handle_navigate 同款，2026-10-18 现场需求）：
   // 变了形先 set_pose（最新停留点）再发导航 goal；已是人形跳过
@@ -2964,9 +3264,59 @@ void MqttGuideBridgeNode::handle_welcome_prep(const CommandEvent & event, bool s
     send_off ? "感谢语" : "就位语");
   nav_operation_id_ = event.operation_id;
   nav_local_ = true;           // 本地注入：到达/失败不发协议回执
+  nav_triggered_ = false;      // P-044 终态配对标志，下方按 relocate_ok 置位
   // 到达分支据此走四足变形而非车型讲解（两标志互斥：送客播感谢语）
   nav_welcome_prep_ = !send_off;
   nav_send_off_ = send_off;
+  // ---- 送客二维码后台准备（2026-10-22 现场需求）：感谢语提及「扫码
+  // 收选车小资料」，到达变形完成后上屏（到达分支 finish_send_off_qr
+  // 收割，先屏后声）。阶段 1（缓存比对/下载 + 转码 + 推送，~3.5s）
+  // 与导航并行重叠，导航几十秒到达时通常早已完成。内容来源：MQTT
+  // scene 载荷 qr_sha256 优先（route_welcome_scene 透传，缓存命中免
+  // 下载）；语料触发未带则默认图片 default_qr_path_（未配置不显示）。
+  // 线程模型同 handle_scene 的 qr_task：凭据先拷贝再按值捕获（避免与
+  // 连接线程凭据轮换竞争），prepare 全程 subprocess 不触碰 ROS 客户端，
+  // 跨线程 happens-before 由 future.get() 建立 ----
+  if (send_off) {
+    const std::string robot_id = robot_id_;
+    const std::string password = password_;
+    const std::string qr_sha256 = event.qr_sha256;
+    send_off_qr_task_ = std::async(
+      std::launch::async, [this, robot_id, password, qr_sha256]() {
+        std::string image_path;
+        if (!qr_sha256.empty()) {
+          auto cached = qr_cache_->cached_path(qr_sha256);
+          if (cached.has_value()) {
+            image_path = *cached;
+          } else {
+            const auto fetch = qr_cache_->fetch(robot_id, password, qr_sha256);
+            if (!fetch.ok) {
+              RCLCPP_WARN(
+                get_logger(),
+                "送客二维码下载失败(本次不显示,不影响流程): hash=%.12s… %s",
+                qr_sha256.c_str(), fetch.detail.c_str());
+              return false;
+            }
+            image_path = fetch.image_path;
+          }
+        } else if (!default_qr_path_.empty()) {
+          image_path = default_qr_path_;
+        } else {
+          RCLCPP_INFO(
+            get_logger(), "送客未携带 qr_sha256 且未配置默认二维码，本次不显示");
+          return false;
+        }
+        const auto prep = screen_->prepare(
+          image_path, qr_sha256.empty() ? "send-off" : qr_sha256);
+        if (!prep.ok) {
+          RCLCPP_WARN(
+            get_logger(), "送客二维码准备失败(本次不显示,不影响流程): %s",
+            prep.detail.c_str());
+          return false;
+        }
+        return true;
+      });
+  }
   tour_->start(waypoint, {});  // 不带讲解词（到达只做变形+就位语/感谢语）
   // 重置定时与池标志（受理事件按目标重新安排途中播报，2026-10-21）
   nav_chatter_next_at_.reset();
@@ -2975,15 +3325,49 @@ void MqttGuideBridgeNode::handle_welcome_prep(const CommandEvent & event, bool s
   business_ = Business::kTour;
   business_busy_until_.reset();  // 导航在途：占用由 tour_->navigating() 表达
   // 语音触发上报（与语料触发 navigate 同面）：App 侧可知机器人正去迎宾点
-  //（2026-10-19 需求：只有变形后重定位成功才发，与 handle_navigate 同口径）
-  if (relocate_ok) {
+  //（2026-10-19 需求：只有变形后重定位成功才发，与 handle_navigate 同
+  // 口径；2026-10-22 起 MQTT scene 路由可达本函数——MQTT 来源不发
+  // triggered/completed：trigger 枚举只有 voice，App 自己下发的指令
+  // 自知触发来源，重复上报反成噪音，与 handle_navigate 的 event.local
+  // 门禁同口径）
+  if (event.local && relocate_ok) {
     send_nav_triggered(NAVIGATE_TRIGGERED_TYPE, nav_point_display_);
-  } else {
+    nav_triggered_ = true;  // 到达/被停据此配发 navigate.completed（P-044）
+  } else if (!relocate_ok) {
     RCLCPP_WARN(
       get_logger(),
       "前置重定位失败，不发 navigate.triggered 上报（%s，只有"
-      "重定位成功才发，2026-10-19 需求）: point=%s", label, nav_point_display_.c_str());
+      "重定位成功才发，2026-10-19 需求），终态亦不发 navigate.completed: point=%s",
+      label, nav_point_display_.c_str());
   }
+  return true;  // 导航已发起（到达后的变形/播报由 worker 到达分支接管）
+}
+
+// ---------------------------------------------------------------------------
+// 送客二维码收敛（2026-10-22 现场需求，仅 worker 线程）：收割
+// send_off_qr_task_ 后台准备结果；show=true 且准备成功时 play_prepared
+// 上屏（到达变四足完成后、感谢语开播前——感谢语提及「扫码收选车
+// 小资料」，先屏后声），show=false 仅收割防泄漏（导航失败/停止路径，
+// 不显示）。future 无效（非送客/未启动/已收割）时 no-op，幂等可安全
+// 重入；上屏失败只告警不阻断感谢语（屏幕与音频相互独立）
+// ---------------------------------------------------------------------------
+void MqttGuideBridgeNode::finish_send_off_qr(bool show, const std::string & source)
+{
+  if (!send_off_qr_task_.valid()) {
+    return;
+  }
+  const bool ready = send_off_qr_task_.get();
+  if (!show || !ready) {
+    return;
+  }
+  const auto display = screen_->play_prepared(source);
+  if (!display.ok) {
+    RCLCPP_WARN(
+      get_logger(), "送客二维码显示失败(不影响感谢语): %s",
+      display.detail.c_str());
+    return;
+  }
+  RCLCPP_INFO(get_logger(), "送客二维码已上屏: %s", source.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -3338,6 +3722,24 @@ void MqttGuideBridgeNode::send_nav_triggered(
     RCLCPP_ERROR(
       get_logger(), "语音触发上报参数非法: type=%s point=%s（不发送）",
       triggered_type.c_str(), point_name.c_str());
+    return;
+  }
+  publish_json(up_commands_topic_, receipt->envelope_json, 1, false);
+}
+
+void MqttGuideBridgeNode::send_nav_completed(
+  const std::string & completed_type, const std::string & point_name,
+  const std::string & outcome, const std::string & reason)
+{
+  // v0.30.0（P-044）：仅语料触发且已发过 *.triggered（nav_triggered_）
+  // 的调用方才走到这里——App 下发指令的终态走 *.result 回执，未发
+  // triggered 的动作不补孤儿 completed（一一对应，按时间序关联）
+  auto receipt = build_nav_completed_event(
+    robot_id_, completed_type, point_name, TRIGGER_VOICE, outcome, reason);
+  if (!receipt) {
+    RCLCPP_ERROR(
+      get_logger(), "语音动作终态上报参数非法: type=%s point=%s outcome=%s（不发送）",
+      completed_type.c_str(), point_name.c_str(), outcome.c_str());
     return;
   }
   publish_json(up_commands_topic_, receipt->envelope_json, 1, false);

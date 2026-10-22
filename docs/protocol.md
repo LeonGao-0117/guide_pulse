@@ -161,7 +161,7 @@ success 禁 reason / failed 必填 reason 按指令枚举 / rejected 必填
 `command_expired`|`invalid_request`）。回执原文缓存重发（同 event_id）。
 `tts.stop` / `navigate.stop` 不得发布任何上行事件（契约）。
 
-### 3.1 `navigate.triggered` / `relocate.triggered`——语音触发上报（v0.26.0 P-040）
+### 3.1 `navigate.triggered` / `relocate.triggered`——语音触发上报（v0.26.0 P-040）与 `*.completed` 终态（v0.30.0 P-044）
 
 协议首个不由 App 指令驱动的上行事件。TTS 话术命中
 `agent_monitor.navigate_phrases` / `agent_monitor.relocate_phrases` 语料
@@ -190,11 +190,26 @@ success 禁 reason / failed 必填 reason 按指令枚举 / rejected 必填
     （`welcome_prep` 语料）同口径。MQTT 下行 `navigate` 不强制
     （维持 2026-10-18「仅变形后补偿性重定位」，其结果经
     `navigate.result` 回执）。
-- **配套终态（2026-10-18 现场需求）**：语料触发的导航被 `navigate.stop`
-  停止时，也发一条 `navigate.result`（`failed/aborted`），`operation_id`
-  用触发时本地生成的 uuid（与 `navigate.triggered` 一样无下发指令可
-  关联，Server 侧按孤儿终态处理或与 triggered 事件按时间序对应）——
-  后端对语音触发的导览既有「开始」也有「被停止」终态可感知。
+- **配套终态（v0.30.0 P-044，2026-10-22 接入；替代 2026-10-18 现场需求
+  的孤儿 `navigate.result` 方案）**：语音触发的导航/重定位完成或失败
+  确定时，发布恰好一条 `navigate.completed` / `relocate.completed`
+  （payload `{point_name, trigger, outcome, reason?}`，同样无
+  `operation_id`），与 `*.triggered` 一一对应、按时间序关联。到达/成功
+  → `success`；失败（含 `~/status` 断流兜底超时归并）→
+  `failed:navigation_failed` / `failed:localization_failed`；被
+  `navigate.stop` / `tts.stop` 打断 → `failed:aborted`。旧方案对语料
+  触发的导航被停时发本地铸造 `operation_id` 的 `navigate.result`（与
+  `navigate.triggered` 一样无下发指令可关联，Server 只按孤儿终态记
+  日志、App 无事件可收），P-044 起改发 `*.completed`（Server 去重后推
+  App `robot.navigation.completed`）——后端对语音触发的导览既有「开始」
+  也有「终态」可感知。语料触发的重定位成功同样改发
+  `relocate.completed`（与 `relocate.triggered` 背靠背；替代 2026-10-21
+  的孤儿 `relocate.result` 方案）。
+- **不发终态的场景**：未发 `*.triggered` 的动作（前置重定位失败仍照常
+  出发的导航；验收失败/超时的重定位——2026-10-19 口径「App 不感知
+  失败的语音触发」不变，且协议要求 triggered 与 completed 一一对应，
+  不发孤儿终态）；掉线/重启（无终态，App 不得当作失败）；App 下发
+  指令的终态走 `*.result` 回执 → `command.status.changed`，与本上报无关。
 - **不发布的场景**：App 下发的 `navigate` / `relocate` 指令（App 已知
   自己触发了什么）；业务互斥 busy 拒绝、点位映射表空/未命中（本地
   策略拒绝，未进入执行流程）；**重定位失败/被拒/超时**（2026-10-19

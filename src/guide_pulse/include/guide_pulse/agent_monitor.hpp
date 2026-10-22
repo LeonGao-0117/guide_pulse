@@ -80,7 +80,8 @@ public:
   struct PhraseRule
   {
     std::string action;                // 动作名："welcome" -> scene=welcome 迎宾；
-                                       // "show_qr" -> 屏幕显示默认二维码 3 分钟；
+                                       // "show_qr" -> 屏幕显示默认二维码 2 分钟
+                                       //   （2026-10-22 现场需求：全流程统一时长）；
                                        // "cancel_qr" -> 取消二维码显示（撤屏，
                                        //   未显示 no-op，2026-10-17 现场需求；
                                        //   与 show_qr 同为互斥业务占 20s 窗口）；
