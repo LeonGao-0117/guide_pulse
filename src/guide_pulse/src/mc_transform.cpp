@@ -453,7 +453,14 @@ void McTransform::run_ensure_form(const std::string & source, bool to_biped)
   }
 
   // 上一个动作可能还在切换中（action_desc 已变目标名但 status 未稳），
-  // 此时发动作会被拒：先等稳定，稳定后用最新动作名查表
+  // 此时发动作会被拒：先等稳定，稳定后用最新动作名查表。
+  // 🔴 等不到也不能直接放弃（2026-10-22 真机教训）：四足 LOCOMOTION 态 +
+  // 速度桥（nav2 的 mc_velocity_bridge）注册输入源时，运控 status 会**恒驻
+  // 200 不回 100**，而 /aima/mc/common/state 话题里 switch_ready=true ——
+  // 运控实际受理动作（当日实测：status=200 直发 QUADRUPED_TO_BIPED_ROTATE
+  // 秒受理，变形成功后 WBC 正常回 100）。速度桥同场景也从不做这道等待。
+  // 故超时后试发：真在切换中的话运控会拒（send_action 返回错误），
+  // 后续优雅放弃与原逻辑同构
   if (status != kMcStatusRunning) {
     RCLCPP_INFO(
       node_->get_logger(),
@@ -472,15 +479,13 @@ void McTransform::run_ensure_form(const std::string & source, bool to_biped)
       }
     }
     if (status != kMcStatusRunning) {
-      const std::string detail = why.empty() ? std::string() : "，" + why;
       RCLCPP_WARN(
         node_->get_logger(),
-        "%s: 当前动作 %s 在 %ds 内未稳定（状态 %d%s），本次不变形，"
-        "保持当前姿态继续播报: %s",
+        "%s: 当前动作 %s 在 %ds 内未稳定（状态 %d%s），改为直接试发"
+        "（四足 LOCOMOTION+速度桥场景 status 恒 200 但运控受理动作；"
+        "若真在切换中会被拒，届时保持当前姿态继续播报）: %s",
         log_prefix, current.c_str(), kMcSettleWaitSeconds, status,
-        detail.c_str(), source.c_str());
-      finish();
-      return;
+        why.empty() ? std::string() : "，" + why, source.c_str());
     }
   }
 
