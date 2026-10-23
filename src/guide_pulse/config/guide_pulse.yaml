@@ -25,6 +25,12 @@ guide_bridge:
     # 时长仍由 display_show_timeout_seconds 独立计时默认 120s=2 分钟，
     # 2026-10-22 现场需求全流程统一；切换场景各业务入口先撤屏不等超时）
     qr_business_timeout_seconds: 20
+    # 取消二维码（撤屏恢复默认表情）的 PlayEmotion 优先级
+    #（2026-10-23 真机故障修复：打断语义 = 高优先级打断低优先级，二维码
+    # 以 priority=0 上屏，取消同为 0 时运控板受理 ok 但不打断循环视频，
+    # 触发车型导览后二维码滞留屏幕即此因；须保持大于 0。取消失败每 5s
+    # 自动重试，无需人工干预）
+    display_restore_priority: 1
     # 真机航点导航：对接 t1_slam_nav_ws 的 /liwei_navigation/navigate
     # action（navigate=go / relocate=set_pose；接口文档见 t1_slam_nav_ws/
     # docs/NavigateAction.md）

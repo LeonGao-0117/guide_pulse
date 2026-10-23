@@ -94,7 +94,7 @@ bool ScreenDisplay::push_to_remote(
 
 ScreenDisplay::Result ScreenDisplay::call_play_emotion(
   const std::string & type, const std::string & file_path,
-  const std::vector<int32_t> & emotion_ids, int32_t loop_count)
+  const std::vector<int32_t> & emotion_ids, int32_t loop_count, int32_t priority)
 {
   Result result;
   if (!client_->service_is_ready()) {
@@ -109,7 +109,7 @@ ScreenDisplay::Result ScreenDisplay::call_play_emotion(
     request->file_paths.push_back(file_path);
   }
   request->emotion_ids = emotion_ids;
-  request->priority = 0;
+  request->priority = priority;
   request->loop_count = loop_count;
 
   auto future = client_->async_send_request(request);
@@ -195,13 +195,28 @@ ScreenDisplay::Result ScreenDisplay::cancel(const std::string & reason)
   if (!showing_) {
     return {true, false, ""};  // 幂等：未显示时无操作
   }
-  showing_ = false;
-  // 打断循环视频 = 播放一次默认表情（PlayEmotion 单通道，新请求即打断）
+  // 打断循环视频 = 播放一次默认表情（PlayEmotion 单通道，新请求即打断
+  // 之外还有优先级仲裁——同优先级不打断循环视频；恢复请求须以高于
+  // 上屏（0）的 restore_priority 发出，否则运控板受理 ok 但屏幕滞留
+  // 二维码，2026-10-23 真机故障）
   auto result = call_play_emotion(
-    "emotion", "", {static_cast<int32_t>(config_.restore_emotion_id)}, 1);
-  RCLCPP_INFO(
-    node_->get_logger(), "二维码取消(%s): %s", reason.c_str(),
-    result.ok ? "ok" : result.detail.c_str());
+    "emotion", "", {static_cast<int32_t>(config_.restore_emotion_id)}, 1,
+    static_cast<int32_t>(config_.restore_priority));
+  if (result.ok) {
+    // 只有受理成功才清常驻状态：失败保持 showing_ 并顺延 deadline
+    // 5s，worker 超时分支到点自动重试撤屏——先置 false 再调用的旧
+    // 顺序会在一次失败后把超时兜底与后续业务入口的 cancel 全部变
+    // 成 no-op，二维码永久滞留屏幕
+    showing_ = false;
+    RCLCPP_INFO(
+      node_->get_logger(), "二维码取消(%s): ok", reason.c_str());
+  } else {
+    deadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    RCLCPP_WARN(
+      node_->get_logger(),
+      "二维码取消(%s)失败(5s后自动重试): %s", reason.c_str(),
+      result.detail.c_str());
+  }
   return result;
 }
 

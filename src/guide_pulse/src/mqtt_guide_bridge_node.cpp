@@ -156,6 +156,11 @@ void MqttGuideBridgeNode::declare_and_load_params()
   // 独立计时互不影响）
   declare_parameter<int>("qr_business_timeout_seconds", 20);
   declare_parameter<int>("display_restore_emotion_id", 90);     // T1 默认表情
+  // 取消二维码恢复表情的 PlayEmotion 优先级（2026-10-23 真机故障修复：
+  // 打断语义 = 高优先级打断低优先级，二维码以 priority=0 上屏，取消
+  // 同为 0 时运控板受理 ok 但不打断循环视频，屏幕滞留二维码——触发
+  // 车型导览后二维码不消失即此因）。须大于 0；失败自动重试不受此影响
+  declare_parameter<int>("display_restore_priority", 1);
 
   // ---- 迎宾二维码缓存/下载（v0.22.0 P-036：scene 带 qr_sha256 哈希快照，
   // 未命中本地缓存时以 MQTT 凭据从 Server 文件面拉取图片）----
@@ -776,6 +781,8 @@ bool MqttGuideBridgeNode::start()
     get_parameter("display_show_timeout_seconds").as_int();
   screen_cfg.restore_emotion_id =
     get_parameter("display_restore_emotion_id").as_int();
+  screen_cfg.restore_priority =
+    get_parameter("display_restore_priority").as_int();
   if (screen_cfg.remote_pass.empty()) {
     RCLCPP_WARN(
       get_logger(),
@@ -1484,8 +1491,10 @@ void MqttGuideBridgeNode::worker_loop()
         }
       } else if (screen_ && screen_->active() && now >= screen_->deadline()) {
         // 二维码常驻超时（display_show_timeout_seconds，全流程统一 2 分钟，
-        // 2026-10-22 现场需求）：恢复默认表情（PlayEmotion 单通道，新请求
-        // 即打断）
+        // 2026-10-22 现场需求）：以 display_restore_priority（高于上屏的 0）
+        // 播默认表情打断循环视频（2026-10-23 真机故障：同优先级打不断，
+        // 受理 ok 但屏幕滞留二维码）；取消失败时 deadline 已被顺延 5s，
+        // 本分支到点自动重试撤屏（ScreenDisplay::cancel 失败保持常驻态）
         screen_->cancel("超时2min");
       } else if (relocate_pending_) {
         // 重定位验收轮询（250ms 周期）：终态只认导航模块的验收结果

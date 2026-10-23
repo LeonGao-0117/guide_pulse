@@ -64,6 +64,13 @@ public:
                                                // 2026-10-22 现场需求全流程统一；
                                                // 与迎宾流程超时独立计时互不影响）
     int restore_emotion_id{90};               // 取消显示后恢复的默认表情
+    int restore_priority{1};                  // 取消请求优先级（2026-10-23 真机
+                                               // 故障修复）：PlayEmotion 打断
+                                               // 语义 = 高优先级打断低优先级
+                                               //（srv 注释），二维码循环视频以
+                                               // priority=0 上屏，取消若同用 0
+                                               // 运控板受理 ok 但不打断循环，
+                                               // 屏幕滞留二维码；须高于上屏值
   };
 
   struct Result
@@ -92,7 +99,11 @@ public:
   Result play_prepared(const std::string & source);
 
   // 取消显示（超时/新业务到达）：恢复默认表情打断循环视频。
-  // 未显示时为空操作（幂等）。
+  // 未显示时为空操作（幂等）。恢复请求以 restore_priority（默认 1，
+  // 高于上屏的 0）发出——同优先级打不断循环视频（2026-10-23 真机
+  // 故障：受理 ok 但屏幕滞留二维码）。受理失败（不可达/超时/被拒）
+  // 保持常驻状态并顺延 deadline 由 worker 超时分支重试，防止撤屏
+  // 通道被一次失败关死
   Result cancel(const std::string & reason);
 
   // 当前是否处于"二维码常驻"状态；deadline() 为超时时刻（worker 唤醒用）
@@ -100,10 +111,13 @@ public:
   std::chrono::steady_clock::time_point deadline() const;
 
 private:
-  // 调 PlayEmotion：file 模式（loop_count<=0 无限循环）或 emotion 恢复
+  // 调 PlayEmotion：file 模式（loop_count<=0 无限循环）或 emotion 恢复。
+  // priority：打断仲裁用（高打断低，同优先级不打断——2026-10-23 真机
+  // 故障：取消与上屏同为 0 时恢复表情打不断二维码循环）
   Result call_play_emotion(
     const std::string & type, const std::string & file_path,
-    const std::vector<int32_t> & emotion_ids, int32_t loop_count);
+    const std::vector<int32_t> & emotion_ids, int32_t loop_count,
+    int32_t priority = 0);
   // scp 推送 mp4 到运控板 remote_dir（system 子进程 sshpass）。
   // content_id 非空时推 QRCode_{id}.mp4 并清掉旧 QRCode*.mp4（防堆积；
   // rm 正在播放的旧文件无碍：播放器持有 fd，且新路径播放即打断）
