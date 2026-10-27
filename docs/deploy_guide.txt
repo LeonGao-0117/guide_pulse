@@ -1,0 +1,114 @@
+guide_pulse 编译、部署及开机自启动指令
+
+1. 编译
+
+进入工作区：
+  cd /opt/liwei/guide_pulse
+
+非首次部署，只编译，不安装依赖：
+  ./scripts/deploy.sh --build-only
+
+首次部署，安装系统依赖并编译：
+  ./scripts/deploy.sh
+
+重大改动，需要删除旧编译文件后重新编译：
+  ./scripts/deploy.sh --clean
+
+说明：
+  guide_pulse 不需要下载模型。
+  目标机器必须已安装 ROS 2 Humble。
+
+
+2. 配置自启动脚本
+
+配置CPU权重：
+  guide_pulse 是单节点轻量应用，当前不需要配置独立的 systemd CPU 权重文件。
+  scripts/autoStartConfig.sh 不会修改 systemd 资源限制。
+
+建立EM/LOG目录：
+  /robot/software/guide_pulse/bin
+  /robot/persist/log/guide_pulse
+
+运行过程中使用的持久化数据目录：
+  /robot/persist/var/guide_pulse
+
+复制启动脚本到EM目录：
+  /robot/software/guide_pulse/bin/start_guide_pulse
+
+执行配置脚本：
+  cd /opt/liwei/guide_pulse
+  sudo ./scripts/autoStartConfig.sh
+
+说明：
+  autoStartConfig.sh 会创建 EM 和日志目录，并复制启动脚本。
+  持久化数据目录由 guide_pulse 运行时按需创建，用于保存 point_map.json。
+  修改 scripts/start_guide_pulse.sh 后，需要重新执行 autoStartConfig.sh 更新EM目录中的副本。
+
+
+3. 修改启动配置文件
+
+先备份配置文件：
+  sudo cp -a /robot/software/process_manager/bin/cfg/t1_v2d0_soc1_config.yaml /robot/software/process_manager/bin/cfg/t1_v2d0_soc1_config.yaml.bak.guide_pulse
+
+修改配置文件：
+  /robot/software/process_manager/bin/cfg/t1_v2d0_soc1_config.yaml
+
+A. 在 startup_stages 的目标启动阶段末尾加上 "guide_pulse"：
+
+        "percep",
+        "liwei_nav",
+        "guide_pulse"
+
+B. 在 apps: 段末尾追加：
+
+    "guide_pulse":
+      path: "/robot/software/guide_pulse/bin/start_guide_pulse"
+      sudo: false
+      stderr: "/tmp/guide_pulse.err"
+      env:
+        LOG_PATH: /robot/persist/log/guide_pulse
+
+说明：
+  LOG_KEEP_DAYS 默认由启动脚本设置为 14。
+  GUIDE_PULSE_WS 已由 autoStartConfig.sh 写入已部署脚本，当前为 /opt/liwei/guide_pulse。
+  HOME 默认由启动脚本设置为 /home/run。
+  ROBOT_SERIAL_NUMBER 默认不需要配置。
+  启动脚本按以下顺序自动获取机器人序列号：
+  ROBOT_SERIAL_NUMBER 环境变量 > 本机 /robot/info/sn > SSH读取运控板 /robot/info/sn。
+  GUIDE_PULSE_DDS_PROFILES 默认不配置，沿用机器人系统现有 DDS 配置，保证与 SDK 和官方模块互通。
+
+
+4. 启动/停止 guide_pulse
+
+启动：
+  yamo em start-app guide_pulse
+
+停止：
+  yamo em stop-app guide_pulse
+
+若 stop 停不干净，读取当前运行 PID 并发送 TERM 信号：
+  kill -TERM "$(awk -F= '/^pid=/{print $2}' /robot/persist/log/guide_pulse/current.run)"
+
+查看进程：
+  pgrep -af 'ros2 launch guide_pulse|guide_bridge'
+
+
+5. 查看log
+
+查看当前最新实时日志：
+  tail -F /robot/persist/log/guide_pulse/latest.log
+
+过滤关键日志：
+  tail -F /robot/persist/log/guide_pulse/latest.log | grep --line-buffered -E 'guide_pulse|guide_bridge|mqtt|enroll|ERROR|WARN'
+
+查看EM错误日志：
+  tail -F /tmp/guide_pulse.err
+
+历史日志目录：
+  /robot/persist/log/guide_pulse/runs/
+
+查看当前运行信息、PID及实际日志路径：
+  cat /robot/persist/log/guide_pulse/current.run
+
+查看ROS日志目录：
+  /robot/persist/log/guide_pulse/ros/
