@@ -4,6 +4,7 @@
 // ============================================================================
 #include "guide_pulse/agent_monitor.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <utility>
 
@@ -114,6 +115,26 @@ bool phrase_matches(const std::string & asr_text, const std::string & phrase)
     return false;  // 语料归一化后为空（纯标点）不作为有效触发词
   }
   return normalized_asr.find(normalized_phrase) != std::string::npos;
+}
+
+FetchVerdict consume_fetched_texts(
+  const std::vector<std::string> & candidates,
+  const std::function<bool(const std::string &)> & matcher,
+  std::string & observe_text)
+{
+  if (candidates.empty()) {
+    return FetchVerdict::kEmpty;
+  }
+  for (const auto & text : candidates) {
+    if (matcher(text)) {
+      return FetchVerdict::kConsumed;  // 命中即消化（冷却/延迟触发在 matcher 内收尾）
+    }
+  }
+  // 全部未命中：观测行取最长候选（各日志源里最全的那份，信息不降级）
+  observe_text = *std::max_element(
+    candidates.begin(), candidates.end(),
+    [](const std::string & a, const std::string & b) {return a.size() < b.size();});
+  return FetchVerdict::kMissRecheck;
 }
 
 // ---------------------------------------------------------------------------
@@ -432,7 +453,9 @@ bool safe_trace_id(const std::string & trace_id)
 // /=3= 标记分段），返回各自首个非空输出行（空串 = 未查到/失败）
 // FetchLines 结构（=4= 新增 audio.done 全量源、=5= nlg 分段拼接，
 // 2026-10-21 现场送客语料「热情相送，宾至如归」跨 NLG 换行折行段
-// 失配问题，见 fetch_tts_text 命令注释）
+// 失配问题，见 fetch_tts_text 命令注释；=6= 新增 handle_nlg_result 行
+// 拼接源，2026-10-27 现场需求：与 =5= 同内容不同打印路径，折行断点
+// 互补，作 =5= 折行残缺时的额外候选）
 struct FetchLines
 {
   std::string local_line;   // 路径1输出：形如 "text=话术 domain="
@@ -440,6 +463,7 @@ struct FetchLines
   std::string stream_line;  // 路径3输出：形如 "text=\"话术\" domain=\"omnissdk\""
   std::string audio_line;   // 路径4输出：audio.done 全量话术（\n 转义已还原为空格）
   std::string nlg_line;     // 路径5输出：nlg 分段话术拼接（可能不全，折行分段取不到）
+  std::string nlg2_line;    // 路径6输出：handle_nlg_result 话术拼接（同 =5=，折行互补源）
 };
 
 FetchLines ssh_fetch_lines(const std::string & cmd)
@@ -459,6 +483,7 @@ FetchLines ssh_fetch_lines(const std::string & cmd)
     if (line == "=3=") {section = 3; continue;}
     if (line == "=4=") {section = 4; continue;}
     if (line == "=5=") {section = 5; continue;}
+    if (line == "=6=") {section = 6; continue;}
     if (line.empty()) {continue;}
     if (section == 1 && out.local_line.empty()) {
       out.local_line = line;
@@ -470,6 +495,8 @@ FetchLines ssh_fetch_lines(const std::string & cmd)
       out.audio_line = line;
     } else if (section == 5 && out.nlg_line.empty()) {
       out.nlg_line = line;
+    } else if (section == 6 && out.nlg2_line.empty()) {
+      out.nlg2_line = line;
     }
   }
   pclose(p);
@@ -560,8 +587,16 @@ void AgentMonitor::fetch_tts_text(const std::string & trace_id)
   //       行时成立）。拼接仍取不到折行分段（主行被 event_id$ 滤、
   //       续行被行前缀滤），文本可能不全：调用方未命中时不消化，
   //       等终态重查拿 =4= 全量再匹配
+  //   =6= 云端 NLG 结果（补强源，2026-10-27 现场发现：长话术分两波
+  //       下发——第一波 audio.done/dispatching 的 text 只剩前半句且
+  //       此后不更新，全量只在第二波 NLG 行）：DispatchManager 的
+  //       'handle_nlg_result event_id: <event_id>, nlg_text: 话术, done:
+  //       true' 行，与 =5= 同内容、不同打印路径（行前缀长度不同，折行
+  //       断点大概率错开），作 =5= 折行残缺时的额外候选；同样全部分段
+  //       拼接、同样可能不全（候选未命中不消化，等终态重查）
   // 路径5检索用的 event_id：trace 为 item_0_event_xxx 形态时剥前缀
-  //（白名单字符集剥前缀后仍安全；非该前缀的 trace 原样参与匹配）
+  //（白名单字符集剥前缀后仍安全；非该前缀的 trace 原样参与匹配；
+  // =6= 的 handle_nlg_result 行 event_id 同为剥前缀形态，共用）
   std::string event_id = trace_id;
   constexpr char kItemPrefix[] = "item_0_";
   if (event_id.rfind(kItemPrefix, 0) == 0) {
@@ -590,6 +625,10 @@ void AgentMonitor::fetch_tts_text(const std::string & trace_id)
     "grep -ah 'received the last nlg result' $F"
     " | grep -a \"event_id: " + event_id + "$\""
     " | sed 's/^.*nlg result: //; s/, event_id: [^,]*$//'"
+    " | tr '\\n' ' '; "
+    "echo =6=; "
+    "grep -ah 'handle_nlg_result event_id: " + event_id + "' $F"
+    " | sed 's/^.*nlg_text: //; s/, done: .*$//'"
     " | tr '\\n' ' ';";
   const std::string cmd =
     "SSHPASS='" + config_.ssh_password + "' sshpass -e ssh "
@@ -598,17 +637,23 @@ void AgentMonitor::fetch_tts_text(const std::string & trace_id)
 
   for (int attempt = 0; attempt < 2; ++attempt) {  // 日志写入延迟时重试一次
     const auto out = ssh_fetch_lines(cmd);
-    // 路径 1：取 "text=... domain=" 的中间段
+    // 各路径解析为候选文本（按优先级顺序收集，任一候选命中语料即消化
+    // ——多源统一决策见 consume_fetched_texts。2026-10-27 现场需求：
+    // 分波长话术 =3=/=4= 只剩前半句、全量在 =5=/=6=，旧逻辑逐路径
+    // 「未命中即 return 且保留去重标记」堵死后续路径与终态重查，
+    // navigate 漏触发——改为全候选尝试后统一收尾）
+    std::vector<std::string> candidates;
+    // 路径 1：本地 TTS —— 取 "text=... domain=" 的中间段。
+    // 自产播报过滤（2026-10-18 日志整理）：本地 TTS 日志行带
+    // domain=<self_domain> 即本进程发的 PlayTts（话术请求侧已知，
+    // 「稍等，马上出发」等提示回查再打一遍纯冗余），整轮丢弃不进候选。
+    // TtsStatus.domain 恒空的原有过滤不生效，此处按日志行解析兜底
     if (!out.local_line.empty()) {
       const auto a = out.local_line.find("text=");
       const auto b = out.local_line.rfind(" domain=");
       if (a != std::string::npos) {
         std::string text = out.local_line.substr(
           a + 5, b != std::string::npos && b > a ? b - a - 5 : std::string::npos);
-        // 自产播报过滤（2026-10-18 日志整理）：本地 TTS 日志行带
-        // domain=<self_domain> 即本进程发的 PlayTts（话术请求侧已知，
-        // 「稍等，马上出发」等提示回查再打一遍纯冗余），直接丢弃。
-        // TtsStatus.domain 恒空的原有过滤不生效，此处按日志行解析兜底
         std::string domain;
         if (b != std::string::npos && b > a) {
           domain = out.local_line.substr(b + 8);
@@ -617,24 +662,13 @@ void AgentMonitor::fetch_tts_text(const std::string & trace_id)
           if (!domain.empty() && domain == config_.self_domain) {
             return;  // 自产播报：不打不匹配
           }
-          // 先匹配语料：命中则「语料命中」行已含话术，跳过 on_tts_text
-          //（免同句双打）；未命中才打「agent 事件: TTS 话术」观测行
-          if (!match_phrases(text, trace_id)) {
-            auto cb = on_tts_text;
-            emit([cb, trace_id, text] { if (cb) cb(trace_id, text); });
-          }
-          return;
+          candidates.push_back(std::move(text));
         }
       }
     }
-    // 路径 2：输出已是纯文本
+    // 路径 2：云端流式 text.done —— 输出已是纯文本
     if (!out.cloud_line.empty()) {
-      const std::string text = out.cloud_line;
-      if (!match_phrases(text, trace_id)) {
-        auto cb = on_tts_text;
-        emit([cb, trace_id, text] { if (cb) cb(trace_id, text); });
-      }
-      return;
+      candidates.push_back(out.cloud_line);
     }
     // 路径 3：云端音频直推——输出形如 text="话术" domain="omnissdk"
     //（折行拼接后话术中可能夹折行空格，归一化匹配自然消解；引号内
@@ -652,11 +686,7 @@ void AgentMonitor::fetch_tts_text(const std::string & trace_id)
           if (!domain.empty() && domain == config_.self_domain) {
             return;  // 自产播报：不打不匹配
           }
-          if (!match_phrases(text, trace_id)) {
-            auto cb = on_tts_text;
-            emit([cb, trace_id, text] { if (cb) cb(trace_id, text); });
-          }
-          return;
+          candidates.push_back(std::move(text));
         }
       }
     }
@@ -664,25 +694,34 @@ void AgentMonitor::fetch_tts_text(const std::string & trace_id)
     // 话术最全（内部换行转义已在命令侧 sed 还原为空格）；audio.done
     // 无 domain 字段，但自产播报走本地 PlayTts 不产生该行，无需自产过滤
     if (!out.audio_line.empty()) {
-      const std::string text = out.audio_line;
-      if (!match_phrases(text, trace_id)) {
-        auto cb = on_tts_text;
-        emit([cb, trace_id, text] { if (cb) cb(trace_id, text); });
-      }
-      return;
+      candidates.push_back(out.audio_line);
     }
     // 路径 5：云端 NLG 分段拼接文本——可能不全（折行分段取不到，
-    // 2026-10-21 送客场景即缺「您这边请！热情相送，」折行段），命中
-    // 才消化；未命中打观测行后解除去重标记，允许 TtsStatus 终态重查
-    // 拿 =4= audio.done 全量再匹配一次（早查时 audio.done 尚未写入）
+    // 2026-10-21 送客场景即缺「您这边请！热情相送，」折行段）
     if (!out.nlg_line.empty()) {
-      const std::string text = out.nlg_line;
-      if (match_phrases(text, trace_id)) {
-        return;  // 已命中消化（延迟触发挂起等说完）
-      }
+      candidates.push_back(out.nlg_line);
+    }
+    // 路径 6：handle_nlg_result 分段拼接文本（=5= 折行互补源，同上
+    // 可能不全；未命中不消化，等终态重查）
+    if (!out.nlg2_line.empty()) {
+      candidates.push_back(out.nlg2_line);
+    }
+    // 多源统一决策：任一候选命中（含冷却/延迟触发在 match_phrases 内
+    // 收尾）即消化；全未命中打观测行（取最长候选，信息不降级）并解除
+    // 去重标记，允许 TtsStatus 终态重查拿更晚写入的全量源再匹配一次
+    //（早查时 audio.done/NLG 全量行尚未写入）；无候选走 attempt 重试
+    std::string observe_text;
+    const auto verdict = consume_fetched_texts(
+      candidates,
+      [this, &trace_id](const std::string & t) {return match_phrases(t, trace_id);},
+      observe_text);
+    if (verdict == FetchVerdict::kConsumed) {
+      return;  // 已命中消化（延迟触发挂起等说完）
+    }
+    if (verdict == FetchVerdict::kMissRecheck) {
       auto cb = on_tts_text;
-      emit([cb, trace_id, text] { if (cb) cb(trace_id, text); });
-      fetched_traces_.erase(trace_id);  // 文本可能残缺：不挡终态重查
+      emit([cb, trace_id, observe_text] { if (cb) cb(trace_id, observe_text); });
+      fetched_traces_.erase(trace_id);  // 候选可能残缺：不挡终态重查
       return;
     }
     if (attempt == 0) {

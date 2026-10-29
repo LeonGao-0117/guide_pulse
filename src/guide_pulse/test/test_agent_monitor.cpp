@@ -13,6 +13,8 @@ namespace
 
 using guide_pulse::normalize_phrase_text;
 using guide_pulse::phrase_matches;
+using guide_pulse::consume_fetched_texts;
+using guide_pulse::FetchVerdict;
 
 // 归一化：中文标点/空白剔除，文字保留
 TEST(NormalizePhraseText, RemovesCjkPunctuationAndSpaces)
@@ -169,6 +171,77 @@ TEST(PhraseMatches, EmptyInputs)
 {
   EXPECT_FALSE(phrase_matches("", "恭候光临，倒屣相迎"));
   EXPECT_FALSE(phrase_matches("好嘞", ""));
+}
+
+// 多源候选决策：任一候选命中即消化；全未命中取最长候选观测并允许
+// 终态重查；空候选返回 kEmpty 走 attempt 重试
+//（2026-10-27 现场：仰望U9 导览话术分两波下发——=3=/=4= 只剩前半句
+// 「…这可是全场」、全量在 =5= 分段拼接源，旧逻辑逐路径未命中即
+// return 且保留去重标记，堵死 =5= 与终态重查，navigate 漏触发）
+TEST(ConsumeFetchedTexts, AnyCandidateHitConsumes)
+{
+  const std::string phrase = "要去看仰望U9，没问题";
+  const auto matcher = [&phrase](const std::string & t) {return phrase_matches(t, phrase);};
+  std::string observe;
+  // 现场实录：=3= 残缺前半句 + =5= 全量分段拼接，语料只在第二个候选
+  EXPECT_EQ(
+    consume_fetched_texts(
+      {"在哦！是有什么需要帮忙的吗？好嘞，这可是全场",
+       "在哦！是有什么需要帮忙的吗？好嘞，这可是全场 "
+       "在哦！是有什么需要帮忙的吗？好嘞，这可是全场超吸睛的纯电超跑，"
+       "您跟我来！要去看仰望U9，没问题"},
+      matcher, observe),
+    FetchVerdict::kConsumed);
+  // 单波完整话术（=3= 直接全量）：第一个候选即命中
+  EXPECT_EQ(
+    consume_fetched_texts(
+      {"没问题，这就带您去看这台科技感拉满的超跑！要去看仰望U9，没问题"},
+      matcher, observe),
+    FetchVerdict::kConsumed);
+}
+
+// 多源候选决策：命中即停止尝试后续候选（不重复匹配）
+TEST(ConsumeFetchedTexts, StopsAtFirstHit)
+{
+  int calls = 0;
+  const auto matcher = [&calls](const std::string &) {++calls; return true;};
+  std::string observe;
+  EXPECT_EQ(
+    consume_fetched_texts({"a", "b", "c"}, matcher, observe),
+    FetchVerdict::kConsumed);
+  EXPECT_EQ(calls, 1);
+}
+
+// 多源候选决策：全未命中取最长候选为观测文本（信息不降级——排查时
+// 看到的是各源里最全的一份），并允许终态重查
+TEST(ConsumeFetchedTexts, AllMissPicksLongestAndAllowsRecheck)
+{
+  const auto matcher = [](const std::string &) {return false;};
+  std::string observe;
+  EXPECT_EQ(
+    consume_fetched_texts(
+      {"在哦！是有什么需要帮忙的吗？好嘞，这可是全场",  // =3= 残缺（短）
+       "在哦！是有什么需要帮忙的吗？好嘞，这可是全场 "
+       "在哦！是有什么需要帮忙的吗？好嘞，这可是全场超吸睛的纯电超跑，"
+       "您跟我来！要去看仰望U9"},  // =5= 折行缺尾段（长）
+      matcher, observe),
+    FetchVerdict::kMissRecheck);
+  EXPECT_EQ(observe, "在哦！是有什么需要帮忙的吗？好嘞，这可是全场 "
+    "在哦！是有什么需要帮忙的吗？好嘞，这可是全场超吸睛的纯电超跑，"
+    "您跟我来！要去看仰望U9");
+  observe = "不应被改写";
+  EXPECT_EQ(consume_fetched_texts({"残缺段"}, matcher, observe), FetchVerdict::kMissRecheck);
+  EXPECT_EQ(observe, "残缺段");  // 单候选观测 = 该候选本身
+}
+
+// 多源候选决策：空候选（日志尚未写入/自产无记录）返回 kEmpty，
+// 观测文本不改动（调用方按落空重试收尾）
+TEST(ConsumeFetchedTexts, EmptyCandidatesReturnsEmpty)
+{
+  const auto matcher = [](const std::string &) {return false;};
+  std::string observe = "保持原值";
+  EXPECT_EQ(consume_fetched_texts({}, matcher, observe), FetchVerdict::kEmpty);
+  EXPECT_EQ(observe, "保持原值");
 }
 
 }  // namespace

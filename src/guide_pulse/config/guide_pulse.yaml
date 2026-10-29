@@ -90,8 +90,9 @@ guide_bridge:
     navigate_depart_text: "稍等，马上出发"
     # 重定位出发播报语（2026-10-18 现场需求）：仅 MQTT 下行的 relocate 先
     # 播这句再起身变形人形（set_pose 有双足站立硬约束）；语料触发不播
-    #（agent 已说「好的，这就在A点开始重定位」）。空串 = 禁用
-    relocate_depart_text: "马上开始重定位，请稍后"
+    #（agent 已说「好的，这就在A点开始重定位」）。空串 = 禁用。
+    # 2026-10-28 现场需求：MQTT 下行的出发播报去掉，配空串禁用
+    relocate_depart_text: ""
     # 途中播报固定首句（2026-10-21 现场需求）：受理引导语播完、第一次
     # 到播报点先播这句固定清道话术（起步时请围观路人让行），播完回到
     # 随机池；空串 = 不固定、从第一句起就随机
@@ -158,6 +159,22 @@ guide_bridge:
     # 配置，且不作 TTS 播报内容；下列语料是语音触发面 + MQTT 完整话术
     # 形态的补充指令词（改一处双面生效）
     welcome_point_code: "Y"
+    # 原地送客虚拟点位 code（2026-10-28 现场需求）：App 下发 navigate 去
+    # 该点位时不导航——Z 是虚拟点位（无需存在于点位映射表/航点表），
+    # 原地完成送客仪式：变形双足 + 播送客语 send_off_done_text（伴随
+    # 右手挥手）+ 送客二维码上屏（默认图 display_default_qr_path，缺省
+    # 随包 QRCode.png）。空串 = 关闭分流（Z 按普通点位走映射表解析）
+    send_off_point_code: "Z"
+    # 原地送客播报伴随的挥手动作 id（1001=右手挥手；0 = 禁用只播语音）
+    send_off_wave_motion_id: 1001
+    # 原地播报虚拟点位 code（2026-10-28 现场需求，与 Z 点同款机制）：
+    # App 下发 navigate 去该点位时不导航——W 是虚拟航点（无需存在于
+    # 航点表），但播报语料须配置在点位映射表该 code 条目的 text 播放
+    # 词（App 推表改词即生效；MQTT 消息只作触发）。原地完成：变形
+    # 双足 + 播报该语料（伴随说话动作轮换池 motion_preset_ids，讲解
+    # 句长时每 motion_repeat_seconds 秒续触下一个动作）。
+    # 空串 = 关闭分流（W 按普通点位走映射表解析）
+    broadcast_point_code: "W"
     agent_monitor.welcome_phrases:       # agent 话术命中任一条 -> 迎宾（空=关闭）
       - "恭候光临，倒屣相迎"
     agent_monitor.welcome_prep_phrases:  # agent 话术命中 -> 等 agent 说完
@@ -219,6 +236,17 @@ guide_bridge:
                                          #  改用 T1 说话动作族轮换；
                                          #  现场看效果可删减或固定某一个，
                                          #  原始范围 1001=右手挥手已弃用）
+    motion_repeat_seconds: 6             # 动作续播间隔秒（2026-10-28 现场
+                                         #  需求：讲车型介绍一句话十几秒
+                                         #  而预设动作只有几秒，手部动作
+                                         #  太短）：播报期间每隔此秒数
+                                         #  续触池中下一个动作（打断旧
+                                         #  动作无缝接续）直到本句播完；
+                                         #  值≈单个动作实际时长时衔接最
+                                         #  顺滑（偏小动作做一半被打断、
+                                         #  偏大两次动作间有停顿），现场
+                                         #  看效果调；0 = 禁用（每句只在
+                                         #  开头触发一次，原行为）
     # 唤醒抑制尾部宽限校准（tail = lead + 每字ms×字数×scale；播报中被
     # 唤醒则调大 scale / tts_speech_ms_per_char）
     tts_speech_ms_per_char: 220

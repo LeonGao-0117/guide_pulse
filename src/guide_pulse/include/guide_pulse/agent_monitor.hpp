@@ -73,6 +73,27 @@ std::string normalize_phrase_text(const std::string & text);
 // 前后夹语气词属正常；识别文本是语料子串不算命中，防短词误触发）
 bool phrase_matches(const std::string & asr_text, const std::string & phrase);
 
+// TTS 话术回查（fetch_tts_text）多源候选的匹配决策结果
+enum class FetchVerdict
+{
+  kConsumed,     // 候选命中语料（或自产播报过滤）：本轮已消化，无需重查
+  kMissRecheck,  // 有候选但全部未命中：允许 TtsStatus 终态重查（候选可能残缺）
+  kEmpty         // 无任何候选文本：调用方按落空处理（attempt 重试/解除标记）
+};
+
+// 多源候选统一匹配决策：按优先级逐个候选调用 matcher（内含语料匹配/
+// 冷却/延迟触发），任一命中即消化返回 kConsumed；全部未命中取最长候选
+// 作为观测文本（五条日志源里最全的那份，信息不降级）返回 kMissRecheck；
+// 无候选返回 kEmpty。
+// 2026-10-27 现场需求：分波长话术 audio.done/dispatching 只剩前半句、
+// 全量在 NLG 分段拼接源——旧逻辑逐路径「未命中即 return 且保留去重
+// 标记」堵死后续路径与终态重查，navigate 漏触发；改为全候选尝试后
+// 统一收尾（单测覆盖：test_agent_monitor.cpp ConsumeFetchedTexts）
+FetchVerdict consume_fetched_texts(
+  const std::vector<std::string> & candidates,
+  const std::function<bool(const std::string &)> & matcher,
+  std::string & observe_text);
+
 class AgentMonitor final
 {
 public:
@@ -146,10 +167,11 @@ private:
   void on_tts_msg(const aimdk_msgs::msg::TtsStatus::SharedPtr msg);
   void on_asr_msg(const aimdk_msgs::msg::AsrResult::SharedPtr msg);
   // 按 trace_id 回查运控板日志取 TTS 话术原文（工作线程执行，串行免锁）。
-  // 覆盖三种 TTS 日志来源：本地 TTS（received request item_id=<trace> 行）、
-  // 云端流式（item_id 匹配的 text.done JSON 行）与云端音频直推
-  //（dispatching status 行的 text="话术"，超长折行需 -A3 拼接提取）；
-  // 查到后触发 on_tts_text 并做语料匹配
+  // 六条日志源（本地 TTS / text.done / dispatching status / audio.done /
+  // NLG 分段拼接 / handle_nlg_result 拼接）解析为候选后统一决策
+  //（consume_fetched_texts）：任一候选命中语料即消化；全未命中打最长
+  // 候选观测行并允许终态重查（候选可能残缺——分波/折行场景，2026-10-27
+  // 现场需求）。查到后触发 on_tts_text 并做语料匹配
   void fetch_tts_text(const std::string & trace_id);
   // agent TTS 话术的语料匹配（含冷却），工作线程执行。trace_id = 话术
   // 来源 TTS（navigate/relocate 延迟触发挂起时等其终态用）。

@@ -109,6 +109,32 @@ private:
   // 一套指令词，改 yaml 一处即双面生效
   bool route_welcome_scene(CommandEvent & event);
   void handle_navigate(const CommandEvent & event);     // 讲解模块入口
+  // 原地送客模块入口（2026-10-28 现场需求）：App 下发 navigate 去送客
+  // 点（point_name 命中 send_off_point_code，默认 Z）——Z 是虚拟点位，
+  // 不发起导航，原地完成送客仪式：变形双足（阻塞 worker 等变形，与
+  // 导航前置变形同模式）-> 送客二维码上屏（先屏后声；navigate 载荷无
+  // qr_sha256 用默认图 default_qr_path_）-> 播感谢语 send_off_done_text
+  // 并伴随右手挥手（send_off_wave_motion_id，触发点 = TTS 受理成功，
+  // 与播报伴随动作同时序，见 play_current 的 source 前缀分流）。双足
+  // 未确认与导航同口径拒绝（播 navigate_transform_failed_text +
+  // failed/transform_failed，二维码后台准备收割不显示）；MQTT 来源
+  // 主体完成后回 navigate.result(success)，语料触发（local）不发回执
+  void handle_inplace_send_off(const CommandEvent & event);
+  // 原地播报模块入口（2026-10-28 现场需求，与 Z 点原地送客同款分流）：
+  // App 下发 navigate 去播报点（point_name 命中 broadcast_point_code，
+  // 默认 W）——W 是虚拟航点，不发起导航，但语料须配置在点位映射表：
+  // 播报内容 = 映射表该 code 条目的 text 播放词（App 推表改词即生效；
+  // MQTT 消息只作触发，携带的 texts 不作播报内容），原地完成：变形
+  // 双足（阻塞 worker 等变形，与导航前置变形同模式）-> 播报该语料并
+  // 伴随说话动作轮换池 motion_preset_ids（会话 source 前缀「播报原地:」
+  // 经 play_current 分流自动触发，含 motion_repeat_seconds 续播，见
+  // play_current 的 source 前缀分流）。表空/未命中 W 与导航同口径拒绝
+  //（语音提示 + failed/point_not_found）；命中但未配 text = 本次不播词
+  // 不变形（与迎宾词同口径，回执照常 success）；双足未确认与导航同
+  // 口径拒绝（播 navigate_transform_failed_text +
+  // failed/transform_failed）；MQTT 来源主体完成后回
+  // navigate.result(success)，语料触发（local）不发回执
+  void handle_inplace_broadcast(const CommandEvent & event);
   // 导航指令话术甄别（2026-10-22 现场需求）：App 下发 navigate 的 texts
   // 若是小T带看复述话术（「要去看X，没问题」类指令）则 true——讲解词
   // 应回退映射表而非照播话术。短语来源：navigate_phrase_template 前后
@@ -124,6 +150,12 @@ private:
   // 命中 agent_monitor.send_off_phrases 语料）：链路同款，仅到达后播
   // 感谢语 send_off_done_text（不再播就位语）
   bool handle_welcome_prep(const CommandEvent & event, bool send_off = false);
+  // 送客二维码后台准备·阶段 1（2026-10-22 现场需求；2026-10-28 抽
+  // 公共段，到达式送客与原地送客共用，仅 worker 线程）：缓存比对/下载
+  // + 转码 + 推送（~3.5s）异步启动，与主流程（导航/原地变形）并行
+  // 重叠，finish_send_off_qr 收割。内容 qr_sha256 优先，未带则默认图
+  // default_qr_path_（未配置不显示）
+  void start_send_off_qr_prepare(const std::string & qr_sha256);
   // 送客二维码收敛（2026-10-22 现场需求，仅 worker 线程）：收割
   // send_off_qr_task_ 后台准备结果；show=true 且准备成功时 play_prepared
   // 上屏（到达变四足完成后、感谢语开播前——感谢语提及「扫码」，先屏
@@ -154,6 +186,10 @@ private:
   // 播报伴随动作：TTS 受理成功时触发预设动作（轮换池取下一个）。
   // 同步短超时（正常毫秒级返回）；失败仅告警绝不影响语音播报
   void trigger_speech_motion();
+  // 触发指定预设动作（播报伴随动作公共段）：说话动作轮换池与原地
+  // 送客右手挥手（2026-10-28 现场需求）共用；motion_id<=0 = 禁用，
+  // 失败仅告警不影响语音
+  void trigger_preset_motion(int32_t motion_id);
   // 开播一个音频会话（替换当前会话——音频单会话策略）。mute_mic：仅
   // 迎宾讲解与导航讲解词传 true（静音麦克风防打断）；其余播报 false
   //（不掐麦克风，唤醒抑制照常武装）
@@ -463,6 +499,15 @@ private:
   //（提及「扫码收选车小资料」，与送客二维码上屏配套，见 send_off_qr_
   // task_）。空串 = 禁用（到达即释放业务）
   std::string send_off_done_text_;
+  // 原地送客虚拟点位 code（2026-10-28 现场需求，参数 send_off_point_code
+  // 默认 Z）：navigate 目标命中即分流 handle_inplace_send_off 原地送客
+  //（不导航、不查点位映射表）。空串 = 关闭分流
+  std::string send_off_point_code_;
+  // 原地播报虚拟点位 code（2026-10-28 现场需求，参数 broadcast_point_code
+  // 默认 W）：navigate 目标命中即分流 handle_inplace_broadcast 原地播报
+  //（不导航，语料取点位映射表该 code 条目的 text 播放词，伴随说话
+  // 动作；无需存在于航点表）。空串 = 关闭分流
+  std::string broadcast_point_code_;
   // 迎宾准备到达后延迟变形秒数（2026-10-18 测试需求）：到达 Y 点收到
   // 导航 result 后不立即变形，等这么多秒再变四足。0 = 原行为（到达即变形）
   int welcome_prep_transform_delay_seconds_{0};
@@ -492,7 +537,20 @@ private:
   std::string mc_source_name_;          // SetMc* 请求 source（变形模块共用）
   bool motion_enabled_;                 // false 关闭（只播语音不做动作）
   std::vector<int32_t> motion_preset_ids_;   // 动作轮换池（参数注入；空=关闭）
+  // 原地送客感谢语伴随的挥手动作 id（2026-10-28 现场需求，参数
+  // send_off_wave_motion_id 默认 1001=右手挥手；0 = 禁用不挥手）
+  int32_t send_off_wave_motion_id_{1001};
   std::size_t motion_next_index_{0};     // 轮换索引（仅 worker 线程访问）
+  // 动作续播间隔秒（2026-10-28 现场需求：讲解一句话十几秒而预设动作
+  // 只有几秒，手部动作太短）——播报期间每隔此秒数续触轮换池下一个
+  // 动作（interrupt=true 打断旧动作无缝接续）直到本句播完；0 = 禁用
+  //（每句受理时只触发一次，原行为）
+  int motion_repeat_seconds_{6};
+  // 动作续播窗口：until = 本句语音时长估算播完时刻（受理成功时按
+  // 尾部宽限同款公式排定）；next_at = 下次续触时刻。仅 worker 线程
+  // 访问（排程同 session_next_at_ 口径）；nullopt = 窗口关闭
+  std::optional<std::chrono::steady_clock::time_point> motion_renew_until_;
+  std::chrono::steady_clock::time_point motion_renew_next_at_{};
   int motion_request_timeout_seconds_;
   rclcpp::Client<aimdk_msgs::srv::SetMcPresetMotion>::SharedPtr motion_client_;
   rclcpp::CallbackGroup::SharedPtr motion_callback_group_;
