@@ -354,4 +354,58 @@ TEST_F(PointMapStoreTest, LoadAcceptsBoundaryText)
   EXPECT_FALSE(store.text_for_code("B").has_value());
 }
 
+// ---------------------------------------------------------------------------
+// name_for_code（2026-11-04 现场需求：navigate 分流判定 display/
+// undisplay 用——code 反查条目显示名）
+// ---------------------------------------------------------------------------
+
+// code -> name 查询：命中/未命中/空表；原样返回（大小写归一化归调用方）
+TEST_F(PointMapStoreTest, NameForCodeLookup)
+{
+  PointMapStore store((dir_ / "map.json").string());
+  ASSERT_TRUE(store.load());
+
+  // 空表：未命中
+  EXPECT_FALSE(store.name_for_code("Z").has_value());
+
+  // 现场形态：Z 条目 name=「Display」（含播放词「正在通话中」）
+  const std::vector<PointMapEntry> points = {
+    {"A", "比亚迪ætəʊ 1"},
+    {"Z", "Display", std::optional<std::string>("正在通话中")},
+    {"X", "UnDisplay"},
+  };
+  ASSERT_TRUE(store.replace(points));
+  EXPECT_EQ(store.name_for_code("Z"), std::optional<std::string>("Display"));
+  EXPECT_EQ(store.name_for_code("X"), std::optional<std::string>("UnDisplay"));
+  EXPECT_EQ(store.name_for_code("A"), std::optional<std::string>("比亚迪ætəʊ 1"));
+  // code 未命中 / name 不参与查询（方向与 text_for_code 一致）
+  EXPECT_FALSE(store.name_for_code("Display").has_value());
+  EXPECT_FALSE(store.name_for_code("a").has_value());  // 大小写敏感
+  EXPECT_FALSE(store.name_for_code("").has_value());
+
+  // 整表替换后旧 name 一并失效（全量替换语义）
+  const std::vector<PointMapEntry> second = {{"Z", "别的名字"}};
+  ASSERT_TRUE(store.replace(second));
+  EXPECT_EQ(store.name_for_code("Z"), std::optional<std::string>("别的名字"));
+  EXPECT_FALSE(store.name_for_code("A").has_value());
+}
+
+// name_for_code 随表落盘跨实例恢复（与 text/name 同生命周期）
+TEST_F(PointMapStoreTest, NameForCodePersistsAcrossRestart)
+{
+  const auto path = dir_ / "map.json";
+  {
+    PointMapStore store(path.string());
+    ASSERT_TRUE(store.load());
+    const std::vector<PointMapEntry> points = {
+      {"Z", "Display", std::optional<std::string>("正在通话中")}};
+    ASSERT_TRUE(store.replace(points));
+  }
+  PointMapStore reloaded(path.string());
+  ASSERT_TRUE(reloaded.load());
+  EXPECT_EQ(reloaded.name_for_code("Z"), std::optional<std::string>("Display"));
+  // text 与 name 同条目两查询面互不干扰
+  EXPECT_EQ(reloaded.text_for_code("Z"), std::optional<std::string>("正在通话中"));
+}
+
 }  // namespace

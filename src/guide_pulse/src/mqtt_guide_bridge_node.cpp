@@ -162,6 +162,18 @@ void MqttGuideBridgeNode::declare_and_load_params()
   // 车型导览后二维码不消失即此因）。须大于 0；失败自动重试不受此影响
   declare_parameter<int>("display_restore_priority", 1);
 
+  // ---- 屏幕文字显示（2026-11-04 现场需求：navigate 分流——point_name
+  // 解析出的映射表条目 name 归一化后为 display 时，条目 text 文字
+  // 上屏常驻 1 分钟（不变形不导航不播报）；为 undisplay 时撤屏恢复
+  // 默认表情（与取消二维码同款操作）----
+  // 文字常驻时长（默认 60s=1 分钟；与二维码 display_show_timeout_
+  // seconds 独立计时，到点 worker 超时分支自动撤屏）
+  declare_parameter<int>("display_text_timeout_seconds", 60);
+  // drawtext 文字渲染用中文字体（大脑板系统 Droid Sans Fallback，
+  // 覆盖 CJK；缺失时文字上屏禁用并告警，二维码显示不受影响）
+  declare_parameter<std::string>(
+    "display_text_font", "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf");
+
   // ---- 迎宾二维码缓存/下载（v0.22.0 P-036：scene 带 qr_sha256 哈希快照，
   // 未命中本地缓存时以 MQTT 凭据从 Server 文件面拉取图片）----
   declare_parameter<std::string>("qr_cache_dir", "/tmp/guide_pulse/qr_cache");
@@ -818,6 +830,7 @@ bool MqttGuideBridgeNode::start()
     get_parameter("display_restore_emotion_id").as_int();
   screen_cfg.restore_priority =
     get_parameter("display_restore_priority").as_int();
+  screen_cfg.text_font_path = get_parameter("display_text_font").as_string();
   if (screen_cfg.remote_pass.empty()) {
     RCLCPP_WARN(
       get_logger(),
@@ -828,6 +841,11 @@ bool MqttGuideBridgeNode::start()
   // 二维码业务互斥窗口（show_qr/cancel_qr 各占此窗口，与其他业务互斥）
   qr_business_timeout_seconds_ =
     static_cast<int>(get_parameter("qr_business_timeout_seconds").as_int());
+  // 屏幕文字显示常驻时长（2026-11-04 现场需求；负值/0 按默认 60s 钳制，
+  // 防误配关掉超时导致文字常驻不撤）
+  display_text_timeout_seconds_ = std::max(
+    1, static_cast<int>(
+      get_parameter("display_text_timeout_seconds").as_int()));
 
   // ---- 播报期间麦克风硬抑制（2026-10-16，SSH pactl，目标复用屏幕配置）----
   mic_mute_enabled_ = get_parameter("mic_mute_enabled").as_bool();
@@ -1547,12 +1565,14 @@ void MqttGuideBridgeNode::worker_loop()
           }
         }
       } else if (screen_ && screen_->active() && now >= screen_->deadline()) {
-        // 二维码常驻超时（display_show_timeout_seconds，全流程统一 2 分钟，
-        // 2026-10-22 现场需求）：以 display_restore_priority（高于上屏的 0）
-        // 播默认表情打断循环视频（2026-10-23 真机故障：同优先级打不断，
-        // 受理 ok 但屏幕滞留二维码）；取消失败时 deadline 已被顺延 5s，
-        // 本分支到点自动重试撤屏（ScreenDisplay::cancel 失败保持常驻态）
-        screen_->cancel("超时2min");
+        // 屏幕内容常驻超时（二维码 display_show_timeout_seconds 默认
+        // 2 分钟，2026-10-22 现场需求全流程统一；文字显示
+        // display_text_timeout_seconds 默认 60s，2026-11-04 现场需求）：
+        // 以 display_restore_priority（高于上屏的 0）播默认表情打断
+        // 循环视频（2026-10-23 真机故障：同优先级打不断，受理 ok 但
+        // 屏幕滞留二维码）；取消失败时 deadline 已被顺延 5s，本分支
+        // 到点自动重试撤屏（ScreenDisplay::cancel 失败保持常驻态）
+        screen_->cancel("常驻超时");
       } else if (relocate_pending_) {
         // 重定位验收轮询（250ms 周期）：终态只认导航模块的验收结果
         //（set_pose goal 的 result）或超时（relocate_timeout_seconds，默认 30s）
@@ -1897,7 +1917,13 @@ void MqttGuideBridgeNode::handle_command(const CommandEvent & event)
   //（2026-10-17 需求：映射表消息处理不受业务处理影响）。语料触发的
   // 迎宾走同一链路（inject_command），同样受限
   const bool qr_cancel_preempts_show =
-    event.type == "cancel_qr" && business_ == Business::kShowQr;
+    business_ == Business::kShowQr &&
+    ((event.type == "cancel_qr") ||
+    // undisplay 分流（2026-11-04 现场需求）同取消语义：显示保护期内
+    // App 下发 navigate(name=undisplay) 必须生效（显示后随即取消的
+    // 成对操作，被自己的显示业务挡住即功能失效）
+    (event.type == "navigate" &&
+    navigate_display_intent(event) == DisplayIntent::kHide));
   if (event.type != "tts.stop" && event.type != "navigate.stop" &&
     event.type != "point_map" && !qr_cancel_preempts_show && business_busy())
   {
@@ -3109,6 +3135,19 @@ bool MqttGuideBridgeNode::navigate_texts_are_agent_reply(
 // ---------------------------------------------------------------------------
 void MqttGuideBridgeNode::handle_navigate(const CommandEvent & event)
 {
+  // ---- 屏幕文字显示/取消分流（2026-11-04 现场需求）：point_name 经
+  // 映射表解析出 code，该条目 name 归一化后为 display/undisplay 时是
+  // 纯屏幕业务——不变形、不导航、不播报，转 handle_display_text
+  //（display=映射表 text 文字上屏 1 分钟 / undisplay=撤屏恢复默认
+  // 表情，与取消二维码同款操作）。置于 Z 送客/W 播报分流之前：分流
+  // 标记在映射表 name 里而非固定 code（现场 Z 条目 name=「Display」，
+  // name 判定必须先于 Z 的 code 精确匹配才能生效；App 换任意 code
+  // 配 display 均可触发，无需改 yaml）----
+  const auto display_intent = navigate_display_intent(event);
+  if (display_intent != DisplayIntent::kNone) {
+    handle_display_text(event, display_intent == DisplayIntent::kShow);
+    return;
+  }
   // ---- 原地送客分流（2026-10-28 现场需求）：目标是送客点（point_name
   // 命中 send_off_point_code，默认 Z；2026-10-17 联调确认 App 下发的
   // 就是 code，原始名精确匹配即可）时不发起导航——Z 是虚拟点位（原地
@@ -3481,6 +3520,131 @@ void MqttGuideBridgeNode::handle_inplace_broadcast(const CommandEvent & event)
   // MQTT 来源：主体完成（变形已确认 + 播报会话已立）回
   // navigate.result(success)；texts 播报属本地执行细节不影响结果
   //（与 handle_inplace_send_off 同语义）
+  if (!event.local) {
+    send_action_result(NAVIGATE_RESULT_TYPE, event.operation_id, ACTION_RESULT_SUCCESS);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 屏幕文字显示/取消·意图判定（2026-11-04 现场需求）：navigate 的
+// point_name 先经映射表两级解析（code 优先/name 兜底，与正常导航同
+// 口径）取 code，再反查该条目 name，ASCII 小写归一化后等值比较
+// display/undisplay（App 推表大小写不保证，现场实测 name=「Display」）。
+// 表空/未命中/其他 name 一律 kNone——走原 navigate 流程（表空/未命中
+// 的拒绝口径由原流程负责）。仅 worker 线程访问（point_map_ 免锁约定）
+// ---------------------------------------------------------------------------
+MqttGuideBridgeNode::DisplayIntent MqttGuideBridgeNode::navigate_display_intent(
+  const CommandEvent & event) const
+{
+  if (event.type != "navigate" || point_map_->size() == 0U) {
+    return DisplayIntent::kNone;
+  }
+  const auto code = point_map_->resolve(event.point_name);
+  if (!code) {
+    return DisplayIntent::kNone;
+  }
+  const auto name = point_map_->name_for_code(*code);
+  if (!name) {
+    return DisplayIntent::kNone;  // 防御：resolve 命中则 name 必在，仅兜底
+  }
+  std::string lower;
+  lower.reserve(name->size());
+  for (const char ch : *name) {
+    lower.push_back(
+      (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch);
+  }
+  if (lower == "display") {
+    return DisplayIntent::kShow;
+  }
+  if (lower == "undisplay") {
+    return DisplayIntent::kHide;
+  }
+  return DisplayIntent::kNone;
+}
+
+// ---------------------------------------------------------------------------
+// 屏幕文字显示/取消模块入口（2026-11-04 现场需求，由 handle_navigate
+// 分流进入，仅 worker 线程）：纯屏幕业务——不变形、不导航、不播报。
+//   show=true（name=display）：映射表该 code 条目 text 经 drawtext
+// 渲染黑底白字 848x480（自适应字号/折行）上屏，常驻
+// display_text_timeout_seconds（默认 60s=1 分钟，到点 worker 超时分支
+// 撤屏恢复默认表情）；业务占用与二维码显示同款（kShowQr +
+// qr_business_timeout_seconds 窗口）。
+//   show=false（name=undisplay）：screen_->cancel 撤屏——与取消二维码
+// 完全同款操作（PlayEmotion 高优先级恢复默认表情打断循环视频，幂等：
+// 无内容在屏 no-op，失败 5s 自动重试由 ScreenDisplay 兜底）；占
+// kCancelQr + qr_business_timeout_seconds 窗口（同 cancel_qr）。
+// 回执：MQTT 来源一律 navigate.result(success)——指令已受理执行，
+// 渲染/推送失败属本地执行细节仅告警（与 Z 送客「二维码准备失败本次
+// 不显示，不影响流程」同哲学）；未配置 text 本次不上屏不占业务
+//（与 W 原地播报「表未配 text 则不播词」同口径）。语料触发（local，
+// 当前无此触发面）不发协议回执
+// ---------------------------------------------------------------------------
+void MqttGuideBridgeNode::handle_display_text(const CommandEvent & event, bool show)
+{
+  const std::string source =
+    std::string(show ? "屏幕文字显示:" : "屏幕文字取消:") + event.operation_id;
+  const auto code = point_map_->resolve(event.point_name);  // 判定已命中，防御取
+  if (show) {
+    const auto text = code ? point_map_->text_for_code(*code) : std::nullopt;
+    if (!text || text->empty()) {
+      RCLCPP_WARN(
+        get_logger(),
+        "屏幕文字显示: 映射表点位 %s 未配置播放词 text，本次不上屏"
+        "（不变形不导航不占业务）: %s",
+        event.point_name.c_str(), source.c_str());
+      if (!event.local) {
+        send_action_result(
+          NAVIGATE_RESULT_TYPE, event.operation_id, ACTION_RESULT_SUCCESS);
+      }
+      return;
+    }
+    RCLCPP_INFO(
+      get_logger(), "屏幕文字显示分流: 原地显示（不变形不导航）: %s 点位=%s",
+      source.c_str(), event.point_name.c_str());
+    const auto prep = screen_->prepare_text(*text, "display-text");
+    if (!prep.ok) {
+      // 渲染/推送失败：本次不显示（与语料触发 show_qr「上屏失败仅告警
+      // 不占业务」同口径），回执照常 success
+      RCLCPP_WARN(
+        get_logger(), "屏幕文字准备失败(本次不显示,不影响流程): %s",
+        prep.detail.c_str());
+    } else {
+      const auto display =
+        screen_->play_prepared(source, display_text_timeout_seconds_);
+      if (!display.ok) {
+        RCLCPP_WARN(
+          get_logger(), "屏幕文字显示失败: %s", display.detail.c_str());
+      } else {
+        // 与二维码显示同款：上屏成功占 kShowQr 互斥窗口（保住文字
+        // 不被新业务立即让位；常驻时长由屏幕超时独立计时）
+        business_ = Business::kShowQr;
+        business_busy_until_ = std::chrono::steady_clock::now() +
+          std::chrono::seconds(qr_business_timeout_seconds_);
+      }
+    }
+  } else {
+    RCLCPP_INFO(
+      get_logger(), "屏幕文字取消分流: 原地撤屏（不变形不导航）: %s 点位=%s",
+      source.c_str(), event.point_name.c_str());
+    // 与取消二维码同款操作（幂等；失败保持常驻态由 ScreenDisplay 5s
+    // 重试兜底，业务照占——撤屏意图已受理）
+    const bool was_showing = screen_ && screen_->active();
+    const auto result = screen_->cancel(source);
+    if (result.ok) {
+      RCLCPP_INFO(
+        get_logger(), "屏幕文字取消: %s（%s）", source.c_str(),
+        was_showing ? "已撤屏" : "无内容在屏 no-op");
+    } else {
+      RCLCPP_WARN(
+        get_logger(), "屏幕文字取消失败(不影响业务占用): %s",
+        result.detail.c_str());
+    }
+    business_ = Business::kCancelQr;
+    business_busy_until_ = std::chrono::steady_clock::now() +
+      std::chrono::seconds(qr_business_timeout_seconds_);
+  }
+  // MQTT 来源：受理即终态（纯屏幕动作无异步面）回 navigate.result(success)
   if (!event.local) {
     send_action_result(NAVIGATE_RESULT_TYPE, event.operation_id, ACTION_RESULT_SUCCESS);
   }

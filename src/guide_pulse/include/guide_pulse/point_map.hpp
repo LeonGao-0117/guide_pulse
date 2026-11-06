@@ -62,6 +62,12 @@ public:
   // 优先级来源，见 mqtt_guide_bridge_node 到达分支）
   std::optional<std::string> text_for_code(const std::string & code) const;
 
+  // code -> 该点位显示名 name（App 界面人话名，如 A -> 比亚迪ætəʊ 1）：
+  // code 未命中返回 nullopt。2026-11-04 现场需求新增：navigate 分流
+  // 判定用（条目 name 归一化为 display/undisplay 时走屏幕文字
+  // 显示/取消，见 mqtt_guide_bridge_node 的 navigate_display_intent）
+  std::optional<std::string> name_for_code(const std::string & code) const;
+
   // 当前表内容（日志/测试用）
   const std::vector<PointMapEntry> & points() const {return points_;}
 

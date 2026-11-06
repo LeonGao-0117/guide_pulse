@@ -225,4 +225,18 @@ std::optional<std::string> PointMapStore::text_for_code(const std::string & code
   return std::nullopt;
 }
 
+std::optional<std::string> PointMapStore::name_for_code(const std::string & code) const
+{
+  // 与 text_for_code 同款线性查表（表上限 256 条，导航分流每次一条，
+  // 无性能面）。2026-11-04 现场需求：navigate 分流判定 display/undisplay
+  // 用（调用方自行归一化大小写）
+  const auto hit = std::find_if(
+    points_.begin(), points_.end(),
+    [&code](const PointMapEntry & entry) {return entry.code == code;});
+  if (hit != points_.end()) {
+    return hit->name;
+  }
+  return std::nullopt;
+}
+
 }  // namespace guide_pulse

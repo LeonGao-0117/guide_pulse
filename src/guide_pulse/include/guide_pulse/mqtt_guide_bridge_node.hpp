@@ -109,6 +109,38 @@ private:
   // 一套指令词，改 yaml 一处即双面生效
   bool route_welcome_scene(CommandEvent & event);
   void handle_navigate(const CommandEvent & event);     // 讲解模块入口
+  // ---- 屏幕文字显示/取消分流（2026-11-04 现场需求）----
+  // navigate 意图判定：point_name 经映射表解析出 code 后，该条目 name
+  // 归一化（ASCII 小写）等于 display -> kShow（映射表 text 文字上屏
+  // 常驻 60s）；等于 undisplay -> kHide（撤屏恢复默认表情，与取消
+  // 二维码同款操作）；其余（含表空/点位未命中）kNone 走原导航流程。
+  // App 推表的大小写不保证（现场实测 name=「Display」），故等值比较
+  // 前先归一化。仅 worker 线程访问（查 point_map_）
+  enum class DisplayIntent
+  {
+    kNone,   // 非屏幕文字业务：走原 navigate 流程
+    kShow,   // name=display：文字上屏
+    kHide,   // name=undisplay：取消屏幕显示
+  };
+  DisplayIntent navigate_display_intent(const CommandEvent & event) const;
+  // 屏幕文字显示/取消模块入口（2026-11-04 现场需求，仅 worker 线程，
+  // 由 handle_navigate 分流进入）：不变形、不导航、不播报——
+  //   show=true（name=display）：映射表该 code 条目 text 渲染上屏
+  //（ScreenDisplay::prepare_text，黑底白字自适应字号），常驻
+  // display_text_timeout_seconds（默认 60s=1 分钟，到点 worker 超时
+  // 分支撤屏）；业务占用与二维码显示同款（kShowQr +
+  // qr_business_timeout_seconds 窗口）；MQTT 来源回 navigate.result
+  //（success）。未配置 text = 本次不上屏不占业务（与 W 原地播报
+  // 「表未配 text 则不播词」同口径，回执照常 success）；渲染/上屏
+  // 失败仅告警不占业务（与 show_qr 同口径），回执照常 success
+  //（与 Z 送客「二维码准备失败本次不显示，不影响流程」同哲学）。
+  //   show=false（name=undisplay）：screen_->cancel 撤屏恢复默认
+  // 表情——与取消二维码完全同款操作（幂等：无内容在屏 no-op）；
+  // 占 kCancelQr + qr_business_timeout_seconds 窗口（同 cancel_qr），
+  // 且经 handle_command 的抢占豁免可打断 kShowQr 保护窗口（取消类
+  // 动作必须生效，与 cancel_qr 同语义）；MQTT 来源回
+  // navigate.result(success)。语料触发（local，当前无此面）不发回执
+  void handle_display_text(const CommandEvent & event, bool show);
   // 原地送客模块入口（2026-10-28 现场需求）：App 下发 navigate 去送客
   // 点（point_name 命中 send_off_point_code，默认 Z）——Z 是虚拟点位，
   // 不发起导航，原地完成送客仪式：变形双足（阻塞 worker 等变形，与
@@ -562,6 +594,10 @@ private:
   // 是两个业务，与其他业务互斥，超时 20s；窗口只管互斥占用，二维码
   // 常驻时长仍由 display_show_timeout_seconds 独立计时）
   int qr_business_timeout_seconds_;
+  // 屏幕文字显示常驻秒数（2026-11-04 现场需求：navigate 分流
+  // name=display 的映射表 text 上屏时长，默认 60s=1 分钟；与二维码
+  // display_show_timeout_seconds 相互独立）
+  int display_text_timeout_seconds_{60};
 
   // ---- 运行时状态 ----
   std::string robot_id_;               // enroll 响应分配（同 SN 稳定），空=尚未取得

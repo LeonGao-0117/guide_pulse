@@ -10,8 +10,9 @@
 # SN 来源（批量部署零手工配置）：
 #   serial_number 参数/yaml > GUIDE_PULSE_SERIAL_NUMBER 环境变量 >
 #   本地 /robot/info/sn > SSH 运控板读取（run@10.1.1.100，可用
-#   GUIDE_PULSE_MC_SSH 覆盖；默认密码方式认证 GUIDE_PULSE_MC_PASSWORD=1，
-#   置空回落 ssh-copy-id 免密钥）。
+#   GUIDE_PULSE_MC_SSH 覆盖；认证三级级联：① 密码 sshpass +
+#   GUIDE_PULSE_MC_PASSWORD（默认 1）② 本用户免密钥（ssh-copy-id）
+#   ③ sudo -n root 免密钥兜底（密钥配在 /root/.ssh 时））。
 # ============================================================================
 import os
 import subprocess
@@ -32,27 +33,32 @@ def _trim(value):
 
 
 def _sn_over_ssh(target):
-    """SSH 读运控板 SN：默认密码方式（sshpass，板间内网出厂密码 1），
-    密码显式置空或无 sshpass 时回落免密钥 BatchMode。"""
+    """SSH 读运控板 SN，认证三级级联回落（先命中先用）：
+    ① 密码方式（sshpass + GUIDE_PULSE_MC_PASSWORD，出厂密码 1）；
+    ② 本用户免密钥（ssh-copy-id 配过则直连）；
+    ③ root 免密钥兜底 sudo -n（运控板 sshd 仅开公钥认证、密钥配在
+    /root/.ssh 时，借 root 私钥连一次；sudo 非免密则跳过）。"""
+    cmds = []
     password = os.environ.get("GUIDE_PULSE_MC_PASSWORD", "1")
     if password:
+        cmds.append(({"SSHPASS": password},
+                     ["sshpass", "-e", "ssh", "-o", "StrictHostKeyChecking=accept-new",
+                      "-o", "ConnectTimeout=3", target, "cat", SN_FILE]))
+    cmds.append((None,
+                 ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
+                  target, "cat", SN_FILE]))
+    cmds.append((None,
+                 ["sudo", "-n", "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
+                  target, "cat", SN_FILE]))
+    for env_extra, cmd in cmds:
         try:
+            env = {**os.environ, **env_extra} if env_extra else None
             result = subprocess.run(
-                ["sshpass", "-e", "ssh", "-o", "StrictHostKeyChecking=accept-new",
-                 "-o", "ConnectTimeout=3", target, "cat", SN_FILE],
-                capture_output=True, text=True, timeout=6, check=True,
-                env={**os.environ, "SSHPASS": password})
+                cmd, capture_output=True, text=True, timeout=6, check=True, env=env)
             return _trim(result.stdout.splitlines()[0] if result.stdout else "")
         except (OSError, subprocess.SubprocessError, IndexError):
-            return ""
-    try:
-        result = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
-             target, "cat", SN_FILE],
-            capture_output=True, text=True, timeout=6, check=True)
-        return _trim(result.stdout.splitlines()[0] if result.stdout else "")
-    except (OSError, subprocess.SubprocessError, IndexError):
-        return ""
+            continue
+    return ""
 
 
 def _resolve_serial_number(context):

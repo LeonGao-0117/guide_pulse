@@ -3,7 +3,8 @@
 #   ros2 launch guide_pulse guide_pulse.launch.py serial_number:=<SN>
 # SN 自动解析（批量部署零手工配置）：
 #   ROBOT_SERIAL_NUMBER 环境变量 > 本地 /robot/info/sn > SSH 运控板读取
-# （运控板 cat /robot/info/sn；默认密码方式认证，见下方 MC_SSH_PASSWORD）。
+# （运控板 cat /robot/info/sn；认证三级级联：密码/本用户密钥/sudo root 密钥，
+#   见下方 MC_SSH_PASSWORD 与 sn_over_ssh）。
 # robot_id 由 Server 在首次 enroll 时分配（协议 v0.9.0+），不再是本工程配置。
 # 安装位置: /robot/software/guide_pulse/bin/start_guide_pulse
 #
@@ -236,8 +237,14 @@ trap cleanup SIGTERM SIGINT
 #         > SSH 运控板读取（GUIDE_PULSE_MC_SSH，默认 run@10.1.1.100）
 # SN 由制造商写入运控板（cat /robot/info/sn）；Jetson 本地的
 # /robot/info/sn 是否落地取决于固件版本，读到就用、读不到跨板取。
-# SSH 认证：默认密码方式（sshpass + GUIDE_PULSE_MC_PASSWORD，板间内网出厂
-# 密码 1，零配置批量部署）；置空密码回落免密钥（ssh-copy-id）。
+# SSH 认证（三级级联回落，先命中先用）：
+#   ① 密码方式 sshpass + GUIDE_PULSE_MC_PASSWORD（板间内网出厂密码 1，
+#      零配置批量部署）；
+#   ② 本用户免密钥（ssh-copy-id）BatchMode；
+#   ③ root 免密钥兜底 sudo -n ssh（运控板 sshd 仅开公钥认证、密钥配在
+#      /root/.ssh 时，借 root 私钥连一次；需 sudo 免密）。
+# 开机时运控板可能尚未就绪：按 GUIDE_PULSE_SN_FETCH_RETRIES 次重试（默认 6，
+# 间隔 GUIDE_PULSE_SN_FETCH_INTERVAL 秒，默认 10）。
 # 开机时运控板可能尚未就绪：按 GUIDE_PULSE_SN_FETCH_RETRIES 次重试（默认 6，
 # 间隔 GUIDE_PULSE_SN_FETCH_INTERVAL 秒，默认 10）。
 # ---------------------------------------------------------------------------
@@ -251,17 +258,43 @@ SN_FETCH_INTERVAL="${GUIDE_PULSE_SN_FETCH_INTERVAL:-10}"
 trim_sn() { printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
 
 sn_over_ssh() {
-  # 密码方式：sshpass 经 SSHPASS 环境变量取密码（不进 argv）；
-  # accept-new 首连自动接受运控板主机指纹（批量部署零交互）
+  local out
+  # ① 密码方式：sshpass 经 SSHPASS 环境变量取密码（不进 argv）；
+  # accept-new 首连自动接受运控板主机指纹（批量部署零交互）。
+  # 部分批次运控板 sshd 禁用密码认证（Permission denied (publickey)），
+  # 失败不 return，继续回落密钥方式。
   if [[ -n "${MC_SSH_PASSWORD}" ]] && command -v sshpass >/dev/null 2>&1; then
-    SSHPASS="${MC_SSH_PASSWORD}" sshpass -e ssh \
+    out="$(SSHPASS="${MC_SSH_PASSWORD}" sshpass -e ssh \
       -o StrictHostKeyChecking=accept-new -o ConnectTimeout=3 \
-      "${MC_SSH_TARGET}" cat /robot/info/sn 2>/dev/null || true
+      "${MC_SSH_TARGET}" cat /robot/info/sn 2>/dev/null || true)"
+    out="$(trim_sn "${out}")"
+    if [[ -n "${out}" ]]; then
+      printf '%s\n' "${out}"
+      return 0
+    fi
+  fi
+  # ② 本用户免密钥方式（ssh-copy-id 配过则直连；BatchMode 无密钥时
+  # 立即失败，绝不交互式卡密码提示）
+  out="$(ssh -o BatchMode=yes -o ConnectTimeout=3 "${MC_SSH_TARGET}" \
+    cat /robot/info/sn 2>/dev/null || true)"
+  out="$(trim_sn "${out}")"
+  if [[ -n "${out}" ]]; then
+    printf '%s\n' "${out}"
     return 0
   fi
-  # 免密钥方式（BatchMode：无密钥时立即失败，绝不交互式卡密码提示）
-  ssh -o BatchMode=yes -o ConnectTimeout=3 "${MC_SSH_TARGET}" \
-    cat /robot/info/sn 2>/dev/null || true
+  # ③ root 免密钥兜底：部署机上密钥常配在 /root/.ssh（运控板仅开
+  # 公钥认证、且只认 root 那把私钥时，sudo ssh 手工验证可用）；
+  # sudo -n 免密才尝试，失败静默（无免密 sudo 的机器不受影响）
+  if sudo -n true >/dev/null 2>&1; then
+    out="$(sudo -n ssh -o BatchMode=yes -o ConnectTimeout=3 "${MC_SSH_TARGET}" \
+      cat /robot/info/sn 2>/dev/null || true)"
+    out="$(trim_sn "${out}")"
+    if [[ -n "${out}" ]]; then
+      printf '%s\n' "${out}"
+      return 0
+    fi
+  fi
+  return 1
 }
 
 resolve_serial_number() {

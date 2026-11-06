@@ -39,10 +39,44 @@ namespace guide_pulse
 
 // 拼接 ffmpeg 转码命令行（二维码图片(PNG/JPEG，ffmpeg 自动识别) ->
 // 848x480 H.264 MP4，静态图 1s@10fps，短视频+播放端无限循环，实测转码
-// 约 0.8s）。纯函数，独立单测。
+// 约 0.8s）。keep_size=false（默认，二维码）：图标最大边 441（短边 92%）
+// 居中防圆屏裁角；keep_size=true（文字图，2026-11-04 现场故障修复：
+// DisplayText.png 本就是精确 848x480 满屏排版，再走 441 缩放会上屏
+// 缩小一半——「文字太小」的真正根源）：跳过 scale/pad 原尺寸转码，
+// 仅保 format/loop。纯函数，独立单测。
 std::string build_ffmpeg_command(
   const std::string & ffmpeg_bin, const std::string & image_path,
-  const std::string & mp4_path);
+  const std::string & mp4_path, bool keep_size = false);
+
+// ---- 屏幕文字显示（2026-11-04 现场需求：navigate 分流 name=display
+// 的条目，映射表 text 文字上屏）纯函数群，独立单测 ----
+
+// 文字布局参数（848x480 脸屏自适应字号排版）
+struct TextLayoutParams
+{
+  int fontsize;       // 字号（像素，同时近似等于单字宽——CJK 方块字）
+  int chars_per_line;  // 每行字数（码点数，按可用宽度算）
+  int max_lines;      // 最多行数（超出截断加省略号，防溢出屏幕）
+};
+
+// 按文本长度挑选布局（字号从大到小试到放得下为止；短状态词如
+// 「正在通话中」用大字号醒目，长段落自动缩字号多行）。char_count
+// 按 UTF-8 码点计（与契约 text 1..2048 Unicode 标量同口径）
+TextLayoutParams pick_text_layout(std::size_t char_count);
+
+// UTF-8 码点折行：每 chars_per_line 个码点插一个换行，超过 max_lines
+// 行截断到 max_lines 行且末尾以省略号（U+2026）收尾。按码点折行
+// 保证中文/emoji 不被截半；空文本返回空串
+std::string wrap_text_for_screen(
+  const std::string & text, int chars_per_line, int max_lines);
+
+// 拼接 ffmpeg drawtext 渲染命令行（黑底白字 848x480 PNG，文字内容经
+// textfile 文件传入不走命令行——免引号/冒号/百分号转义，对任意映射表
+// 文本安全）。纯函数，独立单测
+std::string build_text_image_command(
+  const std::string & ffmpeg_bin, const std::string & font_path,
+  const std::string & textfile_path, const std::string & png_path,
+  int fontsize, int line_spacing);
 
 class ScreenDisplay
 {
@@ -58,6 +92,10 @@ public:
     std::string sshpass_bin{"sshpass"};
     std::string ffmpeg_bin{"ffmpeg"};
     std::string local_tmp_dir{"/tmp/guide_pulse"};  // MP4 本地暂存
+    // 中文字体（drawtext 文字渲染用，Droid Sans Fallback 覆盖 CJK；
+    // 大脑板系统字体，缺失时文字上屏禁用并告警——二维码不受影响）
+    std::string text_font_path{
+      "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"};
     // ---- 行为参数 ----
     int request_timeout_seconds{5};           // 单次 PlayEmotion 调用超时
     int show_timeout_seconds{120};            // 二维码常驻时长（默认 2 分钟，
@@ -89,14 +127,26 @@ public:
 
   // 阶段 1（可与迎宾变形并行重叠）：ffmpeg 转码 + scp 推送运控板。
   // ok=true 表示内容就绪（可 play_prepared）；失败清除就绪状态并带
-  // detail 原因（本次不显示，不影响后续重试）
+  // detail 原因（本次不显示，不影响后续重试）。keep_size 见
+  // build_ffmpeg_command（文字图原尺寸，二维码图标 441 缩放）
   Result prepare(
-    const std::string & image_path, const std::string & content_id = "");
+    const std::string & image_path, const std::string & content_id = "",
+    bool keep_size = false);
+
+  // 阶段 1 文字版（2026-11-04 现场需求）：text 先经 drawtext 渲染成
+  // 848x480 黑底白字 PNG（自适应字号/折行），再走与二维码图片完全
+  // 相同的 转码 + 推送 管线（content_id 区分文件名防缓存）。字体缺失/
+  // 渲染/推送失败与 prepare 同语义（ok=false + detail，本次不显示）
+  Result prepare_text(
+    const std::string & text, const std::string & content_id);
 
   // 阶段 2（变形完成后、TTS 开播前调用）：PlayEmotion 无限循环上屏。
   // 无就绪内容（prepare 未成功/已被消费）时返回失败，不改变显示状态。
-  // 成功后 active()=true 且 deadline() 生效
-  Result play_prepared(const std::string & source);
+  // 成功后 active()=true 且 deadline() 生效。timeout_seconds：本次常驻
+  // 时长覆盖（>0 生效；默认 -1 = 用 config.show_timeout_seconds——
+  // 二维码 2 分钟，文字显示可独立指定如 60s，2026-11-04 现场需求）
+  Result play_prepared(
+    const std::string & source, int timeout_seconds = -1);
 
   // 取消显示（超时/新业务到达）：恢复默认表情打断循环视频。
   // 未显示时为空操作（幂等）。恢复请求以 restore_priority（默认 1，
